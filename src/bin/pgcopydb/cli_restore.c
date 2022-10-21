@@ -561,6 +561,8 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_NONE,
 						   restoreDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreDBoptions.restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */

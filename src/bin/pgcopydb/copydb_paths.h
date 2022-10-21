@@ -22,6 +22,9 @@ typedef struct DirectoryState
 	bool schemaPreDataHasBeenRestored;
 	bool schemaPostDataHasBeenRestored;
 
+	bool hookPreCopyIsDone;
+	bool hookPostCopyIsDone;
+
 	bool tableCopyIsDone;
 	bool indexCopyIsDone;
 	bool sequenceCopyIsDone;
@@ -92,7 +95,11 @@ typedef struct TableFilePaths
 	char doneFile[MAXPGPATH];    /* table done file (summary) */
 	char idxListFile[MAXPGPATH]; /* index oids list file */
 
-	char truncateDoneFile[MAXPGPATH];    /* table truncate done file */
+	char truncateDoneFile[MAXPGPATH];     /* table truncate done file */
+
+	/* TS hooks */
+	char hookPreCopyDoneFile[MAXPGPATH];  /* pre-copy hook done file */
+	char hookPostCopyDoneFile[MAXPGPATH]; /* post-copy hook done file */
 } TableFilePaths;
 
 

@@ -504,6 +504,8 @@ cli_stream_setup(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   streamDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -568,6 +570,8 @@ cli_stream_cleanup(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   streamDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -630,6 +634,8 @@ cli_stream_catchup(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   streamDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -737,6 +743,8 @@ cli_stream_apply(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   streamDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -816,6 +824,8 @@ stream_start_in_mode(LogicalStreamMode mode)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   streamDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */

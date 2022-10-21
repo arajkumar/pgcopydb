@@ -2,6 +2,17 @@
 
 [![Documentation Status](https://readthedocs.org/projects/pgcopydb/badge/?version=latest)](https://pgcopydb.readthedocs.io/en/latest/?badge=latest)
 
+# Timescale notes
+
+This is a Timescale-private fork of https://github.com/dimitri/pgcopydb
+
+### Testing database imports into Timescale Cloud, and so far the changes are:
+
+- Added pre-and-post table copy hooks for the 'clone' command, with the --hook-pre-copy and --hook-post-copy
+  flags to the clone command to enable the hooks. Hooks will be executed with the arguments:
+
+  ```hook-script [pre-copy|post-copy] [source URI] [target URI] [schema.table_name] [snapshot]```
+
 ## Introduction
 
 pgcopydb is a tool that automates running `pg_dump | pg_restore` between two

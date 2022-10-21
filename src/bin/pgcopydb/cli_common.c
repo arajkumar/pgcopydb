@@ -508,6 +508,8 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
+		{ "hook-pre-copy", required_argument, NULL, 'p' },
+		{ "hook-post-copy", required_argument, NULL, 'P' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -566,6 +568,28 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				strlcpy(options.dir, optarg, MAXPGPATH);
 				log_trace("--dir %s", options.dir);
+				break;
+			}
+
+			case 'p': /* TS pre-copy hook script */
+			{
+				if (!file_exists(optarg)) {
+					log_fatal("hook-pre-copy not found: \"%s\"", optarg);
+					++errors;
+				}
+				strlcpy(options.hookPreCopy, optarg, MAXPGPATH);
+				log_trace("--hook-pre-copy %s", options.hookPreCopy);
+				break;
+			}
+
+			case 'P': /* TS post-copy hook script */
+			{
+				if (!file_exists(optarg)) {
+					log_fatal("hook-post-copy not found: \"%s\"", optarg);
+					++errors;
+				}
+				strlcpy(options.hookPostCopy, optarg, MAXPGPATH);
+				log_trace("--hook-post-copy %s", options.hookPostCopy);
 				break;
 			}
 
@@ -929,6 +953,8 @@ cli_copy_prepare_specs(CopyDataSpec *copySpecs, CopyDataSection section)
 						   copyDBoptions.splitTablesLargerThanPretty,
 						   section,
 						   copyDBoptions.snapshot,
+						   copyDBoptions.hookPreCopy,
+						   copyDBoptions.hookPostCopy,
 						   copyDBoptions.restoreOptions,
 						   copyDBoptions.roles,
 						   copyDBoptions.skipLargeObjects,

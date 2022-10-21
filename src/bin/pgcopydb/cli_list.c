@@ -1057,6 +1057,8 @@ cli_list_schema(int argc, char **argv)
 						   listDBoptions.splitTablesLargerThanPretty,
 						   DATA_SECTION_ALL,
 						   "",  /* snapshot */
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -1155,6 +1157,8 @@ cli_list_progress(int argc, char **argv)
 						   listDBoptions.splitTablesLargerThanPretty,
 						   DATA_SECTION_ALL,
 						   "",  /* snapshot */
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */

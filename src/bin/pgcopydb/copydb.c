@@ -540,6 +540,8 @@ copydb_init_specs(CopyDataSpec *specs,
 				  char *splitTablesLargerThanPretty,
 				  CopyDataSection section,
 				  char *snapshot,
+				  char *hookPreCopy,
+				  char *hookPostCopy,
 				  RestoreOptions restoreOptions,
 				  bool roles,
 				  bool skipLargeObjects,
@@ -614,6 +616,21 @@ copydb_init_specs(CopyDataSpec *specs,
 				snapshot,
 				sizeof(tmpCopySpecs.sourceSnapshot.snapshot));
 	}
+
+	/* TS Hooks */
+	if (hookPreCopy != NULL && !IS_EMPTY_STRING_BUFFER(hookPreCopy))
+	{
+		strlcpy(tmpCopySpecs.hookPreCopy,
+				hookPreCopy,
+				sizeof(tmpCopySpecs.hookPreCopy));
+	}
+	if (hookPostCopy != NULL && !IS_EMPTY_STRING_BUFFER(hookPostCopy))
+	{
+		strlcpy(tmpCopySpecs.hookPostCopy,
+				hookPostCopy,
+				sizeof(tmpCopySpecs.hookPostCopy));
+	}
+
 
 	strlcpy(tmpCopySpecs.splitTablesLargerThanPretty,
 			splitTablesLargerThanPretty,
@@ -791,6 +808,19 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 				"%s/%u.truncate",
 				tableSpecs->cfPaths->tbldir,
 				source->oid);
+
+		/*
+		 * TS: The pre- and post-copy table hook done files, needed as they run in
+		 * a critical section.
+		 */
+		sformat(tableSpecs->tablePaths.hookPreCopyDoneFile, MAXPGPATH,
+				"%s/%u.hook-pre-copy",
+				tableSpecs->cfPaths->tbldir,
+				source->oid);
+		sformat(tableSpecs->tablePaths.hookPostCopyDoneFile, MAXPGPATH,
+				"%s/%u.hook-post-copy",
+				tableSpecs->cfPaths->tbldir,
+				source->oid);
 	}
 	else
 	{
@@ -830,6 +860,14 @@ copydb_init_tablepaths(CopyFilePaths *cfPaths,
 {
 	sformat(tablePaths->lockFile, MAXPGPATH, "%s/%d",
 			cfPaths->rundir,
+			oid);
+
+	/* TS hooks */
+	sformat(tablePaths->hookPreCopyDoneFile, MAXPGPATH, "%s/%d.hook-pre-copy",
+			cfPaths->tbldir,
+			oid);
+	sformat(tablePaths->hookPostCopyDoneFile, MAXPGPATH, "%s/%d.hook-post-copy",
+			cfPaths->tbldir,
 			oid);
 
 	sformat(tablePaths->doneFile, MAXPGPATH, "%s/%d.done",

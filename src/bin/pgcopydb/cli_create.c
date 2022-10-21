@@ -298,6 +298,8 @@ cli_create_snapshot(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   createSNoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -557,6 +559,8 @@ cli_create_slot(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   createSlotOptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -612,6 +616,8 @@ cli_drop_slot(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   createSlotOptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -870,6 +876,8 @@ cli_create_origin(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   createOriginOptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
@@ -925,6 +933,8 @@ cli_drop_origin(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   createOriginOptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */

@@ -360,6 +360,8 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_NONE,
 						   dumpDBoptions->snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */

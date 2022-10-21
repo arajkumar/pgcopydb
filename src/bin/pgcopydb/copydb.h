@@ -179,6 +179,9 @@ typedef struct CopyDataSpec
 	char source_pguri[MAXCONNINFO];
 	char target_pguri[MAXCONNINFO];
 
+	char hookPreCopy[MAXPGPATH];
+	char hookPostCopy[MAXPGPATH];
+
 	TransactionSnapshot sourceSnapshot;
 
 	CopyDataSection section;
@@ -260,6 +263,8 @@ bool copydb_init_specs(CopyDataSpec *specs,
 					   char *splitTablesLargerThanPretty,
 					   CopyDataSection section,
 					   char *snapshot,
+					   char *hookPreCopy,
+					   char *hookPostCopy,
 					   RestoreOptions restoreOptions,
 					   bool roles,
 					   bool skipLargeObjects,

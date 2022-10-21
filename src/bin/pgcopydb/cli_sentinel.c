@@ -358,6 +358,8 @@ cli_sentinel_create(int argc, char **argv)
 						   "",  /* skip threshold pretty printed */
 						   DATA_SECTION_ALL,
 						   sentinelDBoptions.snapshot,
+						   "",
+						   "",
 						   restoreOptions,
 						   false, /* roles */
 						   false, /* skipLargeObjects */
