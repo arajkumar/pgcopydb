@@ -23,6 +23,7 @@ RUN apt-get update \
         python3-sphinx \
         lintian \
         curl \
+        libzstd-dev \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/pgcopydb

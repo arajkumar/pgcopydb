@@ -50,10 +50,18 @@ version: GIT-VERSION-FILE
 
 # debian packages built from the current sources
 deb:
-	docker build -f Dockerfile.debian -t pgcopydb_debian .
+	docker build --platform linux/amd64 -f Dockerfile.debian -t pgcopydb_debian_amd64 .
+	docker build --platform linux/arm64 -f Dockerfile.debian -t pgcopydb_debian_arm64 .
 
-debsh: deb
-	docker run --rm -it pgcopydb_debian bash
+debcopy:
+	docker run --platform linux/amd64 --rm pgcopydb_debian_amd64 sh -c "tar -C /usr/src -cf - pgcopydb-* pgcopydb_*" | tar -C dist/amd64 -xf -
+	docker run --platform linux/arm64 --rm pgcopydb_debian_arm64 sh -c "tar -C /usr/src -cf - pgcopydb-* pgcopydb_*" | tar -C dist/arm64 -xf -
+
+debsharm64: deb
+	docker run --platform linux/arm64 --rm -it pgcopydb_debian_arm64 bash
+
+debshamd64: deb
+	docker run --platform linux/amd64 --rm -it pgcopydb_debian_amd64 bash
 
 # debian packages built from latest tag, manually maintained in the Dockerfile
 deb-qa:
