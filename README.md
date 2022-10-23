@@ -13,6 +13,9 @@ This is a Timescale-private fork of https://github.com/dimitri/pgcopydb
 
   ```hook-script [pre-copy|post-copy] [source URI] [target URI] [schema.table_name] [snapshot]```
 
+Current limitations to work on:
+- splitting tables for COPY: does not have a unique column of type integer (int2/int4/int8)
+
 ## Introduction
 
 pgcopydb is a tool that automates running `pg_dump | pg_restore` between two
