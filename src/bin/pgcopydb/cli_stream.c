@@ -884,11 +884,11 @@ cli_stream_transform(int argc, char **argv)
 	/*
 	 * Read the catalogs from the source table from on-file disk.
 	 */
-	if (!copydb_parse_schema_json_file(&copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
+	/* if (!copydb_parse_schema_json_file(&copySpecs)) */
+	/* { */
+	/* 	/1* errors have already been logged *1/ */
+	/* 	exit(EXIT_CODE_INTERNAL_ERROR); */
+	/* } */
 
 	/*
 	 * Refrain from logging SQL statements in the apply module, because they
@@ -1132,11 +1132,11 @@ stream_start_in_mode(LogicalStreamMode mode)
 	/*
 	 * Read the catalogs from the source table from on-file disk.
 	 */
-	if (!copydb_parse_schema_json_file(&copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
+	/* if (!copydb_parse_schema_json_file(&copySpecs)) */
+	/* { */
+	/* 	/1* errors have already been logged *1/ */
+	/* 	exit(EXIT_CODE_INTERNAL_ERROR); */
+	/* } */
 
 	/*
 	 * Refrain from logging SQL statements in the apply module, because they
