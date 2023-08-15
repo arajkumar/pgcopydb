@@ -738,6 +738,7 @@ stream_apply_sql(StreamApplyContext *context,
 			sformat(lsn, sizeof(lsn), "%X/%X",
 					LSN_FORMAT_ARGS(metadata->lsn));
 
+			pgsql_exit_pipeline_mode(pgsql);
 			if (!pgsql_replication_origin_xact_setup(pgsql,
 													 lsn,
 													 metadata->timestamp))
@@ -974,6 +975,7 @@ stream_apply_sql(StreamApplyContext *context,
 				/* HASH_ADD can change the pointer in place, update */
 				context->preparedStmt = stmtHashTable;
 			}
+			pgsql_enter_pipeline_mode(pgsql);
 
 			break;
 		}
