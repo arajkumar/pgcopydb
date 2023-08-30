@@ -1822,7 +1822,7 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 		log_error("Unable to sync pipeline: %s", err);
 		return false;
 	}
-	log_trace("Apply pipeline sync");
+	log_info("Begin pipeline sync");
 	while (PQconsumeInput(connection)) {
       while (!PQisBusy(connection)) {
 		PGresult* res = PQgetResult(connection);
@@ -1851,6 +1851,7 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 	}
 
 doneConsuming:
+	log_info("End pipeline sync");
 	ok = PQexitPipelineMode(connection);
 	if (!ok) {
 		const char* err = PQerrorMessage(connection);

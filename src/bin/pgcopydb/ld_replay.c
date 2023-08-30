@@ -163,21 +163,21 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 
 			if (context->sentinelQueryInProgress)
 			{
-				if (!stream_apply_fetch_sync_sentinel(context))
-				{
-					/* errors have already been logged */
-					return false;
-				}
+				/* if (!stream_apply_fetch_sync_sentinel(context)) */
+				/* { */
+				/* 	/1* errors have already been logged *1/ */
+				/* 	return false; */
+				/* } */
 			}
 
 			/* rate limit to 1 update per second */
 			else if (1 < (now - context->sentinelSyncTime))
 			{
-				if (!stream_apply_send_sync_sentinel(context))
-				{
-					/* errors have already been logged */
-					return false;
-				}
+				/* if (!stream_apply_send_sync_sentinel(context)) */
+				/* { */
+				/* 	/1* errors have already been logged *1/ */
+				/* 	return false; */
+				/* } */
 			}
 			break;
 		}

@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -145,7 +146,7 @@ void log_set_tformat(const char *tformat) {
 
 void log_log(int level, const char *file, int line, const char *fmt, ...)
 {
-  time_t t;
+  struct timeval t;
   struct tm *lt;
 
   if (level < L.level) {
@@ -167,7 +168,7 @@ void log_log(int level, const char *file, int line, const char *fmt, ...)
   lock();
 
   /* Get current time */
-  t = time(NULL);
+  gettimeofday(&t, NULL);
   lt = localtime(&t);
 
   char *json_string = NULL;
@@ -230,6 +231,7 @@ void log_log(int level, const char *file, int line, const char *fmt, ...)
 		char buf[128] = { 0 };
 
 		buf[strftime(buf, sizeof(buf), L.tformat, lt)] = '\0';
+		sprintf(buf + strlen(buf), ".%03d", (int)t.tv_usec / 1000);
 
 		if (L.useColors)
 		{
