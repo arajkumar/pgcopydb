@@ -1797,6 +1797,11 @@ bool pgsql_enter_pipeline_mode(PGSQL *pgsql) {
 	if (status == PQ_PIPELINE_ON) {
 		return true;
 	}
+	int err = PQsetnonblocking(connection, 1);
+	if (err != 0) {
+		log_error("Failed to enter non blocking mode:%s", PQerrorMessage(connection));
+		return false;
+	}
 	int ok = PQenterPipelineMode(connection);
 
 	if (!ok) {
@@ -1823,12 +1828,14 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 		return false;
 	}
 	log_info("Begin pipeline sync");
+	int results = 0;
 	while (PQconsumeInput(connection)) {
       while (!PQisBusy(connection)) {
 		PGresult* res = PQgetResult(connection);
         if (res == NULL) {
           continue;
         }
+		results ++;
 		ExecStatusType resultStatus = PQresultStatus(res);
 
         PQclear(res);
@@ -1851,7 +1858,12 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 	}
 
 doneConsuming:
-	log_info("End pipeline sync");
+	log_info("End pipeline sync, count %d", results);
+	int err = PQsetnonblocking(connection, 0);
+	if (err != 0) {
+		log_error("Failed to enter blocking mode:%s", PQerrorMessage(connection));
+		return false;
+	}
 	ok = PQexitPipelineMode(connection);
 	if (!ok) {
 		const char* err = PQerrorMessage(connection);

@@ -454,11 +454,11 @@ stream_apply_send_sync_sentinel(StreamApplyContext *context)
 		return true;
 	}
 
-	/* if (!pgsql_send_sync_sentinel_apply(src, durableLSN)) */
-	/* { */
-	/* 	log_error("Failed to sync progress with the pgcopydb sentinel"); */
-	/* 	return false; */
-	/* } */
+	if (!pgsql_send_sync_sentinel_apply(src, durableLSN))
+	{
+		log_error("Failed to sync progress with the pgcopydb sentinel");
+		return false;
+	}
 
 	context->sentinelSyncTime = time(NULL);
 	context->sentinelQueryInProgress = true;
