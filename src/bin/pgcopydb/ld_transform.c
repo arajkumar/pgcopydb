@@ -867,6 +867,9 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 			 content.count,
 			 sqlfilename);
 
+	free(content.buffer);
+	free(content.lines);
+
 	return true;
 }
 
@@ -1289,6 +1292,8 @@ FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray)
 
 		(void) FreeLogicalMessageTuple(tuple);
 	}
+
+	free(tupleArray->array);
 }
 
 
@@ -1299,6 +1304,10 @@ FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray)
 void
 FreeLogicalMessageTuple(LogicalMessageTuple *tuple)
 {
+	for (int i = 0; i < tuple->cols; i++  )
+	{
+		free(tuple->columns[i]);
+	}
 	free(tuple->columns);
 
 	for (int r = 0; r < tuple->values.count; r++)
@@ -1316,8 +1325,10 @@ FreeLogicalMessageTuple(LogicalMessageTuple *tuple)
 			}
 		}
 
-		free(tuple->values.array);
+		free(values->array);
 	}
+
+	free(tuple->values.array);
 }
 
 
@@ -1801,6 +1812,7 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 				if (!stream_add_value_in_json_array(value, jsArray))
 				{
 					/* errors have already been logged */
+					destroyPQExpBuffer(buf);
 					return false;
 				}
 			}
@@ -1811,6 +1823,7 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 		if (PQExpBufferBroken(buf))
 		{
 			log_error("Failed to transform INSERT statement: Out of Memory");
+			destroyPQExpBuffer(buf);
 			return false;
 		}
 
@@ -1827,6 +1840,7 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 
 		json_free_serialized_string(serialized_string);
 		json_value_free(js);
+		destroyPQExpBuffer(buf);
 	}
 
 	return true;
@@ -1996,6 +2010,7 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 
 		json_free_serialized_string(serialized_string);
 		json_value_free(js);
+		destroyPQExpBuffer(buf);
 	}
 
 	return true;
@@ -2042,6 +2057,7 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
 							  old->cols);
+					destroyPQExpBuffer(buf);
 					return false;
 				}
 
@@ -2053,6 +2069,7 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 				if (!stream_add_value_in_json_array(value, jsArray))
 				{
 					/* errors have already been logged */
+					destroyPQExpBuffer(buf);
 					return false;
 				}
 			}
@@ -2071,6 +2088,7 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 
 		json_free_serialized_string(serialized_string);
 		json_value_free(js);
+		destroyPQExpBuffer(buf);
 	}
 
 	return true;

@@ -241,6 +241,7 @@ copydb_target_drop_tables(CopyDataSpec *specs)
 	if (!pgsql_execute(&dst, query->data))
 	{
 		/* errors have already been logged */
+		destroyPQExpBuffer(query);
 		return false;
 	}
 
