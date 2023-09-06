@@ -41,7 +41,7 @@ GUC applySettingsSync[] = {
 GUC applySettings[] = {
 	COMMON_GUC_SETTINGS,
 	{ "synchronous_commit", "off" },
-	{ "session_replication_role", "'replica'" },
+/*	{ "session_replication_role", "'replica'" }, */
 	{ NULL, NULL },
 };
 
@@ -730,6 +730,11 @@ stream_apply_sql(StreamApplyContext *context,
 			}
 
 			/*
+			 * exit from pipeline before committing.
+			 */
+			pgsql_exit_pipeline_mode(pgsql);
+
+			/*
 			 * update replication progress with metadata->lsn, that is,
 			 * transaction COMMIT LSN
 			 */
@@ -845,6 +850,11 @@ stream_apply_sql(StreamApplyContext *context,
 					context->previousLSN < metadata->lsn;
 			}
 
+			/*
+			 * exit from pipeline before updating replication origin.
+			 */
+			pgsql_exit_pipeline_mode(pgsql);
+
 			/* in a transaction only the COMMIT LSN is tracked */
 			if (context->transactionInProgress)
 			{
@@ -945,6 +955,11 @@ stream_apply_sql(StreamApplyContext *context,
 			{
 				return true;
 			}
+
+			/*
+			 * ensure that prepare is always executed in pipeline mode.
+			 */
+			pgsql_enter_pipeline_mode(pgsql);
 
 			uint32_t hash = metadata->hash;
 			PreparedStmt *stmtHashTable = context->preparedStmt;

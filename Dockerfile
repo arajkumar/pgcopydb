@@ -1,7 +1,7 @@
 #
 # Define a base image with all our build dependencies.
 #
-FROM debian:bullseye-slim as build
+FROM postgres:14-bullseye as build
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -63,7 +63,7 @@ RUN apt-get update \
     psutils \
     libpq5 \
     postgresql-client-common \
-    postgresql-client-13 \
+    postgresql-client \
 	&& rm -rf /var/lib/apt/lists/*
 
 RUN adduser --disabled-password --gecos '' --home /var/lib/postgres docker

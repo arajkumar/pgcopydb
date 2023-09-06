@@ -1770,12 +1770,10 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 				endpoint, PQbackendPID(connection), name, sql);
 	}
 
-	PGresult *result = PQprepare(connection, name, sql, paramCount, paramTypes);
+	int result = PQsendPrepare(connection, name, sql, paramCount, paramTypes);
 
-	if (!is_response_ok(result))
+	if (!result)
 	{
-		pgsql_execute_log_error(pgsql, result, sql, NULL, NULL);
-
 		/*
 		 * Multi statements might want to ROLLBACK and hold to the open
 		 * connection for a retry step.
@@ -1788,13 +1786,93 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 		return false;
 	}
 
-	PQclear(result);
-	clear_results(pgsql);
 	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
 	{
 		(void) pgsql_finish(pgsql);
 	}
 
+	return true;
+}
+
+
+bool
+pgsql_enter_pipeline_mode(PGSQL *pgsql)
+{
+	PGconn *connection = pgsql->connection;
+	PGpipelineStatus status = PQpipelineStatus(connection);
+	if (status == PQ_PIPELINE_ON)
+	{
+		return true;
+	}
+	int ok = PQenterPipelineMode(connection);
+
+	if (!ok)
+	{
+		log_error("Failed to enter pipeline mode:%s", PQerrorMessage(connection));
+		return false;
+	}
+	log_trace("Entering pipeline mode");
+	return true;
+}
+
+
+bool
+pgsql_exit_pipeline_mode(PGSQL *pgsql)
+{
+	PGconn *connection = pgsql->connection;
+
+	PGpipelineStatus status = PQpipelineStatus(connection);
+	if (status != PQ_PIPELINE_ON)
+	{
+		return false;
+	}
+
+	int ok = PQpipelineSync(connection);
+	if (!ok)
+	{
+		const char *err = PQerrorMessage(connection);
+		log_error("Unable to sync pipeline: %s", err);
+		return false;
+	}
+
+	int results = 0;
+	while (PQconsumeInput(connection) != 0)
+	{
+		PGresult *res = PQgetResult(connection);
+		if (res == NULL)
+		{
+			continue;
+		}
+		results++;
+		ExecStatusType resultStatus = PQresultStatus(res);
+
+		PQclear(res);
+		if (resultStatus == PGRES_PIPELINE_SYNC)
+		{
+			log_trace("Pipeline sync received from result");
+			goto doneConsuming;
+		}
+
+		bool ok =
+			resultStatus == PGRES_SINGLE_TUPLE ||
+			resultStatus == PGRES_TUPLES_OK ||
+			resultStatus == PGRES_COPY_BOTH ||
+			resultStatus == PGRES_COMMAND_OK;
+		if (!ok)
+		{
+			log_error("BUG: unexpected result status: %x", resultStatus);
+			return false;
+		}
+	}
+
+doneConsuming:
+	ok = PQexitPipelineMode(connection);
+	if (!ok)
+	{
+		const char *err = PQerrorMessage(connection);
+		log_error("Unable to exit pipeline: %s", err);
+	}
+	log_trace("Exit pipeline");
 	return true;
 }
 
@@ -1844,16 +1922,20 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 		}
 	}
 
-	PGresult *result = PQexecPrepared(connection, name,
+	bool result = PQsendQueryPrepared(connection, name,
 									  paramCount, paramValues,
 									  NULL, NULL, 0);
 
-	if (!is_response_ok(result))
+	/* log_info("send query prepared: %d", result); */
+	/* PGresult *result = PQgetResult(connection); */
+	if (!result)
 	{
+		const char *err = PQerrorMessage(connection);
 		char sql[BUFSIZE] = { 0 };
 		sformat(sql, sizeof(sql), "EXECUTE %s;", name);
+		log_info("error: %s", err);
 
-		pgsql_execute_log_error(pgsql, result, sql, debugParameters, context);
+		/* pgsql_execute_log_error(pgsql, result, sql, debugParameters, context); */
 		destroyPQExpBuffer(debugParameters);
 
 		/*
@@ -1870,19 +1952,19 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 
 	if (parseFun != NULL)
 	{
-		(*parseFun)(context, result);
+		/* (*parseFun)(context, result); */
 	}
 
 	destroyPQExpBuffer(debugParameters);
 
-	PQclear(result);
-	clear_results(pgsql);
+	/* PQclear(result); */
+	/*/ clear_results(pgsql); */
 	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
 	{
 		(void) pgsql_finish(pgsql);
 	}
 
-	return true;
+	return result;
 }
 
 
