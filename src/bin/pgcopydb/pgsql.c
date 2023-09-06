@@ -1763,11 +1763,10 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 				endpoint, PQbackendPID(connection), name, sql);
 	}
 
-	PGresult *result = PQprepare(connection, name, sql, paramCount, paramTypes);
+	int result = PQsendPrepare(connection, name, sql, paramCount, paramTypes);
 
-	if (!is_response_ok(result))
+	if (!result)
 	{
-		pgsql_execute_log_error(pgsql, result, sql, NULL, NULL);
 
 		/*
 		 * Multi statements might want to ROLLBACK and hold to the open
@@ -1781,8 +1780,6 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 		return false;
 	}
 
-	PQclear(result);
-	clear_results(pgsql);
 	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
 	{
 		(void) pgsql_finish(pgsql);
@@ -1821,13 +1818,14 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 		return false;
 	}
 
+	clock_t start = clock();
+	log_info("Begin pipeline sync");
 	int ok = PQpipelineSync(connection);
 	if (!ok) {
 		const char* err = PQerrorMessage(connection);
 		log_error("Unable to sync pipeline: %s", err);
 		return false;
 	}
-	log_info("Begin pipeline sync");
 	int results = 0;
 	while (PQconsumeInput(connection)) {
       while (!PQisBusy(connection)) {
@@ -1858,7 +1856,8 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 	}
 
 doneConsuming:
-	log_info("End pipeline sync, count %d", results);
+	clock_t end = clock();
+	log_info("End pipeline sync, count %d, %lf", results, ((double)(end-start))/CLOCKS_PER_SEC);
 	int err = PQsetnonblocking(connection, 0);
 	if (err != 0) {
 		log_error("Failed to enter blocking mode:%s", PQerrorMessage(connection));
