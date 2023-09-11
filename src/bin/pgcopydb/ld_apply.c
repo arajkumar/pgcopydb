@@ -619,6 +619,24 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_BEGIN:
 		{
+			static bool temp = false;
+			if (!temp) {
+				log_info("create temp table");
+				if (!pgsql_execute(pgsql, "CREATE TEMPORARY TABLE temp_tags(LIKE tags);"))
+				{
+					log_info("Failed to create temp table");
+				}
+				if (!pgsql_execute(pgsql, "CREATE TEMPORARY TABLE temp_readings(LIKE readings);"))
+				{
+					log_info("Failed to create temp table");
+				}
+				if (!pgsql_execute(pgsql, "CREATE TEMPORARY TABLE temp_diagnostics(LIKE diagnostics);"))
+				{
+					log_info("Failed to create temp table");
+				}
+				log_info("done creating temp table");
+				temp = true;
+			}
 			if (metadata->lsn == InvalidXLogRecPtr ||
 				IS_EMPTY_STRING_BUFFER(metadata->timestamp))
 			{
