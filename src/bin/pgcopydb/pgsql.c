@@ -1856,6 +1856,7 @@ bool pgsql_exit_pipeline_mode(PGSQL *pgsql) {
 	}
 
 doneConsuming:
+	{
 	clock_t end = clock();
 	log_info("End pipeline sync, count %d, %lf", results, ((double)(end-start))/CLOCKS_PER_SEC);
 	int err = PQsetnonblocking(connection, 0);
@@ -1869,6 +1870,7 @@ doneConsuming:
 		log_error("Unable to exit pipeline: %s", err);
 	}
 	log_trace("Exit pipeline");
+	}
 	return true;
 }
 
