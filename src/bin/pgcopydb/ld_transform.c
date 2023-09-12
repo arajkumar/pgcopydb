@@ -1169,6 +1169,64 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 }
 
 
+/* append the new insert statement if targets same table as previous */
+static bool
+coalesceInsertStatements(LogicalMessageInsert *last,
+						 LogicalMessageInsert *stmt)
+{
+	if (strcmp(last->nspname, stmt->nspname) != 0 ||
+		strcmp(last->relname, stmt->relname) != 0)
+	{
+		return false;
+	}
+
+	LogicalMessageValuesArray *lastValuesArray = &last->new.array->values;
+
+	if (lastValuesArray->capacity < (lastValuesArray->count + 1))
+	{
+		/* double the capacity to avoid excessive realloc */
+		lastValuesArray->capacity *= 2;
+		lastValuesArray->array = (LogicalMessageValues *) realloc(lastValuesArray->array,
+																  sizeof(
+																	  LogicalMessageValues)
+																  *
+																  lastValuesArray->
+																  capacity);
+	}
+
+	/* move the new value to the existing statement */
+	lastValuesArray->array[lastValuesArray->count++] = stmt->new.array->values.array[0];
+
+	/* avoid deallocation of moved value */
+	stmt->new.array->values.count = 0;
+
+	return true;
+}
+
+
+/* Append the new statement if the action is same and targets same table. */
+static bool
+coalesceStatements(LogicalTransactionStatement *last,
+				   LogicalTransactionStatement *stmt)
+{
+	if (last->action != stmt->action)
+	{
+		return false;
+	}
+
+	if (stmt->action == STREAM_ACTION_INSERT)
+	{
+		if (coalesceInsertStatements(&last->stmt.insert, &stmt->stmt.insert))
+		{
+			/* deallocate tuple */
+			FreeLogicalMessageTupleArray(&(stmt->stmt.insert.new));
+			return true;
+		}
+	}
+	return false;
+}
+
+
 /*
  * streamLogicalTransactionAppendStatement appends a statement to the current
  * transaction.
@@ -1181,9 +1239,6 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
  *     already existing tuple array created on the previous statement
  *
  * This allows to then generate multi-values insert commands, for instance.
- *
- * TODO: at the moment we don't pack several statements that look alike into
- * the same one.
  */
 bool
 streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
@@ -1213,16 +1268,28 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 	}
 	else
 	{
-		if (txn->last != NULL)
+		if (coalesceStatements(txn->last, stmt))
 		{
-			/* update the current last entry of the linked-list */
-			txn->last->next = stmt;
+			/*
+			 * Deallocate new statement as it is merged into the
+			 * existing statment.
+			 */
+			free(stmt);
 		}
+		else
+		{
+			/* couldn't coalesce, append to the txn list as a new statement */
+			if (txn->last != NULL)
+			{
+				/* update the current last entry of the linked-list */
+				txn->last->next = stmt;
+			}
 
-		/* the new statement now becomes the last entry of the linked-list */
-		stmt->prev = txn->last;
-		stmt->next = NULL;
-		txn->last = stmt;
+			/* the new statement now becomes the last entry of the linked-list */
+			stmt->prev = txn->last;
+			stmt->next = NULL;
+			txn->last = stmt;
+		}
 	}
 
 	++txn->count;
@@ -1365,15 +1432,17 @@ AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
 	/*
 	 * Allocate the tuple values, an array of VALUES, as in SQL.
 	 *
-	 * TODO: actually support multi-values clauses (single column names array,
-	 * multiple VALUES matching the same metadata definition). At the moment
-	 * it's always a single VALUES entry: VALUES(a, b, c).
+	 * It actually supports multi-values clauses (single column names array,
+	 * multiple VALUES matching the same metadata definition).
 	 *
 	 * The goal is to be able to represent VALUES(a1, b1, c1), (a2, b2, c2).
+	 *
+	 * Refer coalesceStatements for more details.
 	 */
 	LogicalMessageValuesArray *valuesArray = &(tuple->values);
 
 	valuesArray->count = 1;
+	valuesArray->capacity = 1;
 	valuesArray->array =
 		(LogicalMessageValues *) calloc(1, sizeof(LogicalMessageValues));
 
