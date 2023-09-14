@@ -331,7 +331,6 @@ typedef struct PreparedStmt
 	UT_hash_handle hh;          /* makes this structure hashable */
 } PreparedStmt;
 
-
 /*
  * As we're using synchronous_commit = off to speed-up things on the apply
  * side, we need to track durability in the client-side.
@@ -612,7 +611,11 @@ bool computeTxnMetadataFilename(uint32_t xid,
 								char *filename);
 bool writeTxnMetadataFile(LogicalTransaction *txn, const char *dir);
 
+bool GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
+												char **nspname, char **relname);
+
 void FreeLogicalMessage(LogicalMessage *msg);
+void FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt);
 void FreeLogicalTransaction(LogicalTransaction *tx);
 void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
 void FreeLogicalMessageTuple(LogicalMessageTuple *tuple);
