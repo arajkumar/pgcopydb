@@ -34,6 +34,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 typedef struct TransformStreamCtx
@@ -1203,6 +1204,25 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 		return false;
 	}
 
+	char *nspname, *relname;
+	if (GetRelationFromLogicalTransactionStatement(stmt, &nspname, &relname))
+	{
+		/* Skip catalog table */
+		if (!timescale_allow_statement(nspname, relname))
+		{
+			log_trace("Ignore catalog %s.%s", nspname, relname);
+			FreeLogicalTransactionStatement(stmt);
+			return true;
+		}
+
+		/* Map if the relation is chunk */
+		if (timescale_is_chunk(nspname, relname))
+		{
+			timescale_chunk_to_hypertable(nspname, relname, nspname, relname);
+		}
+	}
+
+
 	if (txn->first == NULL)
 	{
 		txn->first = stmt;
@@ -1244,6 +1264,88 @@ FreeLogicalMessage(LogicalMessage *msg)
 }
 
 
+bool
+GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
+										   char **nspname, char **relname)
+{
+	switch (stmt->action)
+	{
+		case STREAM_ACTION_INSERT:
+		{
+			*nspname = stmt->stmt.insert.nspname;
+			*relname = stmt->stmt.insert.relname;
+			break;
+		}
+
+		case STREAM_ACTION_UPDATE:
+		{
+			*nspname = stmt->stmt.update.nspname;
+			*relname = stmt->stmt.update.relname;
+			break;
+		}
+
+		case STREAM_ACTION_DELETE:
+		{
+			*nspname = stmt->stmt.delete.nspname;
+			*relname = stmt->stmt.delete.relname;
+			break;
+		}
+
+		case STREAM_ACTION_TRUNCATE:
+		{
+			*nspname = stmt->stmt.truncate.nspname;
+			*relname = stmt->stmt.truncate.relname;
+			break;
+		}
+
+		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
+		default:
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+
+/*
+ * FreeLogicalTransactionStatement frees the malloc'ated memory areas of a
+ * LogicalTransaction.
+ */
+void
+FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt)
+{
+	switch (stmt->action)
+	{
+		case STREAM_ACTION_INSERT:
+		{
+			FreeLogicalMessageTupleArray(&(stmt->stmt.insert.new));
+			break;
+		}
+
+		case STREAM_ACTION_UPDATE:
+		{
+			FreeLogicalMessageTupleArray(&(stmt->stmt.update.old));
+			FreeLogicalMessageTupleArray(&(stmt->stmt.update.new));
+			break;
+		}
+
+		case STREAM_ACTION_DELETE:
+		{
+			FreeLogicalMessageTupleArray(&(stmt->stmt.delete.old));
+			break;
+		}
+
+		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
+		default:
+		{
+			break;
+		}
+	}
+	free(stmt);
+}
+
+
 /*
  * FreeLogicalTransaction frees the malloc'ated memory areas of a
  * LogicalTransaction.
@@ -1255,38 +1357,9 @@ FreeLogicalTransaction(LogicalTransaction *tx)
 
 	for (; currentStmt != NULL;)
 	{
-		switch (currentStmt->action)
-		{
-			case STREAM_ACTION_INSERT:
-			{
-				FreeLogicalMessageTupleArray(&(currentStmt->stmt.insert.new));
-				break;
-			}
-
-			case STREAM_ACTION_UPDATE:
-			{
-				FreeLogicalMessageTupleArray(&(currentStmt->stmt.update.old));
-				FreeLogicalMessageTupleArray(&(currentStmt->stmt.update.new));
-				break;
-			}
-
-			case STREAM_ACTION_DELETE:
-			{
-				FreeLogicalMessageTupleArray(&(currentStmt->stmt.delete.old));
-				break;
-			}
-
-			/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
-			default:
-			{
-				break;
-			}
-		}
-
 		LogicalTransactionStatement *stmt = currentStmt;
 		currentStmt = currentStmt->next;
-
-		free(stmt);
+		FreeLogicalTransactionStatement(stmt);
 	}
 
 	tx->first = NULL;

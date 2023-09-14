@@ -25,6 +25,7 @@
 #include "schema.h"
 #include "signals.h"
 #include "string_utils.h"
+#include "timescale.h"
 
 CopyDBOptions streamDBoptions = { 0 };
 
@@ -916,6 +917,13 @@ cli_stream_transform(int argc, char **argv)
 	}
 
 	if (!stream_init_context(&specs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs.connStrings.source_pguri))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
