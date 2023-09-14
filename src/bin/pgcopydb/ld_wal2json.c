@@ -30,6 +30,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 static bool SetColumnNamesAndValues(LogicalMessageTuple *tuple,

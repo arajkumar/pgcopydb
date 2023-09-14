@@ -26,7 +26,6 @@ win32ver.rc
 *.exe
 lib*dll.def
 lib*.pc
-.ccls-cache
 
 # Local excludes in root directory
 /config.log
