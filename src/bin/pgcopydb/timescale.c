@@ -55,7 +55,7 @@ parseHypertableDetails(void *ctx, PGresult *res)
 
 		/* Insert the ChunkHypertableMap entry into the hashmap */
 		HASH_ADD_INT(chunkHypertableMap, hypertableID, chunkMapEntry);
-		log_info("Adding hypertable info:%s.%s %d", chunkMapEntry->nspname,
+		log_info("Adding hypertable info rel: %s.%s id: %d", chunkMapEntry->nspname,
 				 chunkMapEntry->relname, chunkMapEntry->hypertableID);
 	}
 }
@@ -74,7 +74,7 @@ timescale_init(PGSQL *pgsql, char *pguri)
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 								   NULL, &parseHypertableDetails))
 	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
+		log_error("Failed to fetch chunk hypertable mapping");
 		return false;
 	}
 	return true;
