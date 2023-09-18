@@ -614,6 +614,10 @@ stream_apply_sql(StreamApplyContext *context,
 					  LSN_FORMAT_ARGS(metadata->lsn));
 
 			context->previousLSN = metadata->lsn;
+			/*
+			 * exit from pipeline before committing.
+			 */
+			pgsql_exit_pipeline_mode(pgsql);
 
 			break;
 		}
