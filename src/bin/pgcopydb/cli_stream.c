@@ -1142,6 +1142,13 @@ stream_start_in_mode(LogicalStreamMode mode)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs.connStrings.source_pguri))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	/*
 	 * Read the catalogs from the source table from on-file disk.
 	 */
