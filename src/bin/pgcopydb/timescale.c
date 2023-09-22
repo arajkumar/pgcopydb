@@ -55,11 +55,13 @@ parseHypertableDetails(void *ctx, PGresult *res)
 
 		/* Insert the ChunkHypertableMap entry into the hashmap */
 		HASH_ADD_INT(chunkHypertableMap, hypertableID, chunkMapEntry);
-		log_info("Adding hypertable relation: %s.%s id: %d", chunkMapEntry->nspname,
-				 chunkMapEntry->relname, chunkMapEntry->hypertableID);
+		log_notice("Adding hypertable relation: %s.%s id: %d", chunkMapEntry->nspname,
+				   chunkMapEntry->relname, chunkMapEntry->hypertableID);
 	}
 }
 
+
+static bool isTimescale = false;
 
 bool
 timescale_init(PGSQL *pgsql, char *pguri)
@@ -69,6 +71,19 @@ timescale_init(PGSQL *pgsql, char *pguri)
 		/* errors have already been logged */
 		return false;
 	}
+
+	if (!pgsql_table_exists(pgsql, "_timescaledb_catalog", "hypertable", &isTimescale))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!isTimescale)
+	{
+		log_notice("Source database does not have the Timescale extension installed.");
+		return true;
+	}
+
 	const char *sql =
 		"SELECT id, schema_name, table_name FROM _timescaledb_catalog.hypertable";
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
@@ -107,6 +122,11 @@ bool
 timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nspname_out,
 							  char *relname_out)
 {
+	if (!isTimescale)
+	{
+		return true;
+	}
+
 	uint32_t targetHypertableID;
 	if (!extract_hypertable_id(relname_in, &targetHypertableID))
 	{
@@ -134,6 +154,11 @@ timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nspname_
 bool
 timescale_is_chunk(const char *nspname_in, const char *relname_in)
 {
+	if (!isTimescale)
+	{
+		return false;
+	}
+
 	/* Chunk will be always present in _timescaledb_internal schema */
 	if (streq(nspname_in, "_timescaledb_internal"))
 	{
@@ -153,6 +178,11 @@ timescale_is_chunk(const char *nspname_in, const char *relname_in)
 bool
 timescale_allow_statement(const char *nspname_in, const char *relname_in)
 {
+	if (!isTimescale)
+	{
+		return true;
+	}
+
 	const char *denylist[][2] = {
 		{ "_timescaledb_catalog", NULL },
 		{ "_timescaledb_internal", "bgw_job_stat" },
