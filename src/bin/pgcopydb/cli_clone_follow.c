@@ -217,6 +217,12 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs->connStrings.source_pguri))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 	/*
 	 * When using pgcopydb clone --follow --restart we first cleanup the
 	 * previous setup, and that includes dropping the replication slot.
