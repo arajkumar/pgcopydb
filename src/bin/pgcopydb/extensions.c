@@ -252,27 +252,10 @@ copydb_parse_extensions_requirements(CopyDataSpec *copySpecs, char *filename)
 bool
 copydb_prepare_extensions_restore(CopyDataSpec *copySpecs)
 {
-	bool timescaledb = false;
-	SourceExtensionArray *extensionArray = &(copySpecs->catalog.extensionArray);
-
-	for (int i = 0; i < extensionArray->count; i++)
+	if (!timescaledb_pre_restore(copySpecs))
 	{
-		SourceExtension *ext = &(extensionArray->array[i]);
-
-		if (streq(ext->extname, "timescaledb"))
-		{
-			timescaledb = true;
-			break;
-		}
-	}
-
-	if (timescaledb)
-	{
-		if (!timescaledb_pre_restore(copySpecs))
-		{
-			/* errors have already been logged */
-			return false;
-		}
+		/* errors have already been logged */
+		return false;
 	}
 
 	return true;
@@ -289,29 +272,11 @@ copydb_prepare_extensions_restore(CopyDataSpec *copySpecs)
 bool
 copydb_finalize_extensions_restore(CopyDataSpec *copySpecs)
 {
-	bool timescaledb = false;
-	SourceExtensionArray *extensionArray = &(copySpecs->catalog.extensionArray);
-
-	for (int i = 0; i < extensionArray->count; i++)
+	if (!timescaledb_post_restore(copySpecs))
 	{
-		SourceExtension *ext = &(extensionArray->array[i]);
-
-		if (streq(ext->extname, "timescaledb"))
-		{
-			timescaledb = true;
-			break;
-		}
+		/* errors have already been logged */
+		return false;
 	}
-
-	if (timescaledb)
-	{
-		if (!timescaledb_post_restore(copySpecs))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
 	return true;
 }
 
