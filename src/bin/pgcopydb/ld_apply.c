@@ -618,7 +618,11 @@ stream_apply_sql(StreamApplyContext *context,
 			/*
 			 * exit from pipeline before committing.
 			 */
-			pgsql_exit_pipeline_mode(pgsql);
+			if (!pgsql_exit_pipeline_mode(pgsql))
+			{
+				/* errors have already been logged */
+				return false;
+			}
 
 			break;
 		}
@@ -738,7 +742,11 @@ stream_apply_sql(StreamApplyContext *context,
 			/*
 			 * exit from pipeline before committing.
 			 */
-			pgsql_exit_pipeline_mode(pgsql);
+			if (!pgsql_exit_pipeline_mode(pgsql))
+			{
+				/* errors have already been logged */
+				return false;
+			}
 
 			/*
 			 * update replication progress with metadata->lsn, that is,
@@ -859,7 +867,11 @@ stream_apply_sql(StreamApplyContext *context,
 			/*
 			 * exit from pipeline before updating replication origin.
 			 */
-			pgsql_exit_pipeline_mode(pgsql);
+			if (!pgsql_exit_pipeline_mode(pgsql))
+			{
+				/* errors have already been logged */
+				return false;
+			}
 
 			/* in a transaction only the COMMIT LSN is tracked */
 			if (context->transactionInProgress)
@@ -965,7 +977,11 @@ stream_apply_sql(StreamApplyContext *context,
 			/*
 			 * ensure that prepare is always executed in pipeline mode.
 			 */
-			pgsql_enter_pipeline_mode(pgsql);
+			if (!pgsql_enter_pipeline_mode(pgsql))
+			{
+				/* errors have already been logged */
+				return false;
+			}
 
 			uint32_t hash = metadata->hash;
 			PreparedStmt *stmtHashTable = context->preparedStmt;

@@ -1800,42 +1800,43 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 
 
 bool
-pgsql_enter_pipeline_mode(PGSQL *pgsql)
+pgsql_enter_pipeline_mode(PGSQL *target)
 {
-	PGconn *connection = pgsql->connection;
+	PGconn *connection = target->connection;
 	PGpipelineStatus status = PQpipelineStatus(connection);
 	if (status == PQ_PIPELINE_ON)
 	{
 		return true;
 	}
-	int ok = PQenterPipelineMode(connection);
 
+	int ok = PQenterPipelineMode(connection);
 	if (!ok)
 	{
-		log_error("Failed to enter pipeline mode:%s", PQerrorMessage(connection));
+		(void) pgcopy_log_error(target, NULL, "Failed to enter pipeline");
 		return false;
 	}
+
 	log_trace("Entering pipeline mode");
 	return true;
 }
 
 
 bool
-pgsql_exit_pipeline_mode(PGSQL *pgsql)
+pgsql_exit_pipeline_mode(PGSQL *target)
 {
-	PGconn *connection = pgsql->connection;
+	PGconn *connection = target->connection;
 
 	PGpipelineStatus status = PQpipelineStatus(connection);
 	if (status != PQ_PIPELINE_ON)
 	{
-		return false;
+		log_trace("Called when not in pipeline mode");
+		return true;
 	}
 
 	int ok = PQpipelineSync(connection);
 	if (!ok)
 	{
-		const char *err = PQerrorMessage(connection);
-		log_error("Unable to sync pipeline: %s", err);
+		(void) pgcopy_log_error(target, NULL, "Failed sync pipeline");
 		return false;
 	}
 
@@ -1864,7 +1865,7 @@ pgsql_exit_pipeline_mode(PGSQL *pgsql)
 			resultStatus == PGRES_COMMAND_OK;
 		if (!ok)
 		{
-			log_error("BUG: unexpected result status: %x", resultStatus);
+			(void) pgcopy_log_error(target, res, "Read after pipeline sync failed");
 			return false;
 		}
 	}
@@ -1873,10 +1874,10 @@ doneConsuming:
 	ok = PQexitPipelineMode(connection);
 	if (!ok)
 	{
-		const char *err = PQerrorMessage(connection);
-		log_error("Unable to exit pipeline: %s", err);
+		(void) pgcopy_log_error(target, NULL, "Failed to exit pipeline");
+		return false;
 	}
-	log_trace("Exit pipeline");
+	log_trace("Exit pipeline with %d results", results);
 	return true;
 }
 
