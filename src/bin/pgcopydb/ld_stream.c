@@ -297,6 +297,7 @@ stream_init_context(StreamSpecs *specs)
 	privateContext->endpos = specs->endpos;
 	privateContext->startpos = specs->startpos;
 	privateContext->startposActionFromJSON = specs->startposActionFromJSON;
+	privateContext->lsnOffset = specs->lsnOffset;
 
 	privateContext->mode = specs->mode;
 	privateContext->stdIn = specs->stdIn;
@@ -609,13 +610,24 @@ streamCheckResumePosition(StreamSpecs *specs)
 		specs->startpos = latest->lsn;
 		specs->startposComputedFromJSON = true;
 		specs->startposActionFromJSON = latest->action;
+		LogicalMessageMetadata *lastline = &(messages[lastLineNb]);
+		if (lastline->action == STREAM_ACTION_KEEPALIVE)
+		{
+			specs->lsnOffset = lastLineNb - lineNb - 2;
+		}
+		else
+		{
+			specs->lsnOffset = lastLineNb - lineNb - 1;
+		}
 
 		log_info("Resuming streaming at LSN %X/%X "
 				 "from first message with that LSN read in JSON file \"%s\", "
-				 "line %d",
+				 "line %d "
+				 "lsnOffset %d",
 				 LSN_FORMAT_ARGS(specs->startpos),
 				 latestStreamedContent.filename,
-				 lineNb);
+				 lineNb,
+				 specs->lsnOffset);
 
 		char *latestMessage = latestStreamedContent.lines[lineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
@@ -1540,10 +1552,17 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 		 * same message as the latest flushed in our JSON file when it's
 		 * actually a new message.
 		 */
-		privateContext->reachedStartPos =
-			privateContext->startpos < metadata->lsn ||
-			(privateContext->startpos == metadata->lsn &&
-			 metadata->action != privateContext->startposActionFromJSON);
+		if (privateContext->startpos == metadata->lsn)
+		{
+			if (privateContext->lsnOffset == 0)
+			{
+				privateContext->reachedStartPos = true;
+			}
+			else
+			{
+				privateContext->lsnOffset --;
+			}
+		}
 	}
 
 	if (!privateContext->reachedStartPos)
