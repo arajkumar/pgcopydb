@@ -668,6 +668,8 @@ follow_start_transform(StreamSpecs *specs)
 
 		close_fd_or_exit(specs->pipe_rt[0]);
 		close_fd_or_exit(specs->pipe_ta[1]);
+		fclose(specs->in);
+		fclose(specs->out);
 
 		return success;
 	}
@@ -713,6 +715,7 @@ follow_start_catchup(StreamSpecs *specs)
 		bool success = stream_apply_replay(specs);
 
 		close_fd_or_exit(specs->pipe_ta[0]);
+		fclose(specs->in);
 
 		return success;
 	}

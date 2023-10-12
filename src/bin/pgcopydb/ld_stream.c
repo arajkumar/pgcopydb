@@ -611,13 +611,14 @@ streamCheckResumePosition(StreamSpecs *specs)
 		specs->startposComputedFromJSON = true;
 		specs->startposActionFromJSON = latest->action;
 		LogicalMessageMetadata *lastline = &(messages[lastLineNb]);
+		log_info("Last message action is %c", lastline->action);
 		if (lastline->action == STREAM_ACTION_KEEPALIVE)
 		{
-			specs->lsnOffset = lastLineNb - lineNb - 2;
+			specs->lsnOffset = lastLineNb - lineNb - 1;
 		}
 		else
 		{
-			specs->lsnOffset = lastLineNb - lineNb - 1;
+			specs->lsnOffset = lastLineNb - lineNb;
 		}
 
 		log_info("Resuming streaming at LSN %X/%X "
