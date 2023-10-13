@@ -90,12 +90,6 @@ stream_transform_stream(StreamSpecs *specs)
 		return false;
 	}
 
-	if (!stream_init_context(specs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	TransformStreamCtx ctx = {
 		.context = privateContext,
 		.currentMsgIndex = 0
@@ -294,18 +288,6 @@ stream_transform_write_message(StreamContext *privateContext,
 		txn->commit = true;
 	}
 
-	/*
-	 * If we're in a continued transaction, it means that the earlier write
-	 * of this txn's BEGIN statement didn't have the COMMIT LSN. Therefore,
-	 * we need to maintain that LSN as a separate metadata file. This is
-	 * necessary because the COMMIT LSN is required later in the apply
-	 * process.
-	 */
-	if (txn->continued)
-	{
-		writeTxnMetadataFile(txn, privateContext->paths.dir);
-	}
-
 	/* now write the transaction out */
 	if (privateContext->out != NULL)
 	{
@@ -321,6 +303,18 @@ stream_transform_write_message(StreamContext *privateContext,
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	/*
+	 * If we're in a continued transaction, it means that the earlier write
+	 * of this txn's BEGIN statement didn't have the COMMIT LSN. Therefore,
+	 * we need to maintain that LSN as a separate metadata file. This is
+	 * necessary because the COMMIT LSN is required later in the apply
+	 * process.
+	 */
+	if (txn->continued && txn->commit)
+	{
+		writeTxnMetadataFile(txn, privateContext->paths.dir);
 	}
 
 	(void) FreeLogicalMessage(currentMsg);
