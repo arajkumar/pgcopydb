@@ -267,7 +267,7 @@ stream_transform_write_message(StreamContext *privateContext,
 	 * least a partial transaction within known boundaries.
 	 */
 	if (metadata->action != STREAM_ACTION_COMMIT &&
-		metadata->action != STREAM_ACTION_KEEPALIVE &&
+		/* metadata->action != STREAM_ACTION_KEEPALIVE && */
 		metadata->action != STREAM_ACTION_SWITCH &&
 		metadata->action != STREAM_ACTION_ENDPOS)
 	{

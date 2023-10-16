@@ -527,6 +527,14 @@ read_from_stream(FILE *stream, ReadFromStreamContext *context)
 			char **lines = (char **) calloc(count, sizeof(char *));
 			int lineCount = splitLines(buf, lines, count);
 
+			if (count != lineCount)
+			{
+				log_error("BUG: count != lineCount: %d != %d", count, lineCount);
+				free(lines);
+				free(buf);
+				return false;
+			}
+
 			log_trace("read_from_stream read %6zu bytes in %d lines %s[%lld]",
 					  bytes,
 					  lineCount,

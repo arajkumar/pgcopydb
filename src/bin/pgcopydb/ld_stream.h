@@ -286,6 +286,7 @@ typedef struct StreamContext
 
 	bool reachedStartPos;
 	StreamAction startposActionFromJSON;
+	int lsnOffset;
 
 	bool stdIn;
 	bool stdOut;
@@ -440,6 +441,7 @@ struct StreamSpecs
 
 	bool startposComputedFromJSON;
 	StreamAction startposActionFromJSON;
+	int lsnOffset;
 
 	LogicalStreamMode mode;
 
