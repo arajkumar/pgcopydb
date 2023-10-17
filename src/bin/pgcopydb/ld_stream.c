@@ -490,10 +490,24 @@ streamCheckResumePosition(StreamSpecs *specs)
 {
 	StreamContent latestStreamedContent = { 0 };
 
-	if (!stream_read_latest(specs, &latestStreamedContent))
+	bool success = stream_read_latest(specs, &latestStreamedContent);
+
+	if (!success)
 	{
-		/* errors have already been logged */
-		return false;
+		if (latestStreamedContent.count == 0)
+		{
+			/* errors have already been logged */
+			return false;
+		}
+		else
+		{
+			/* This indicates a corrupt JSON file, we can continue after repaiting */
+			log_warn("Failed to read latest JSON file \"%s\", "
+					"will try to continue after repairing it",
+					latestStreamedContent.filename);
+			/* Remove latest line from JSON file which is possibly corrupt */
+			latestStreamedContent.count--;
+		}
 	}
 
 	/*
@@ -596,7 +610,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 		{
 			LogicalMessageMetadata *previous = &(messages[lineNb]);
 
-			if (previous->lsn == latest->lsn)
+			if (previous->action != STREAM_ACTION_COMMIT)
 			{
 				latest = previous;
 			}
@@ -606,43 +620,61 @@ streamCheckResumePosition(StreamSpecs *specs)
 			}
 		}
 
+
 		specs->startpos = latest->lsn;
 		specs->startposComputedFromJSON = true;
-		specs->startposActionFromJSON = latest->action;
+		specs->startposActionFromJSON = STREAM_ACTION_COMMIT;
 
 		log_info("Resuming streaming at LSN %X/%X "
 				 "from first message with that LSN read in JSON file \"%s\", "
+				 "action %c "
 				 "line %d",
 				 LSN_FORMAT_ARGS(specs->startpos),
 				 latestStreamedContent.filename,
+				 specs->startposActionFromJSON,
 				 lineNb);
 
 		char *latestMessage = latestStreamedContent.lines[lineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
-	}
 
-	bool flush = false;
-	uint64_t lsn = 0;
+		char *recoveryFilename = "/tmp/recovery";
+		if (!unlink_file(recoveryFilename))
+		{
+			log_error("Failed to remove file \"%s\": %m", recoveryFilename);
+			return false;
+		}
 
-	if (!pgsql_replication_slot_exists(&src, specs->slot.slotName, &flush, &lsn))
-	{
-		/* errors have already been logged */
-		return false;
-	}
+		FILE *recoveryFile = fopen_with_umask(recoveryFilename, "ab", FOPEN_FLAGS_A, 0644);
+		if (recoveryFile == NULL)
+		{
+			log_error("Failed to open file \"%s\": %m", recoveryFilename);
+			return false;
+		}
 
-	/*
-	 * The receive process knows how to skip over LSNs that have already been
-	 * fetched in a previous run. What we are not able to do is fill-in a gap
-	 * between what we have on-disk and what the replication slot can send us.
-	 */
-	if (specs->startpos < lsn)
-	{
-		log_error("Failed to resume replication: on-disk next LSN is %X/%X  "
-				  "and replication slot LSN is %X/%X",
-				  LSN_FORMAT_ARGS(specs->startpos),
-				  LSN_FORMAT_ARGS(lsn));
+		char *lastMessage = NULL;
+		for (int i = 0; i <= lineNb; i++)
+		{
+			char *message = latestStreamedContent.lines[i];
+			if (fformat(recoveryFile, "%s\n", message) == -1)
+			{
+				log_error("Failed to write to file \"%s\": %m", recoveryFilename);
+				fclose(recoveryFile);
+				return false;
+			}
+			lastMessage = message;
+		}
 
-		return false;
+		fclose(recoveryFile);
+
+		log_info("Last message in recovery file is: %s", lastMessage);
+
+		if (rename(recoveryFilename, latestStreamedContent.filename) != 0)
+		{
+			log_error("Failed to move file \"%s\" to \"%s\": %m",
+					  recoveryFilename,
+					  latestStreamedContent.filename);
+			return false;
+		}
 	}
 
 	return true;
