@@ -646,12 +646,13 @@ stream_apply_sql(StreamApplyContext *context,
 
 				if (!readTxnCommitLSN(context, metadata))
 				{
-					/* errors have already been logged */
-					return false;
+					context->reachedStartPos = true;
 				}
-
-				context->reachedStartPos =
-					context->previousLSN < metadata->txnCommitLSN;
+				else
+				{
+					context->reachedStartPos =
+						context->previousLSN < metadata->txnCommitLSN;
+				}
 			}
 
 			log_debug("BEGIN %lld LSN %X/%X @%s, previous LSN %X/%X, COMMIT LSN %X/%X %s",
@@ -724,8 +725,29 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_COMMIT:
 		{
-			if (!context->reachedStartPos)
+			/*
+			 * It is possible that COMMIT comes just after SWITCH
+			 * and both endup having the same LSN. In that case,
+			 * we should keep the commit.
+			 */
+			context->reachedStartPos =
+				context->previousLSN <= metadata->lsn;
+
+			if (!context->reachedStartPos && context->transactionInProgress)
 			{
+				if (!pgsql_execute(pgsql, "ROLLBACK"))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				log_notice("Rollback transaction %lld LSN %X/%X "
+						   "previous LSN %X/%X",
+						   (long long) metadata->xid,
+						   LSN_FORMAT_ARGS(metadata->lsn),
+						   LSN_FORMAT_ARGS(context->previousLSN));
+
+				context->transactionInProgress = false;
 				return true;
 			}
 
@@ -1427,31 +1449,7 @@ readTxnCommitLSN(StreamApplyContext *context,
 		return true;
 	}
 
-	char txnfilename[MAXPGPATH] = { 0 };
-
-	if (!computeTxnMetadataFilename(metadata->xid,
-									context->paths.dir,
-									txnfilename))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	log_debug("stream_apply_sql: BEGIN message without a commit LSN, "
-			  "fetching commit LSN from transaction metadata file \"%s\"",
-			  txnfilename);
-
-	LogicalMessageMetadata txnMetadata = { .xid = metadata->xid };
-
-	if (!parseTxnMetadataFile(txnfilename, &txnMetadata))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	metadata->txnCommitLSN = txnMetadata.txnCommitLSN;
-
-	return true;
+	return false;
 }
 
 
