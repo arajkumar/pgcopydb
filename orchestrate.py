@@ -1,126 +1,92 @@
+#!/usr/bin/env python3
 # This script orchestrates CDC based migration process from TimescaleDB to Timescale.
 import subprocess
-import threading
 import os
 import time
 import signal
-import queue
 import re
 import sys
+import shutil
+import tempfile
+import threading
 
 DELAY_THRESHOLD = 30 # Megabytes.
 
+WORK_DIR = os.path.join(tempfile.gettempdir(), 'ts_cdc')
+shutil.rmtree(WORK_DIR, ignore_errors=True)
+os.makedirs(WORK_DIR, exist_ok=True)
+
 env = os.environ.copy()
-for key in ["PGCOPYDB_DIR", "PGCOPYDB_SWITCH_OVER_DIR", "PGCOPYDB_METADATA_DIR", "PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
+for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
     if env[key] == "" or env[key] == None:
         raise ValueError(f"${key} not found")
 
-# Stop any running pgcopydb process.
-print("Killing pgcopydb processes")
-subprocess.run(["killall", "-9", "pgcopydb"])
-subprocess.run(["rm", "-R",
-                f"{env['PGCOPYDB_DIR']}/cdc",
-                f"{env['PGCOPYDB_DIR']}/compare",
-                f"{env['PGCOPYDB_DIR']}/pgcopydb.*",
-                f"{env['PGCOPYDB_DIR']}/run",
-                f"{env['PGCOPYDB_DIR']}/schema",
-                f"{env['PGCOPYDB_DIR']}/snapshot",
-                f"{env['PGCOPYDB_DIR']}/dump",
-                f"{env['PGCOPYDB_DIR']}/logs"])
-subprocess.run(["mkdir", f"{env['PGCOPYDB_DIR']}/logs"])
-
-class CommandThread(threading.Thread):
+### Helper functions.
+class Command:
     def __init__(self, command: str = "", env = env, use_shell: bool = False, log_path: str = ""):
-        super().__init__()
         self.command = command
-        self.process = None
-        self.env = env
-        self.use_shell = use_shell
-        self.log_path = log_path
-        self.pid = None
-
-    def run(self):
-        if self.log_path == "":
-            self.process = subprocess.Popen(self.command, shell=self.use_shell, env=self.env)
+        if log_path == "":
+            self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env)
         else:
-            fname_stdout = f"{self.log_path}_stdout.log"
+            fname_stdout = f"{log_path}_stdout.log"
             f_stdout = open(fname_stdout, "w")
 
-            fname_stderr = f"{self.log_path}_stderr.log"
+            fname_stderr = f"{log_path}_stderr.log"
             f_stderr = open(fname_stderr, "w")
 
-            self.process = subprocess.Popen(self.command, shell=self.use_shell, env=self.env,
+            self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env,
                                             stdout=f_stdout, stderr=f_stderr)
-        self.pid = self.process.pid
+        self.wait_thread = threading.Thread(target=self.process_wait)
+        self.wait_thread.start()
+
+    def process_wait(self):
         self.process.wait()
+        code = self.process.returncode
+        if code != 0 and code != -15 and code != -9:
+            # -15 is for SIGTERM; -9 is for SIGKILL
+            # We ignore process execution that stops for SIGTERM and SIGKILL since these are signals
+            # given by self.terminate() and self.kill(). pgcopydb often requires these signals to stop.
+            #
+            # If we do not give these signals during the program execution (as and when required),
+            # then pgcopydb hangs indefinitely (for some reason) even if it has completed its execution.
+            raise RuntimeError(f"command '{self.command}' exited with {self.process.returncode} code")
 
-    def send_signal(self, signal_type):
-        if self.process is not None:
-            self.process.send_signal(signal_type)
+    def wait(self):
+        """
+        wait waits for the process to complete with a zero code.
+        """
+        self.wait_thread.join()
 
-    def get_pid(self):
-        return self.pid
+    def terminate(self):
+        self.process.terminate()
 
-def run_cmd(cmd: str):
-    if subprocess.run(cmd, shell=True, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE).returncode != 0:
-        raise RuntimeError(f"error running cmd: '{cmd}'")
+    def terminate_process_including_children(self):
+        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
 
-result = subprocess.run("psql -A -t -d $PGCOPYDB_SOURCE_PGURI -c \" select extversion from pg_extension where extname = 'timescaledb'; \" ", shell=True, env=env, stdout=subprocess.PIPE, text=True)
-source_ts_version = str(result.stdout)[:-1]
-result = subprocess.run("psql -A -t -d $PGCOPYDB_TARGET_PGURI -c \" select extversion from pg_extension where extname = 'timescaledb'; \" ", shell=True, env=env, stdout=subprocess.PIPE, text=True)
-target_ts_version = str(result.stdout)[:-1]
-if source_ts_version != target_ts_version:
-    raise RuntimeError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
+    def kill(self):
+        self.process.kill()
 
-cleanup_command = "pgcopydb stream cleanup"
-cleanup_thread = CommandThread(command=cleanup_command, use_shell=True,
-                                log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_cleanup")
-cleanup_thread.start()
-cleanup_thread.join()
+def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
+    stdout = subprocess.PIPE
+    stderr = subprocess.PIPE
+    if log_path != "":
+        fname_stdout = f"{log_path}_stdout.log"
+        stdout = open(fname_stdout, "w")
+        fname_stderr = f"{log_path}_stderr.log"
+        stderr = open(fname_stderr, "w")
+    result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
+    if result.returncode != 0 and not ignore_non_zero_code:
+        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code ")
+    return str(result.stdout)
 
-snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
-snapshot_thread = CommandThread(command=snapshot_command, use_shell=True,
-                                log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
-print("Creating snapshot ...")
-snapshot_thread.start()
+def psql(uri: str, sql: str):
+    return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d {uri} -c " {sql} " """
 
-time.sleep(10) # 10 seconds of wait should be enough to create a snapshot.
-
-follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
-follow_thread = CommandThread(command=follow_command, use_shell=True,
-                              log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
-print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc ...")
-follow_thread.start()
-
-run_cmd('psql -A -d $PGCOPYDB_TARGET_PGURI -c "select timescaledb_pre_restore()"')
-
-pgdump_command = f"pg_dump --jobs 8 $PGCOPYDB_SOURCE_PGURI --format d --file $PGCOPYDB_DIR/dump --exclude-table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
-pgdump_thread = CommandThread(command=pgdump_command, use_shell=True,
-                              log_path=f"{env['PGCOPYDB_DIR']}/logs/pgdump")
-print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
-start = time.time()
-pgdump_thread.start()
-pgdump_thread.join()
-time_taken = time.time() - start
-print(f"Completed in {time_taken:.0f}s")
-
-pgrestore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI -v --format d $PGCOPYDB_DIR/dump"
-pgrestore_thread = CommandThread(command=pgrestore_command, use_shell=True,
-                                 log_path=f"{env['PGCOPYDB_DIR']}/logs/pgrestore")
-print(f"Restoring from {env['PGCOPYDB_DIR']}/dump ...")
-start = time.time()
-pgrestore_thread.start()
-pgrestore_thread.join()
-time_taken = time.time() - start
-print(f"Completed in {time_taken:.0f}s")
-
-postrestore_command = "psql -A -d $PGCOPYDB_TARGET_PGURI -c \"begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit; \" "
-run_cmd(postrestore_command)
-
-snapshot_thread.send_signal(signal_type=signal.SIGINT)
-
-print("Applying buffered transactions ...")
-run_cmd("pgcopydb stream sentinel set apply")
+def run_sql(execute_on_target: bool, sql: str):
+    dest = "$PGCOPYDB_SOURCE_PGURI"
+    if execute_on_target:
+        dest = "$PGCOPYDB_TARGET_PGURI"
+    run_cmd(psql(dest, sql))
 
 def wait_for_signal(sig):
     received_signal = False
@@ -135,67 +101,6 @@ def wait_for_signal(sig):
         signal.pause()
 
     print(f"Received signal {sig}")
-
-analyze_queue = queue.Queue()
-def analyze_routine():
-    analyze_command = "psql -A -t -d $PGCOPYDB_TARGET_PGURI -c \" analyze verbose; \" "
-    run_cmd(analyze_command)
-    analyze_queue.put(1)
-    return
-
-analyze_started = False
-analyze_finished = False
-analyze_thread = threading.Thread(target=analyze_routine)
-while True:
-    delay = "psql -A -t -d $PGCOPYDB_SOURCE_PGURI -c \" select pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) delay from pgcopydb.sentinel \" "
-    result = subprocess.run(delay, shell=True, env=env, stdout=subprocess.PIPE, text=True)
-    delay_bytes = int(result.stdout)
-    delay_mb = int(delay_bytes / (1024 * 1024))
-    print(f"[WATCH] Source DB - Target DB => {delay_mb}MB")
-    if not analyze_started and delay_mb < DELAY_THRESHOLD:
-        print(f"Source DB - Target DB below {DELAY_THRESHOLD}MB threshold, analyzing Target DB ...")
-        analyze_started = True
-        analyze_thread.start()
-    if not analyze_finished and not analyze_queue.empty():
-        print("Waiting for analyze ...")
-        analyze_thread.join()
-        analyze_finished = True
-    if analyze_finished and delay_mb > 0:
-        print("[ACTION NEEDED] When you are ready, stop the traffic on your Source DB so that 'Source DB - Target DB' can be 0")
-    if analyze_finished and delay_mb == 0:
-        # At this moment, the historical and live data has been migrated.
-        # The user is yet to verify the intigrity of historical + live data for which he needs to stop the traffic.
-        # The moment he think he is ready for verification, he will stop the traffic and signal a SIGHUP, and we
-        # will respond with stopping the live replay process.
-        print("Source DB and Target DB are in sync.")
-        print("[ACTION NEEDED] Waiting for SIGHUP to stop live-replay process so that you can check data intigrity ...")
-        wait_for_signal(signal.SIGHUP)
-        print("[SIGNAL] Received SIGHUP")
-        break
-    time.sleep(10)
-
-print("Waiting for pgcopydb follow to stop ...")
-pid = follow_thread.get_pid()
-os.kill(pid, signal.SIGKILL)
-follow_thread.join()
-print("Stopped")
-
-print("[ACTION NEEDED] Now, you should check intigrity of your data. Once you are confident, you need to give SIGCONT to continue")
-
-# At this moment, user has finished verifying data intigrity. He is ready to resume the migration process
-# and move into the switch-over phase. Note, the traffic remains halted ATM.
-wait_for_signal(signal.SIGCONT)
-print("[SIGNAL] Received SIGCONT")
-
-switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --plugin wal2json --slot-name switchover"
-switchover_snapshot_thread = CommandThread(command=switchover_snapshot_command, use_shell=True,
-                                           log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
-print("Starting switchover snapshot ...")
-switchover_snapshot_thread.start()
-
-time.sleep(10) # Wait for snapshot to create.
-
-switchover_snapshot_log = f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot_stderr.log"
 
 def extract_lsn_and_snapshot(log_line: str):
     """
@@ -216,83 +121,220 @@ def extract_lsn_and_snapshot(log_line: str):
 
     return lsn, snapshot_id
 
-end_pos_lsn = ""
-switchover_snapshot_id = ""
-with open(switchover_snapshot_log, 'r') as file:
-    line_count = 0
-    for line in file:
-        line_count += 1
-        if line_count == 2:
-            log_line = line.strip()
-            end_pos_lsn, switchover_snapshot_id = extract_lsn_and_snapshot(log_line)
-            break
+### Helper functions ends.
 
-print(f"Last LSN (Log Sequence Number) to be streamed => {end_pos_lsn}")
-run_cmd(f"pgcopydb stream sentinel set endpos {end_pos_lsn}")
+def pgcopydb_init_env():
+    env["PGCOPYDB_DIR"] = WORK_DIR
+    env["PGCOPYDB_SWITCH_OVER_DIR"] = env["PGCOPYDB_DIR"] + "/switch_over"
+    env["PGCOPYDB_METADATA_DIR"] = env["PGCOPYDB_SWITCH_OVER_DIR"] + "/caggs_metadata"
 
-endpos_follow_command = "pgcopydb follow --dir $PGCOPYDB_SWITCH_OVER_DIR --plugin wal2json --resume"
-endpos_follow_thread = CommandThread(endpos_follow_command, use_shell=True,
-                                     log_path=f"{env['PGCOPYDB_DIR']}/logs/endpos_follow")
+    os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
+    os.makedirs(f"{WORK_DIR}/logs", exist_ok=False)
 
-print(f"Streaming upto {end_pos_lsn} (Last LSN) ...")
-endpos_follow_thread.start()
-endpos_follow_log = f"{env['PGCOPYDB_DIR']}/logs/endpos_follow_stderr.log"
+def check_timescaledb_version():
+    result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
+    source_ts_version = str(result)[:-1]
 
-def is_endpos_streamed(log_line: str):
-    pattern_1 = r"Streamed up to write_lsn [A-F0-9/]+, flush_lsn [A-F0-9/]+, stopping"
-    pattern_2 = r"Current endpos [A-F0-9/]+ was previously reached at [A-F0-9/]+"
-    return bool(re.search(pattern_1, log_line)) or bool(re.search(pattern_2, log_line))
+    result = run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
+    target_ts_version = str(result)[:-1]
 
-while True:
+    if source_ts_version != target_ts_version:
+        raise RuntimeError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
+
+def cleanup_replication_progress():
+    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
+    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
+    if run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb' or slot_name = 'switchover');")) == "t":
+        raise RuntimeError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
+
+def create_snapshot_and_follow():
+    print("Creating snapshot ...")
+    snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
+    snapshot_proc = Command(command=snapshot_command, use_shell=True,
+                                    log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
+
     time.sleep(5)
-    file = open(endpos_follow_log, 'r')
-    done = False
-    for line in file:
-        l = line.strip()
-        if is_endpos_streamed(l):
-            print("End position LSN has been streamed successfully")
-            done = True
+
+    print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc ...")
+    follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
+    follow_proc = Command(command=follow_command, use_shell=True,
+                                log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
+    return (snapshot_proc, follow_proc)
+
+def migrate_existing_data():
+    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
+
+    print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
+    start = time.time()
+    pgdump_command = f"pg_dump -d $PGCOPYDB_SOURCE_PGURI --jobs 8 --no-owner --no-privileges --no-tablespaces --quote-all-identifiers --format d --file $PGCOPYDB_DIR/dump --exclude-table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
+    run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pg_dump_existing_data")
+    time_taken = (time.time() - start) / 60
+    print(f"Completed in {time_taken:.1f}m")
+
+    print(f"Restoring from {env['PGCOPYDB_DIR']}/dump ...")
+    start = time.time()
+    pgrestore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --no-owner --no-privileges --no-tablespaces -v --format d $PGCOPYDB_DIR/dump"
+    run_cmd(pgrestore_command, f"{env['PGCOPYDB_DIR']}/logs/pg_restore_existing_data", ignore_non_zero_code=True)
+    time_taken = (time.time() - start) / 60
+    print(f"Completed in {time_taken:.1f}m")
+
+    run_sql(execute_on_target=True,
+        sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
+
+def wait_for_DBs_to_sync():
+    def get_delay():
+        delay_bytes = int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) delay from pgcopydb.sentinel;")))
+        return int(delay_bytes / (1024 * 1024))
+
+    analyzed = False
+    analyze_cmd = 'psql -A -t -d $PGCOPYDB_TARGET_PGURI -c " analyze verbose; " '
+    while True:
+        delay_mb = get_delay()
+        print(f"[WATCH] Source DB - Target DB => {delay_mb}MB")
+        if delay_mb < DELAY_THRESHOLD and not analyzed:
+            print("Starting analyze on Target DB. This might take sometime to complete ...")
+            run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
+            print("Analyze complete")
+            analyzed = True
+            continue
+        if analyzed:
+            if delay_mb > 0 and delay_mb < DELAY_THRESHOLD:
+                print("[ACTION NEEDED] When you are ready, stop the traffic on your Source DB and wait for 'Source DB - Target DB' to be 0")
+            elif delay_mb == 0:
+                # At this moment, the historical and live data has been migrated.
+                # The user is yet to verify the integrity of historical + live data for which he needs to stop the traffic.
+                # The moment he think he is ready for verification, he will stop the traffic and signal a SIGHUP, and we
+                # will respond with stopping the live replay process.
+                print("Source DB and Target DB are in sync.")
+                print("[ACTION NEEDED] Waiting for SIGHUP to stop live-replay process so that you can check data integrity ...")
+                wait_for_signal(signal.SIGHUP)
+                print("[SIGNAL] Received SIGHUP")
+                break
+        time.sleep(10)
+
+def wait_for_LSN_to_sync():
+    switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --plugin wal2json --slot-name switchover"
+    switchover_snapshot_proc = Command(command=switchover_snapshot_command, use_shell=True,
+                                            log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
+    switchover_snapshot_log = f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot_stderr.log"
+
+    time.sleep(10) # Wait for snapshot to create.
+
+    end_pos_lsn = ""
+    with open(switchover_snapshot_log, 'r') as file:
+        line_count = 0
+        for line in file:
+            line_count += 1
+            if line_count == 2:
+                log_line = line.strip()
+                end_pos_lsn, _ = extract_lsn_and_snapshot(log_line)
+                break
+
+    print(f"Last LSN (Log Sequence Number) to be streamed => {end_pos_lsn}")
+    run_cmd(f"pgcopydb stream sentinel set endpos {end_pos_lsn}")
+
+    print(f"Streaming upto {end_pos_lsn} (Last LSN) ...")
+    endpos_follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --resume"
+    endpos_follow_proc = Command(endpos_follow_command, use_shell=True,
+                                        log_path=f"{env['PGCOPYDB_DIR']}/logs/endpos_follow")
+
+    endpos_follow_log = f"{env['PGCOPYDB_DIR']}/logs/endpos_follow_stderr.log"
+
+    def is_endpos_streamed(log_line: str):
+        pattern_1 = r"Streamed up to write_lsn [A-F0-9/]+, flush_lsn [A-F0-9/]+, stopping"
+        pattern_2 = r"Follow mode is now done, reached replay_lsn [A-F0-9/]+ with endpos [A-F0-9/]+"
+        return bool(re.search(pattern_1, log_line)) or bool(re.search(pattern_2, log_line))
+
+    while True:
+        time.sleep(5)
+        file = open(endpos_follow_log, 'r')
+        done = False
+        for line in file:
+            l = line.strip()
+            if is_endpos_streamed(l):
+                print("End position LSN has been streamed successfully")
+                done = True
+                break
+        if done:
             break
-    if done:
-        break
 
-print("Waiting for 'pgcopydb follow' for Last LSN to complete ...")
-endpos_follow_thread.join()
+    endpos_follow_proc.kill()
+    return switchover_snapshot_proc
 
-copy_sequences_command = "pgcopydb copy sequences"
-copy_sequences_thread = CommandThread(copy_sequences_command, use_shell=True,
-                                      log_path=f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
-print("Copying sequences ...")
-copy_sequences_thread.start()
-copy_sequences_thread.join()
+def copy_sequences():
+    run_cmd("pgcopydb copy sequences", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
 
-metadata_pg_dump_command = f"pg_dump $PGCOPYDB_SOURCE_PGURI --format d --file $PGCOPYDB_METADATA_DIR --table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat ${env['PGCOPYDB_SWITCH_OVER_DIR']}/snapshot)"
-metadata_pg_dump_thread = CommandThread(metadata_pg_dump_command, use_shell=True,
-                                        log_path=f"{env['PGCOPYDB_DIR']}/logs/pg_dump_metadata")
-print(f"Dumping metadata from Source DB to {env['PGCOPYDB_METADATA_DIR']} ...")
-start = time.time()
-metadata_pg_dump_thread.start()
-metadata_pg_dump_thread.join()
-time_taken = time.time() - start
-print(f"Completed in {time_taken:.0f}s")
+def migrate_caggs_metadata():
+    print(f"Dumping metadata from Source DB to {env['PGCOPYDB_METADATA_DIR']} ...")
+    metadata_pg_dump_command = f"pg_dump -d $PGCOPYDB_SOURCE_PGURI --no-owner --no-privileges --no-tablespaces --quote-all-identifiers --format d --file $PGCOPYDB_METADATA_DIR --table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_SWITCH_OVER_DIR']}/snapshot)"
+    start = time.time()
+    run_cmd(metadata_pg_dump_command, f"{env['PGCOPYDB_DIR']}/logs/pg_dump_metadata")
+    time_taken = (time.time() - start) / 60
+    print(f"Completed in {time_taken:.1f}m")
 
-metadata_pg_restore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --format d $PGCOPYDB_METADATA_DIR"
-metadata_pg_restore_thread = CommandThread(metadata_pg_restore_command, use_shell=True,
-                                        log_path=f"{env['PGCOPYDB_DIR']}/logs/pg_restore_metadata")
-print(f"Restoring metadata from {env['PGCOPYDB_METADATA_DIR']} to Target DB ...")
-start = time.time()
-metadata_pg_restore_thread.start()
-metadata_pg_restore_thread.join()
-time_taken = time.time() - start
-print(f"Completed in {time_taken:.0f}s")
+    print(f"Restoring metadata from {env['PGCOPYDB_METADATA_DIR']} to Target DB ...")
+    metadata_pg_restore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --no-owner --no-privileges --no-tablespaces --data-only --format d $PGCOPYDB_METADATA_DIR"
+    start = time.time()
+    run_cmd(metadata_pg_restore_command, f"{env['PGCOPYDB_DIR']}/logs/pg_restore_metadata")
+    time_taken = (time.time() - start) / 60
+    print(f"Completed in {time_taken:.1f}m")
 
-print("Enabling continuous aggregates refresh policies ...")
-enable_cagg_jobs = "psql -A -t -d $PGCOPYDB_TARGET_PGURI -c \" select alter_job(job_id, scheduled => true) from timescaledb_information.jobs where application_name like 'Refresh Continuous%'; \" "
-run_cmd(enable_cagg_jobs)
+def enable_caggs_policies():
+    run_sql(execute_on_target=True,
+                 sql="select alter_job(job_id, scheduled => true) from timescaledb_information.jobs where application_name like 'Refresh Continuous%';")
+    run_sql(execute_on_target=True,
+                 sql="select timescaledb_post_restore();")
 
-print("Running all jobs ...")
-run_all_jobs = "psql -A -t -d $PGCOPYDB_TARGET_PGURI -c \" select timescaledb_post_restore(); \" "
-run_cmd(run_all_jobs)
+def cleanup():
+    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
+    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR")
 
-print("Migration successfully completed")
-sys.exit(0)
+if __name__ == "__main__":
+    pgcopydb_init_env()
+
+    print("Verifying TimescaleDB version in Source DB and Target DB ...")
+    check_timescaledb_version()
+
+    print("Cleaning up any replication progress ...")
+    cleanup_replication_progress()
+
+    snapshot_proc, follow_proc = create_snapshot_and_follow()
+
+    print("Migrating existing data from Source DB to Target DB ...")
+    migrate_existing_data()
+    snapshot_proc.terminate()
+
+    print("Applying buffered transactions ...")
+    run_cmd("pgcopydb stream sentinel set apply")
+
+    wait_for_DBs_to_sync()
+
+    print("Waiting for live-replay to stop ...")
+    follow_proc.terminate_process_including_children()
+    print("Stopped")
+
+    print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need to give SIGCONT to continue")
+    # At this moment, user has finished verifying data integrity. He is ready to resume the migration process
+    # and move into the switch-over phase. Note, the traffic remains halted ATM.
+    wait_for_signal(signal.SIGCONT)
+    print("[SIGNAL] Received SIGCONT")
+
+    print("Syncing last LSN in Source DB to Target DB ...")
+    switchover_snapshot_proc = wait_for_LSN_to_sync()
+
+    print("Copying sequences ...")
+    copy_sequences()
+
+    print("Migrating caggs metadata ...")
+    migrate_caggs_metadata()
+
+    switchover_snapshot_proc.terminate()
+
+    print("Enabling continuous aggregates refresh policies ...")
+    enable_caggs_policies()
+
+    print("Cleaning up replication data ...")
+    cleanup()
+
+    print("Migration successfully completed")
+    sys.exit(0)
