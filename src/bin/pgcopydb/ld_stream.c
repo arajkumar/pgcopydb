@@ -1535,15 +1535,28 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 	if (!privateContext->reachedStartPos)
 	{
 		/*
-		 * Also the same LSN might be assigned to a BEGIN message, a COMMIT
-		 * message, and a KEEPALIVE message. Avoid skipping what looks like the
-		 * same message as the latest flushed in our JSON file when it's
-		 * actually a new message.
+		 * Write InternalMessage abort to indicate last
+		 * transcation is a partial transaction.
 		 */
-		privateContext->reachedStartPos =
-			privateContext->startpos < metadata->lsn ||
-			(privateContext->startpos == metadata->lsn &&
-			 metadata->action != privateContext->startposActionFromJSON);
+		log_debug("Reached startpos %X/%X, writing abort message",
+				  LSN_FORMAT_ARGS(privateContext->startpos));
+		/* we might have to rotate to the next on-disk file */
+		if (!streamRotateFile(context))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+		InternalMessage abort = {
+			.action = STREAM_ACTION_ABORT,
+			.lsn = metadata->lsn
+		};
+
+		if (!stream_write_internal_message(context, &abort))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+		privateContext->reachedStartPos = true;
 	}
 
 	if (!privateContext->reachedStartPos)
@@ -2125,6 +2138,11 @@ StreamActionFromChar(char action)
 			return STREAM_ACTION_ENDPOS;
 		}
 
+		case 'A':
+		{
+			return STREAM_ACTION_ABORT;
+		}
+
 		default:
 		{
 			log_error("Failed to parse JSON message action: \"%c\"", action);
@@ -2198,6 +2216,11 @@ StreamActionToString(StreamAction action)
 		case STREAM_ACTION_ENDPOS:
 		{
 			return "ENDPOS";
+		}
+
+		case STREAM_ACTION_ABORT:
+		{
+			return "ABORT";
 		}
 
 		default:

@@ -1106,6 +1106,25 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 			break;
 		}
 
+		case STREAM_ACTION_ABORT:
+		{
+			stmt->stmt.abort.lsn = metadata->lsn;
+
+			if (mesg->isTransaction)
+			{
+				(void) streamLogicalTransactionAppendStatement(txn, stmt);
+			}
+			else
+			{
+				/* copy the stmt over, then free the extra allocated memory */
+				mesg->action = metadata->action;
+				mesg->command.endpos = stmt->stmt.endpos;
+				free(stmt);
+			}
+
+			break;
+		}
+
 		/* now handle DML messages from the output plugin */
 		default:
 		{

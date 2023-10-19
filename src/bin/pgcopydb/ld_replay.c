@@ -190,6 +190,7 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 		case STREAM_ACTION_TRUNCATE:
 		case STREAM_ACTION_MESSAGE:
 		case STREAM_ACTION_SWITCH:
+		case STREAM_ACTION_ABORT:
 		default:
 		{
 			break;

@@ -42,7 +42,8 @@ typedef enum
 	STREAM_ACTION_MESSAGE = 'M',
 	STREAM_ACTION_SWITCH = 'X',
 	STREAM_ACTION_KEEPALIVE = 'K',
-	STREAM_ACTION_ENDPOS = 'E'
+	STREAM_ACTION_ENDPOS = 'E',
+	STREAM_ACTION_ABORT = 'A'
 } StreamAction;
 
 typedef struct InternalMessage
@@ -177,6 +178,11 @@ typedef struct LogicalMessageEndpos
 	uint64_t lsn;
 } LogicalMessageEndpos;
 
+typedef struct LogicalMessageAbort
+{
+	uint64_t lsn;
+} LogicalMessageAbort;
+
 /*
  * The JSON-lines logical decoding stream is then parsed into transactions that
  * contains a series of insert/update/delete/truncate commands.
@@ -194,6 +200,7 @@ typedef struct LogicalTransactionStatement
 		LogicalMessageSwitchWAL switchwal;
 		LogicalMessageKeepalive keepalive;
 		LogicalMessageEndpos endpos;
+		LogicalMessageEndpos abort;
 	} stmt;
 
 	struct LogicalTransactionStatement *prev; /* double linked-list */
