@@ -92,17 +92,19 @@ stream_init_specs(StreamSpecs *specs,
 		case STREAM_PLUGIN_WAL2JSON:
 		{
 			KeyVal options = {
-				.count = 6,
+				.count = 7,
 				.keywords = {
 					"format-version",
 					"include-xids",
 					"include-schemas",
 					"include-transaction",
 					"include-types",
+					"include-lsn",
 					"filter-tables"
 				},
 				.values = {
 					"2",
+					"true",
 					"true",
 					"true",
 					"true",

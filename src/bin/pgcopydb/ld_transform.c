@@ -1023,6 +1023,30 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				return false;
 			}
 
+			/*
+			 * When using test_decoding, we append the received message as a
+			 * JSON string in the "message" object key. When using wal2json, we
+			 * use the raw JSON message as a json object in the "message"
+			 * object key.
+			 */
+			JSON_Value_Type jsmesgtype =
+				json_value_get_type(
+					json_object_get_value(
+						json_value_get_object(json),
+						"message"));
+
+			if (jsmesgtype == JSONObject)
+			{
+				if (!parseWal2jsonMessage(privateContext, message, json))
+				{
+					log_error("Failed to parse wal2json message, "
+							  "see above for details");
+					return false;
+				}
+
+			}
+			txn->commitLSN = metadata->txnCommitLSN;
+
 			break;
 		}
 

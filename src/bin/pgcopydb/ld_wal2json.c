@@ -120,6 +120,20 @@ parseWal2jsonMessage(StreamContext *privateContext,
 	/* most actions share a need for "schema" and "table" properties */
 	JSON_Object *jsobj = json_value_get_object(json);
 
+	if (metadata->action == STREAM_ACTION_BEGIN)
+	{
+		char *nextlsn = (char *) json_object_dotget_string(jsobj, "message.nextlsn");
+		if (nextlsn != NULL)
+		{
+			if (!parseLSN(nextlsn, &(metadata->txnCommitLSN)))
+			{
+				log_error("Failed to parse LSN \"%s\"", nextlsn);
+				return false;
+			}
+		}
+		return true;
+	}
+
 	char *schema = NULL;
 	char *table = NULL;
 
