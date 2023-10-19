@@ -259,27 +259,54 @@ stream_transform_write_message(StreamContext *privateContext,
 	LogicalMessage *currentMsg = &(privateContext->currentMsg);
 	LogicalMessageMetadata *metadata = &(privateContext->metadata);
 
-	/*
-	 * Is it time to close the current message and prepare a new one?
-	 *
-	 * If not, just skip writing the current message/transaction to the SQL
-	 * file, we need a full transaction in-memory to be able to do that. Or at
-	 * least a partial transaction within known boundaries.
-	 */
-	if (metadata->action != STREAM_ACTION_COMMIT &&
-		metadata->action != STREAM_ACTION_KEEPALIVE &&
-		metadata->action != STREAM_ACTION_SWITCH &&
-		metadata->action != STREAM_ACTION_ENDPOS)
+	if (currentMsg->isTransaction)
 	{
-		return true;
-	}
+		LogicalTransaction *txn = &(currentMsg->command.tx);
 
-	LogicalTransaction *txn = &(currentMsg->command.tx);
+		/* we need to know the end LSN of the transaction */
+		if (txn->commitLSN == InvalidXLogRecPtr)
+		{
+			return true;
+		}
 
-	if (metadata->action == STREAM_ACTION_COMMIT)
-	{
-		/* now write the COMMIT message even when txn is continued */
-		txn->commit = true;
+		/*
+		 * Remove SWITCH message from the transcation and append it
+		 * to the end.
+		 */
+		for (LogicalTransactionStatement *stmt = txn->first;
+			 stmt != NULL;
+			 stmt = stmt->next)
+		{
+			if (stmt->action == STREAM_ACTION_SWITCH)
+			{
+				if (stmt->next == NULL)
+				{
+					/* SWITCH is already at the end of the transaction */
+					break;
+				}
+
+				/* If SWITCH is first, then update the first pointer */
+				if (stmt == txn->first)
+				{
+					txn->first = stmt->next;
+					stmt->prev = NULL;
+				}
+				else
+				{
+					/* remove the SWITCH statement from the transaction */
+					stmt->prev->next = stmt->next;
+					stmt->next->prev = stmt->prev;
+				}
+
+				/* append the SWITCH statement at the end of the transaction */
+				stmt->prev = txn->last;
+				stmt->next = NULL;
+				txn->last->next = stmt;
+				txn->last = stmt;
+
+				break;
+			}
+		}
 	}
 
 	/* now write the transaction out */
@@ -299,18 +326,6 @@ stream_transform_write_message(StreamContext *privateContext,
 		return false;
 	}
 
-	/*
-	 * If we're in a continued transaction, it means that the earlier write
-	 * of this txn's BEGIN statement didn't have the COMMIT LSN. Therefore,
-	 * we need to maintain that LSN as a separate metadata file. This is
-	 * necessary because the COMMIT LSN is required later in the apply
-	 * process.
-	 */
-	if (txn->continued && txn->commit)
-	{
-		writeTxnMetadataFile(txn, privateContext->paths.dir);
-	}
-
 	(void) FreeLogicalMessage(currentMsg);
 
 	if (metadata->action == STREAM_ACTION_COMMIT)
@@ -320,35 +335,6 @@ stream_transform_write_message(StreamContext *privateContext,
 
 		*currentMsg = empty;
 		++(*currentMsgIndex);
-	}
-	else if (currentMsg->isTransaction)
-	{
-		/*
-		 * A SWITCH WAL or a KEEPALIVE or an ENDPOS message happened in the
-		 * middle of a transaction: we need to mark the new transaction as
-		 * a continued part of the previous one.
-		 */
-		log_debug("stream_transform_line: continued transaction at %c: %X/%X",
-				  metadata->action,
-				  LSN_FORMAT_ARGS(metadata->lsn));
-
-		LogicalMessage new = { 0 };
-
-		new.isTransaction = true;
-		new.action = STREAM_ACTION_BEGIN;
-
-		LogicalTransaction *old = &(currentMsg->command.tx);
-		LogicalTransaction *txn = &(new.command.tx);
-
-		txn->continued = true;
-
-		txn->xid = old->xid;
-		txn->beginLSN = old->beginLSN;
-		strlcpy(txn->timestamp, old->timestamp, sizeof(txn->timestamp));
-
-		txn->first = NULL;
-
-		*currentMsg = new;
 	}
 
 	return true;
