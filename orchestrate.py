@@ -9,6 +9,7 @@ import sys
 import shutil
 import tempfile
 import threading
+import queue
 
 DELAY_THRESHOLD = 30 # Megabytes.
 
@@ -18,7 +19,7 @@ os.makedirs(WORK_DIR, exist_ok=True)
 
 env = os.environ.copy()
 for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
-    if env[key] == "" or env[key] == None:
+    if key not in env or env[key] == "" or env[key] == None:
         raise ValueError(f"${key} not found")
 
 ### Helper functions.
@@ -88,19 +89,22 @@ def run_sql(execute_on_target: bool, sql: str):
         dest = "$PGCOPYDB_TARGET_PGURI"
     run_cmd(psql(dest, sql))
 
-def wait_for_signal(sig):
-    received_signal = False
-
-    def handler(signum, frame):
-        nonlocal received_signal
-        received_signal = True
-
-    signal.signal(sig, handler)
-    print(f"PID: {os.getpid()} - Waiting for signal {sig}")
-    while not received_signal:
-        signal.pause()
-
-    print(f"Received signal {sig}")
+def wait_for_keypress(key: str) -> queue.Queue:
+    """
+    waits for the 'key' to be pressed. It returns a keypress_event queue
+    that becomes non-empty when the required 'key' is pressed (and ENTER).
+    """
+    notify_queue = queue.Queue(maxsize=1)
+    def key_e():
+        while True:
+            k = input()
+            if k.lower() == key.lower():
+                notify_queue.put(1)
+                notify_queue.task_done()
+                return
+    key_event = threading.Thread(target=key_e)
+    key_event.start()
+    return notify_queue
 
 def extract_lsn_and_snapshot(log_line: str):
     """
@@ -188,28 +192,19 @@ def wait_for_DBs_to_sync():
 
     analyzed = False
     analyze_cmd = 'psql -A -t -d $PGCOPYDB_TARGET_PGURI -c " analyze verbose; " '
+    key_event_queue = wait_for_keypress(key="s")
     while True:
         delay_mb = get_delay()
-        print(f"[WATCH] Source DB - Target DB => {delay_mb}MB")
-        if delay_mb < DELAY_THRESHOLD and not analyzed:
+        print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. Press 's' (and ENTER) to stop live-replay")
+        if not analyzed and delay_mb < DELAY_THRESHOLD:
             print("Starting analyze on Target DB. This might take sometime to complete ...")
             run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
             print("Analyze complete")
             analyzed = True
             continue
-        if analyzed:
-            if delay_mb > 0 and delay_mb < DELAY_THRESHOLD:
-                print("[ACTION NEEDED] When you are ready, stop the traffic on your Source DB and wait for 'Source DB - Target DB' to be 0")
-            elif delay_mb == 0:
-                # At this moment, the historical and live data has been migrated.
-                # The user is yet to verify the integrity of historical + live data for which he needs to stop the traffic.
-                # The moment he think he is ready for verification, he will stop the traffic and signal a SIGHUP, and we
-                # will respond with stopping the live replay process.
-                print("Source DB and Target DB are in sync.")
-                print("[ACTION NEEDED] Waiting for SIGHUP to stop live-replay process so that you can check data integrity ...")
-                wait_for_signal(signal.SIGHUP)
-                print("[SIGNAL] Received SIGHUP")
-                break
+        if not key_event_queue.empty():
+            print("Received key press event: 's'")
+            break
         time.sleep(10)
 
 def wait_for_LSN_to_sync():
@@ -313,11 +308,16 @@ if __name__ == "__main__":
     follow_proc.terminate_process_including_children()
     print("Stopped")
 
-    print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need to give SIGCONT to continue")
+    print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need Press 'c' (and ENTER) to continue")
+    event_queue = wait_for_keypress(key="c")
+    while True:
+        if not event_queue.empty():
+            print("Received key press event: 'c'")
+            print("Continuing ...")
+            break
+        time.sleep(1)
     # At this moment, user has finished verifying data integrity. He is ready to resume the migration process
     # and move into the switch-over phase. Note, the traffic remains halted ATM.
-    wait_for_signal(signal.SIGCONT)
-    print("[SIGNAL] Received SIGCONT")
 
     print("Syncing last LSN in Source DB to Target DB ...")
     switchover_snapshot_proc = wait_for_LSN_to_sync()
