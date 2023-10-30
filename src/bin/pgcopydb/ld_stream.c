@@ -660,33 +660,6 @@ streamCheckResumePosition(StreamSpecs *specs)
 		LogicalMessageMetadata *messages = latestStreamedContent.messages;
 		LogicalMessageMetadata *latest = &(messages[lastLineNb]);
 
-		/*
-		 * We could have several messages following each-other with the same
-		 * LSN, typically a sequence like:
-		 *
-		 *  {"action":"I","xid":"492","lsn":"0/244BEE0", ...}
-		 *  {"action":"K","lsn":"0/244BEE0", ...}
-		 *  {"action":"E","lsn":"0/244BEE0"}
-		 *
-		 * In that case we want to remember the latest message action as being
-		 * INSERT rather than ENDPOS.
-		 */
-		int lineNb = lastLineNb;
-
-		for (; lineNb > 0; lineNb--)
-		{
-			LogicalMessageMetadata *previous = &(messages[lineNb]);
-
-			if (previous->lsn == latest->lsn)
-			{
-				latest = previous;
-			}
-			else
-			{
-				break;
-			}
-		}
-
 		specs->startpos = latest->lsn;
 		specs->startposComputedFromJSON = true;
 		specs->startposActionFromJSON = latest->action;
@@ -696,9 +669,9 @@ streamCheckResumePosition(StreamSpecs *specs)
 				 "line %d",
 				 LSN_FORMAT_ARGS(specs->startpos),
 				 latestStreamedContent.filename,
-				 lineNb);
+				 lastLineNb);
 
-		char *latestMessage = latestStreamedContent.lines[lineNb];
+		char *latestMessage = latestStreamedContent.lines[lastLineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
 	}
 

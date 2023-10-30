@@ -660,6 +660,21 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_BEGIN:
 		{
+			/*
+			 * Abort the previous transaction, it might be due to
+			 * restart or resuming from a previous run.
+			 */
+			if (context->transactionInProgress)
+			{
+				if (!pgsql_execute(pgsql, "ROLLBACK"))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				context->transactionInProgress = false;
+			}
+
 			if (metadata->lsn == InvalidXLogRecPtr ||
 				IS_EMPTY_STRING_BUFFER(metadata->timestamp))
 			{

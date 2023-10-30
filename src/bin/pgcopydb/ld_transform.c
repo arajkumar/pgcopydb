@@ -244,12 +244,28 @@ stream_transform_resume(StreamSpecs *specs)
 	 */
 	if (file_exists(jsonFileName))
 	{
+		/*
+		 * While resuming, jsonFileName might have partially written
+		 * transcation, which can either have BEGIN without a COMMIT or
+		 * a COMMIT without a BEGIN or DML statements without a BEGIN.
+		 * This would break replay buffer managment as it expects a complete
+		 * transaction with BEGIN and COMMIT.
+		 *
+		 * To mitigate this, we will not stream the resumed file to catchup,
+		 * by setting privateContext->out to NULL., but we would still call
+		 * stream_transform_file() to resume the parsing context.
+		 */
+		FILE *out = privateContext->out;
+		privateContext->out = NULL;
+
 		if (!stream_transform_file(specs, jsonFileName, sqlFileName))
 		{
 			log_error("Failed to resume transforming from existing file \"%s\"",
 					  sqlFileName);
+			privateContext->out = out;
 			return false;
 		}
+		privateContext->out = out;
 	}
 
 	return true;
@@ -1074,9 +1090,19 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 		{
 			if (mesg->isTransaction)
 			{
-				log_error("Failed to parse BEGIN: "
-						  "transaction already in progress");
-				return false;
+				txn = &(mesg->command.tx);
+
+				log_notice("Ignore incomplete transaction xid %lld "
+						   "at %X/%X",
+						   (long long) txn->xid,
+						   LSN_FORMAT_ARGS(txn->beginLSN));
+
+				(void) FreeLogicalMessage(mesg);
+
+				/* then prepare a new one, reusing the same memory area */
+				LogicalMessage empty = { 0 };
+
+				*mesg = empty;
 			}
 
 			mesg->isTransaction = true;
