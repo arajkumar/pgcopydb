@@ -368,6 +368,7 @@ typedef struct StreamApplyContext
 	uint32_t WalSegSz;          /* information about source database */
 
 	uint64_t previousLSN;       /* register COMMIT LSN progress */
+	uint64_t switchLSN;       /* register COMMIT LSN progress */
 
 	LSNTracking *lsnTrackingList;
 

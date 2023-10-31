@@ -653,13 +653,29 @@ stream_apply_sql(StreamApplyContext *context,
 					  LSN_FORMAT_ARGS(context->previousLSN),
 					  LSN_FORMAT_ARGS(metadata->lsn));
 
-			context->previousLSN = metadata->lsn;
+			context->switchLSN = metadata->lsn;
+			// context->previousLSN = metadata->lsn;
 
 			break;
 		}
 
 		case STREAM_ACTION_BEGIN:
 		{
+			/*
+			 * Abort the previous transaction, it might be due to
+			 * restart or resuming from a previous run.
+			 */
+			if (context->transactionInProgress)
+			{
+				if (!pgsql_execute(pgsql, "ROLLBACK"))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				context->transactionInProgress = false;
+			}
+
 			if (metadata->lsn == InvalidXLogRecPtr ||
 				IS_EMPTY_STRING_BUFFER(metadata->timestamp))
 			{
@@ -691,8 +707,16 @@ stream_apply_sql(StreamApplyContext *context,
 					return false;
 				}
 
-				context->reachedStartPos =
-					context->previousLSN < metadata->txnCommitLSN;
+				if (metadata->txnCommitLSN != InvalidXLogRecPtr)
+				{
+
+					context->reachedStartPos =
+						context->previousLSN < metadata->txnCommitLSN;
+				}
+				else
+				{
+					context->reachedStartPos = true;
+				}
 			}
 
 			log_debug("BEGIN %lld LSN %X/%X @%s, previous LSN %X/%X, COMMIT LSN %X/%X %s",
@@ -772,8 +796,29 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_COMMIT:
 		{
+			context->reachedStartPos = context->previousLSN <= metadata->lsn;
+
 			if (!context->reachedStartPos)
 			{
+				if (!context->transactionInProgress)
+				{
+					return true;
+				}
+
+				log_notice("Abort transaction %lld LSN %X/%X @%s, "
+						   "previous LSN %X/%X",
+						   (long long) metadata->xid,
+						   LSN_FORMAT_ARGS(metadata->lsn),
+						   metadata->timestamp,
+						   LSN_FORMAT_ARGS(context->previousLSN));
+
+				/* Rollback the transaction */
+				if (!pgsql_execute(pgsql, "ROLLBACK"))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+				context->transactionInProgress = false;
 				return true;
 			}
 
@@ -1309,15 +1354,26 @@ computeSQLFileName(StreamApplyContext *context)
 {
 	XLogSegNo segno;
 
+	uint64_t switchLSN;
+
+	if (context->switchLSN != InvalidXLogRecPtr)
+	{
+		switchLSN = context->switchLSN;
+	}
+	else
+	{
+		switchLSN = context->previousLSN;
+	}
+
 	if (context->WalSegSz == 0)
 	{
 		log_error("Failed to compute the SQL filename for LSN %X/%X "
 				  "without context->wal_segment_size",
-				  LSN_FORMAT_ARGS(context->previousLSN));
+				  LSN_FORMAT_ARGS(switchLSN));
 		return false;
 	}
 
-	XLByteToSeg(context->previousLSN, segno, context->WalSegSz);
+	XLByteToSeg(switchLSN, segno, context->WalSegSz);
 	XLogFileName(context->wal, context->system.timeline, segno, context->WalSegSz);
 
 	sformat(context->sqlFileName, sizeof(context->sqlFileName),
@@ -1326,7 +1382,7 @@ computeSQLFileName(StreamApplyContext *context)
 			context->wal);
 
 	log_debug("computeSQLFileName: %X/%X \"%s\"",
-			  LSN_FORMAT_ARGS(context->previousLSN),
+			  LSN_FORMAT_ARGS(switchLSN),
 			  context->sqlFileName);
 
 	return true;
@@ -1523,30 +1579,6 @@ readTxnCommitLSN(StreamApplyContext *context,
 	{
 		return true;
 	}
-
-	char txnfilename[MAXPGPATH] = { 0 };
-
-	if (!computeTxnMetadataFilename(metadata->xid,
-									context->paths.dir,
-									txnfilename))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	log_debug("stream_apply_sql: BEGIN message without a commit LSN, "
-			  "fetching commit LSN from transaction metadata file \"%s\"",
-			  txnfilename);
-
-	LogicalMessageMetadata txnMetadata = { .xid = metadata->xid };
-
-	if (!parseTxnMetadataFile(txnfilename, &txnMetadata))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	metadata->txnCommitLSN = txnMetadata.txnCommitLSN;
 
 	return true;
 }
