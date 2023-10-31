@@ -285,7 +285,6 @@ typedef struct StreamContext
 	bool apply;
 
 	bool reachedStartPos;
-	StreamAction startposActionFromJSON;
 
 	bool stdIn;
 	bool stdOut;
@@ -378,6 +377,7 @@ typedef struct StreamApplyContext
 	uint64_t replay_lsn;        /* from the pgcopydb sentinel */
 
 	bool reachedStartPos;
+	bool txnHasCommitLSN;
 	bool reachedEndPos;
 	bool reachedEOF;
 	bool transactionInProgress;
@@ -439,9 +439,6 @@ struct StreamSpecs
 	uint64_t startpos;
 	uint64_t endpos;
 	CopyDBSentinel sentinel;
-
-	bool startposComputedFromJSON;
-	StreamAction startposActionFromJSON;
 
 	LogicalStreamMode mode;
 
@@ -611,11 +608,6 @@ bool parseMessage(StreamContext *privateContext, char *message, JSON_Value *json
 bool streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 											 LogicalTransactionStatement *stmt);
 
-bool computeTxnMetadataFilename(uint32_t xid,
-								const char *dir,
-								char *filename);
-bool writeTxnMetadataFile(LogicalTransaction *txn, const char *dir);
-
 void FreeLogicalMessage(LogicalMessage *msg);
 void FreeLogicalTransaction(LogicalTransaction *tx);
 void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
@@ -671,9 +663,6 @@ bool setupReplicationOrigin(StreamApplyContext *context, bool logSQL);
 bool computeSQLFileName(StreamApplyContext *context);
 
 bool parseSQLAction(const char *query, LogicalMessageMetadata *metadata);
-bool readTxnCommitLSN(StreamApplyContext *context,
-					  LogicalMessageMetadata *metadata);
-bool parseTxnMetadataFile(const char *filename, LogicalMessageMetadata *metadata);
 
 bool stream_apply_track_insert_lsn(StreamApplyContext *context,
 								   uint64_t sourceLSN);
