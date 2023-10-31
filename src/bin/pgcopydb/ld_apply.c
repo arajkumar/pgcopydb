@@ -650,16 +650,31 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_SWITCH:
 		{
 			log_debug("SWITCH from %X/%X to %X/%X",
-					  LSN_FORMAT_ARGS(context->previousLSN),
+					  LSN_FORMAT_ARGS(context->switchLSN),
 					  LSN_FORMAT_ARGS(metadata->lsn));
 
-			context->previousLSN = metadata->lsn;
+			context->switchLSN = metadata->lsn;
 
 			break;
 		}
 
 		case STREAM_ACTION_BEGIN:
 		{
+			/*
+			 * Abort the previous transaction, it might be due to
+			 * restart or resuming from a previous run.
+			 */
+			if (context->transactionInProgress)
+			{
+				if (!pgsql_execute(pgsql, "ROLLBACK"))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				context->transactionInProgress = false;
+			}
+
 			if (metadata->lsn == InvalidXLogRecPtr ||
 				IS_EMPTY_STRING_BUFFER(metadata->timestamp))
 			{
@@ -685,15 +700,16 @@ stream_apply_sql(StreamApplyContext *context,
 				 * action. Therefore, this condition will still hold true.
 				 */
 
-				if (!readTxnCommitLSN(context, metadata))
+				context->txnHasCommitLSN =
+					metadata->txnCommitLSN != InvalidXLogRecPtr;
+				if (context->txnHasCommitLSN)
 				{
-					/* errors have already been logged */
-					return false;
+					context->reachedStartPos =
+						context->previousLSN < metadata->txnCommitLSN;
 				}
-
-				context->reachedStartPos =
-					context->previousLSN < metadata->txnCommitLSN;
 			}
+
+			bool skip = !context->reachedStartPos && context->txnHasCommitLSN;
 
 			log_debug("BEGIN %lld LSN %X/%X @%s, previous LSN %X/%X, COMMIT LSN %X/%X %s",
 					  (long long) metadata->xid,
@@ -701,7 +717,7 @@ stream_apply_sql(StreamApplyContext *context,
 					  metadata->timestamp,
 					  LSN_FORMAT_ARGS(context->previousLSN),
 					  LSN_FORMAT_ARGS(metadata->txnCommitLSN),
-					  context->reachedStartPos ? "" : "[skipping]");
+					  skip ? "[skipping]" : "");
 
 			/*
 			 * Check if we reached the endpos LSN already.
@@ -719,7 +735,7 @@ stream_apply_sql(StreamApplyContext *context,
 			}
 
 			/* actually skip this one if we didn't reach start pos yet */
-			if (!context->reachedStartPos)
+			if (skip)
 			{
 				return true;
 			}
@@ -743,6 +759,7 @@ stream_apply_sql(StreamApplyContext *context,
 			 */
 			bool commitLSNreachesEndPos =
 				context->endpos != InvalidXLogRecPtr &&
+				context->txnHasCommitLSN &&
 				context->endpos <= metadata->txnCommitLSN;
 
 			GUC *settings =
@@ -772,8 +789,33 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_COMMIT:
 		{
+			context->reachedStartPos = context->previousLSN < metadata->lsn;
+
 			if (!context->reachedStartPos)
 			{
+				/*
+				 * Skip a COMMIT without BEGIN, which can happen while resuming
+				 * or transitioning from catchup to replay.
+				 */
+				if (!context->transactionInProgress)
+				{
+					return true;
+				}
+
+				log_notice("Skip(abort) applied transaction %lld LSN %X/%X @%s, "
+						   "previous LSN %X/%X",
+						   (long long) metadata->xid,
+						   LSN_FORMAT_ARGS(metadata->lsn),
+						   metadata->timestamp,
+						   LSN_FORMAT_ARGS(context->previousLSN));
+
+				/* Rollback the transaction */
+				if (!pgsql_execute(pgsql, "ROLLBACK"))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+				context->transactionInProgress = false;
 				return true;
 			}
 
@@ -842,7 +884,7 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_ENDPOS:
 		{
-			if (!context->reachedStartPos)
+			if (!context->reachedStartPos && context->txnHasCommitLSN)
 			{
 				return true;
 			}
@@ -1006,7 +1048,7 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_UPDATE:
 		case STREAM_ACTION_DELETE:
 		{
-			if (!context->reachedStartPos)
+			if (!context->reachedStartPos && context->txnHasCommitLSN)
 			{
 				return true;
 			}
@@ -1045,7 +1087,7 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_EXECUTE:
 		{
-			if (!context->reachedStartPos)
+			if (!context->reachedStartPos && context->txnHasCommitLSN)
 			{
 				return true;
 			}
@@ -1109,7 +1151,7 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_TRUNCATE:
 		{
-			if (!context->reachedStartPos)
+			if (!context->reachedStartPos && context->txnHasCommitLSN)
 			{
 				return true;
 			}
@@ -1309,15 +1351,26 @@ computeSQLFileName(StreamApplyContext *context)
 {
 	XLogSegNo segno;
 
+	uint64_t switchLSN = context->switchLSN;
+
+	/*
+	 * If we haven't switched WAL yet, then we're still at the previousLSN
+	 * position.
+	 */
+	if (switchLSN == InvalidXLogRecPtr)
+	{
+		switchLSN = context->previousLSN;
+	}
+
 	if (context->WalSegSz == 0)
 	{
 		log_error("Failed to compute the SQL filename for LSN %X/%X "
 				  "without context->wal_segment_size",
-				  LSN_FORMAT_ARGS(context->previousLSN));
+				  LSN_FORMAT_ARGS(switchLSN));
 		return false;
 	}
 
-	XLByteToSeg(context->previousLSN, segno, context->WalSegSz);
+	XLByteToSeg(switchLSN, segno, context->WalSegSz);
 	XLogFileName(context->wal, context->system.timeline, segno, context->WalSegSz);
 
 	sformat(context->sqlFileName, sizeof(context->sqlFileName),
@@ -1326,7 +1379,7 @@ computeSQLFileName(StreamApplyContext *context)
 			context->wal);
 
 	log_debug("computeSQLFileName: %X/%X \"%s\"",
-			  LSN_FORMAT_ARGS(context->previousLSN),
+			  LSN_FORMAT_ARGS(switchLSN),
 			  context->sqlFileName);
 
 	return true;
@@ -1503,136 +1556,6 @@ parseSQLAction(const char *query, LogicalMessageMetadata *metadata)
 	if (metadata->action == STREAM_ACTION_UNKNOWN)
 	{
 		log_error("Failed to parse action from query: %s", query);
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * readTxnCommitLSN ensures metadata has transaction COMMIT LSN by fetching it
- * from metadata file if it is not present
- */
-bool
-readTxnCommitLSN(StreamApplyContext *context,
-				 LogicalMessageMetadata *metadata)
-{
-	/* if txnCommitLSN is invalid, then fetch it from txn metadata file */
-	if (metadata->txnCommitLSN != InvalidXLogRecPtr)
-	{
-		return true;
-	}
-
-	char txnfilename[MAXPGPATH] = { 0 };
-
-	if (!computeTxnMetadataFilename(metadata->xid,
-									context->paths.dir,
-									txnfilename))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	log_debug("stream_apply_sql: BEGIN message without a commit LSN, "
-			  "fetching commit LSN from transaction metadata file \"%s\"",
-			  txnfilename);
-
-	LogicalMessageMetadata txnMetadata = { .xid = metadata->xid };
-
-	if (!parseTxnMetadataFile(txnfilename, &txnMetadata))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	metadata->txnCommitLSN = txnMetadata.txnCommitLSN;
-
-	return true;
-}
-
-
-/*
- * parseTxnMetadataFile returns the transaction metadata content for the given
- * metadata filename.
- */
-bool
-parseTxnMetadataFile(const char *filename, LogicalMessageMetadata *metadata)
-{
-	/* store xid as it will be overwritten while parsing metadata */
-	uint32_t xid = metadata->xid;
-
-	if (xid == 0)
-	{
-		log_error("BUG: parseTxnMetadataFile is called with "
-				  "transaction xid: %lld", (long long) xid);
-		return false;
-	}
-
-	/*
-	 * Read the transaction metadata file created by the transform process for
-	 * transactions spanning multiple WAL files. The metadata json file is
-	 * generated upon encountering the COMMIT statement, but it may take some
-	 * time to become available for transformation. Therefore, we retry here.
-	 */
-
-	ConnectionRetryPolicy retryPolicy = { 0 };
-
-	int maxT = 900;             /* 15 mins */
-	int maxSleepTime = 3000;    /* 2s */
-	int baseSleepTime = 100;    /* 100ms */
-
-	(void) pgsql_set_retry_policy(&retryPolicy,
-								  maxT,
-								  -1, /* unbounded number of attempts */
-								  maxSleepTime,
-								  baseSleepTime);
-
-	while (!pgsql_retry_policy_expired(&retryPolicy))
-	{
-		if (file_exists(filename))
-		{
-			break;
-		}
-
-		int sleepTimeMs =
-			pgsql_compute_connection_retry_sleep_time(&retryPolicy);
-
-		log_debug("parseTxnMetadataFile: waiting for transaction metadata "
-				  "file %s to be created, retrying in %dms",
-				  filename, sleepTimeMs);
-
-		/* we have milliseconds, pg_usleep() wants microseconds */
-		(void) pg_usleep(sleepTimeMs * 1000);
-	}
-
-	char *txnMetadataContent = NULL;
-	long size = 0L;
-
-	/* we don't want to retry anymore, error out if files still don't exist */
-	if (!read_file(filename, &txnMetadataContent, &size))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	JSON_Value *json = json_parse_string(txnMetadataContent);
-
-	if (!parseMessageMetadata(metadata, txnMetadataContent, json, true))
-	{
-		/* errors have already been logged */
-		json_value_free(json);
-		return false;
-	}
-
-	json_value_free(json);
-
-	if (metadata->txnCommitLSN == InvalidXLogRecPtr ||
-		metadata->xid != xid ||
-		IS_EMPTY_STRING_BUFFER(metadata->timestamp))
-	{
-		log_error("Failed to parse metadata for transaction metadata file "
-				  "%s: %s", filename, txnMetadataContent);
 		return false;
 	}
 

@@ -377,18 +377,6 @@ stream_transform_write_message(StreamContext *privateContext,
 		return false;
 	}
 
-	/*
-	 * If we're in a continued transaction, it means that the earlier write
-	 * of this txn's BEGIN statement didn't have the COMMIT LSN. Therefore,
-	 * we need to maintain that LSN as a separate metadata file. This is
-	 * necessary because the COMMIT LSN is required later in the apply
-	 * process.
-	 */
-	if (txn->continued && txn->commit)
-	{
-		writeTxnMetadataFile(txn, privateContext->paths.dir);
-	}
-
 	(void) FreeLogicalMessage(currentMsg);
 
 	if (metadata->action == STREAM_ACTION_COMMIT)
@@ -1074,9 +1062,19 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 		{
 			if (mesg->isTransaction)
 			{
-				log_error("Failed to parse BEGIN: "
-						  "transaction already in progress");
-				return false;
+				txn = &(mesg->command.tx);
+
+				log_notice("Ignore incomplete transaction xid %lld "
+						   "at %X/%X",
+						   (long long) txn->xid,
+						   LSN_FORMAT_ARGS(txn->beginLSN));
+
+				(void) FreeLogicalMessage(mesg);
+
+				/* then prepare a new one, reusing the same memory area */
+				LogicalMessage empty = { 0 };
+
+				*mesg = empty;
 			}
 
 			mesg->isTransaction = true;
@@ -2582,70 +2580,4 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 
 	/* makes compiler happy */
 	return false;
-}
-
-
-/*
- *  computeTxnMetadataFilename computes the file path for transaction metadata
- *  based on its transaction id
- */
-bool
-computeTxnMetadataFilename(uint32_t xid, const char *dir, char *filename)
-{
-	if (dir == NULL)
-	{
-		log_error("BUG: computeTxnMetadataFilename is called with "
-				  "directory: NULL");
-		return false;
-	}
-
-	if (xid == 0)
-	{
-		log_error("BUG: computeTxnMetadataFilename is called with "
-				  "transaction xid: %lld", (long long) xid);
-		return false;
-	}
-
-	sformat(filename, MAXPGPATH, "%s/%lld.json", dir, (long long) xid);
-
-	return true;
-}
-
-
-/*
- * writeTxnMetadataFile writes the transaction metadata to a file in the given
- * directory
- */
-bool
-writeTxnMetadataFile(LogicalTransaction *txn, const char *dir)
-{
-	char txnfilename[MAXPGPATH] = { 0 };
-
-	if (!computeTxnMetadataFilename(txn->xid, dir, txnfilename))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	log_debug("stream_write_commit_metadata_file: writing transaction "
-			  "metadata file \"%s\" with commit lsn %X/%X",
-			  txnfilename,
-			  LSN_FORMAT_ARGS(txn->commitLSN));
-
-	char contents[BUFSIZE] = { 0 };
-
-	sformat(contents, BUFSIZE,
-			"{\"xid\":%lld,\"commit_lsn\":\"%X/%X\",\"timestamp\":\"%s\"}\n",
-			(long long) txn->xid,
-			LSN_FORMAT_ARGS(txn->commitLSN),
-			txn->timestamp);
-
-	/* write the metadata to txnfilename */
-	if (!write_file(contents, strlen(contents), txnfilename))
-	{
-		log_error("Failed to write file \"%s\"", txnfilename);
-		return false;
-	}
-
-	return true;
 }

@@ -338,7 +338,6 @@ stream_init_context(StreamSpecs *specs)
 
 	privateContext->endpos = specs->endpos;
 	privateContext->startpos = specs->startpos;
-	privateContext->startposActionFromJSON = specs->startposActionFromJSON;
 
 	privateContext->mode = specs->mode;
 
@@ -365,33 +364,10 @@ stream_init_context(StreamSpecs *specs)
 		return false;
 	}
 
-	/*
-	 * When streaming is resumed, transactions are sent in full even if we wrote
-	 * and flushed a transactions partially in previous command. This implies
-	 * that, if the last message is B/I/U/D/T, the streaming resumes from the
-	 * same transaction and there's a need to skip some messages.
-	 *
-	 * However, note that if the last message is COMMIT, the streaming will
-	 * resume from the next transaction.
-	 */
 	privateContext->metadata.action = STREAM_ACTION_UNKNOWN;
 	privateContext->previous.action = STREAM_ACTION_UNKNOWN;
 
 	privateContext->lastWriteTime = 0;
-
-	if (specs->startposComputedFromJSON &&
-		(specs->startposActionFromJSON == STREAM_ACTION_BEGIN ||
-		 specs->startposActionFromJSON == STREAM_ACTION_INSERT ||
-		 specs->startposActionFromJSON == STREAM_ACTION_UPDATE ||
-		 specs->startposActionFromJSON == STREAM_ACTION_DELETE ||
-		 specs->startposActionFromJSON == STREAM_ACTION_TRUNCATE))
-	{
-		privateContext->reachedStartPos = false;
-	}
-	else
-	{
-		privateContext->reachedStartPos = true;
-	}
 
 	/*
 	 * Initializing maxWrittenLSN as startpos at the beginning of migration or
@@ -660,45 +636,16 @@ streamCheckResumePosition(StreamSpecs *specs)
 		LogicalMessageMetadata *messages = latestStreamedContent.messages;
 		LogicalMessageMetadata *latest = &(messages[lastLineNb]);
 
-		/*
-		 * We could have several messages following each-other with the same
-		 * LSN, typically a sequence like:
-		 *
-		 *  {"action":"I","xid":"492","lsn":"0/244BEE0", ...}
-		 *  {"action":"K","lsn":"0/244BEE0", ...}
-		 *  {"action":"E","lsn":"0/244BEE0"}
-		 *
-		 * In that case we want to remember the latest message action as being
-		 * INSERT rather than ENDPOS.
-		 */
-		int lineNb = lastLineNb;
-
-		for (; lineNb > 0; lineNb--)
-		{
-			LogicalMessageMetadata *previous = &(messages[lineNb]);
-
-			if (previous->lsn == latest->lsn)
-			{
-				latest = previous;
-			}
-			else
-			{
-				break;
-			}
-		}
-
 		specs->startpos = latest->lsn;
-		specs->startposComputedFromJSON = true;
-		specs->startposActionFromJSON = latest->action;
 
 		log_info("Resuming streaming at LSN %X/%X "
 				 "from first message with that LSN read in JSON file \"%s\", "
 				 "line %d",
 				 LSN_FORMAT_ARGS(specs->startpos),
 				 latestStreamedContent.filename,
-				 lineNb);
+				 lastLineNb);
 
-		char *latestMessage = latestStreamedContent.lines[lineNb];
+		char *latestMessage = latestStreamedContent.lines[lastLineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
 	}
 
@@ -1606,40 +1553,6 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 	/* in case of filtering, early exit */
 	if (metadata->filterOut)
 	{
-		return true;
-	}
-
-	/*
-	 * When streaming resumed for a partially applied txn, have we reached a
-	 * message that wasn't flushed in the previous command?
-	 */
-	if (!privateContext->reachedStartPos)
-	{
-		/*
-		 * Also the same LSN might be assigned to a BEGIN message, a COMMIT
-		 * message, and a KEEPALIVE message. Avoid skipping what looks like the
-		 * same message as the latest flushed in our JSON file when it's
-		 * actually a new message.
-		 */
-		privateContext->reachedStartPos =
-			privateContext->startpos < metadata->lsn ||
-			(privateContext->startpos == metadata->lsn &&
-			 metadata->action != privateContext->startposActionFromJSON);
-	}
-
-	if (!privateContext->reachedStartPos)
-	{
-		metadata->filterOut = true;
-
-		log_debug("Skipping write for action %c for XID %u at LSN %X/%X: "
-				  "startpos %X/%X not been reached",
-				  metadata->action,
-				  metadata->xid,
-				  LSN_FORMAT_ARGS(metadata->lsn),
-				  LSN_FORMAT_ARGS(privateContext->startpos));
-
-		*previous = *metadata;
-
 		return true;
 	}
 
