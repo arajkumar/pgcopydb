@@ -650,7 +650,7 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_SWITCH:
 		{
 			log_debug("SWITCH from %X/%X to %X/%X",
-					  LSN_FORMAT_ARGS(context->previousLSN),
+					  LSN_FORMAT_ARGS(context->switchLSN),
 					  LSN_FORMAT_ARGS(metadata->lsn));
 
 			context->switchLSN = metadata->lsn;
@@ -791,21 +791,27 @@ stream_apply_sql(StreamApplyContext *context,
 		{
 			/*
 			 * Transaction without commitLSN can be skipped only during
-			 * the COMMIT action. This transaction might have been already
-			 * committed previous run which was interrupted and previousLSN
-			 * can have same value as current transaction's COMMIT LSN. In that
-			 * case, we should skip this transaction.
+			 * the COMMIT action.
+			 *
+			 * This transaction might have been already applied in the previous
+			 * run which was interrupted and previousLSN can have same value as
+			 * current transaction's COMMIT LSN. In that case, we should skip
+			 * this transaction.
 			 */
 			context->reachedStartPos = context->previousLSN <= metadata->lsn;
 
 			if (!context->reachedStartPos)
 			{
+				/*
+				 * Skip a COMMIT without BEGIN, which can happen while resuming
+				 * or transitioning from catchup to replay.
+				 */
 				if (!context->transactionInProgress)
 				{
 					return true;
 				}
 
-				log_notice("Abort transaction %lld LSN %X/%X @%s, "
+				log_notice("Skip(abort) applied transaction %lld LSN %X/%X @%s, "
 						   "previous LSN %X/%X",
 						   (long long) metadata->xid,
 						   LSN_FORMAT_ARGS(metadata->lsn),
@@ -1356,7 +1362,10 @@ computeSQLFileName(StreamApplyContext *context)
 
 	uint64_t switchLSN = context->switchLSN;
 
-	/* if we don't have a switch LSN, use the previous LSN */
+	/*
+	 * If we haven't switched WAL yet, then we're still at the previousLSN
+	 * position.
+	 */
 	if (switchLSN == InvalidXLogRecPtr)
 	{
 		switchLSN = context->previousLSN;
