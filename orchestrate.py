@@ -13,9 +13,10 @@ import queue
 
 DELAY_THRESHOLD = 30 # Megabytes.
 
-WORK_DIR = os.path.join(tempfile.gettempdir(), 'ts_cdc')
+WORK_DIR = os.path.join(tempfile.gettempdir(), "ts_cdc")
 shutil.rmtree(WORK_DIR, ignore_errors=True)
 os.makedirs(WORK_DIR, exist_ok=True)
+os.makedirs(os.path.join(tempfile.gettempdir(), "pgcopydb"), exist_ok=True)
 
 env = os.environ.copy()
 for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
