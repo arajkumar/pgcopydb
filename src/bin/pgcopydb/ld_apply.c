@@ -682,34 +682,41 @@ stream_apply_sql(StreamApplyContext *context,
 				return false;
 			}
 
+			/*
+			 * Few a time, BEGIN won't have a txnCommitLSN for the txn which
+			 * spread across multiple WAL segments. We call that txn as
+			 * a continuedTxn and allow it to be replayed until we encounter
+			 * a COMMIT message.
+			 *
+			 * The lsn of a COMMIT message determines whether to keep txn or
+			 * abort.
+			 */
+			context->continuedTxn = metadata->txnCommitLSN == InvalidXLogRecPtr;
+
 			/* did we reach the starting LSN positions now? */
 			if (!context->reachedStartPos)
 			{
 				/*
 				 * compare previousLSN with COMMIT LSN to safely include
-				 * complete transactions while skipping already applied changes.
+				 * complete transactions while skipping already applied
+				 * changes.
 				 *
-				 * this is particularly useful at the beginnig where BEGIN LSN
-				 * of some transactions could be less than `consistent_point`,
-				 * but COMMIT LSN of those transactions is guaranteed to be
-				 * greater.
+				 * this is particularly useful at the beginnig where
+				 * BEGIN LSN of some transactions could be less than
+				 * `consistent_point`, but COMMIT LSN of those transactions
+				 * is guaranteed to be greater.
 				 *
-				 * in case of interruption and this is the first transaction to
-				 * be applied, previousLSN should be equal to the last
-				 * transaction's COMMIT LSN or the LSN of non-transaction
-				 * action. Therefore, this condition will still hold true.
+				 * in case of interruption and this is the first
+				 * transaction to be applied, previousLSN should be equal
+				 * to the last transaction's COMMIT LSN or the LSN of
+				 * non-transaction action. Therefore, this condition will
+				 * still hold true.
 				 */
-
-				context->txnHasCommitLSN =
-					metadata->txnCommitLSN != InvalidXLogRecPtr;
-				if (context->txnHasCommitLSN)
-				{
-					context->reachedStartPos =
-						context->previousLSN < metadata->txnCommitLSN;
-				}
+				context->reachedStartPos =
+					context->previousLSN < metadata->txnCommitLSN;
 			}
 
-			bool skip = !context->reachedStartPos && context->txnHasCommitLSN;
+			bool skip = !context->reachedStartPos && !context->continuedTxn;
 
 			log_debug("BEGIN %lld LSN %X/%X @%s, previous LSN %X/%X, COMMIT LSN %X/%X %s",
 					  (long long) metadata->xid,
@@ -759,7 +766,7 @@ stream_apply_sql(StreamApplyContext *context,
 			 */
 			bool commitLSNreachesEndPos =
 				context->endpos != InvalidXLogRecPtr &&
-				context->txnHasCommitLSN &&
+				!context->continuedTxn &&
 				context->endpos <= metadata->txnCommitLSN;
 
 			GUC *settings =
@@ -794,28 +801,29 @@ stream_apply_sql(StreamApplyContext *context,
 			if (!context->reachedStartPos)
 			{
 				/*
-				 * Skip a COMMIT without BEGIN, which can happen while resuming
-				 * or transitioning from catchup to replay.
+				 * Abort if we are not yet reachedStartPos and txn is a
+				 * continuedTxn.
 				 */
-				if (!context->transactionInProgress)
+				if (context->continuedTxn)
 				{
-					return true;
+					log_notice("Skip(abort) applied transaction %lld LSN %X/%X "
+							   "@%s, previous LSN %X/%X",
+							   (long long) metadata->xid,
+							   LSN_FORMAT_ARGS(metadata->lsn),
+							   metadata->timestamp,
+							   LSN_FORMAT_ARGS(context->previousLSN));
+
+					/* Rollback the transaction */
+					if (!pgsql_execute(pgsql, "ROLLBACK"))
+					{
+						/* errors have already been logged */
+						return false;
+					}
+					 /* Reset the transactionInProgress after abort */
+					context->transactionInProgress = false;
+					context->continuedTxn = false;
 				}
 
-				log_notice("Skip(abort) applied transaction %lld LSN %X/%X @%s, "
-						   "previous LSN %X/%X",
-						   (long long) metadata->xid,
-						   LSN_FORMAT_ARGS(metadata->lsn),
-						   metadata->timestamp,
-						   LSN_FORMAT_ARGS(context->previousLSN));
-
-				/* Rollback the transaction */
-				if (!pgsql_execute(pgsql, "ROLLBACK"))
-				{
-					/* errors have already been logged */
-					return false;
-				}
-				context->transactionInProgress = false;
 				return true;
 			}
 
@@ -884,7 +892,7 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_ENDPOS:
 		{
-			if (!context->reachedStartPos && context->txnHasCommitLSN)
+			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				return true;
 			}
@@ -893,14 +901,24 @@ stream_apply_sql(StreamApplyContext *context,
 					  LSN_FORMAT_ARGS(metadata->lsn),
 					  LSN_FORMAT_ARGS(context->previousLSN));
 
-			context->previousLSN = metadata->lsn;
+			/*
+			 * Don't update previousLSN if we are in a continuedTxn.
+			 *
+			 * Otherwise, during resume a continued txn having an endpos
+			 * will update the previousLSN to endpos's LSN causing the
+			 * current transaction to be applied again.
+			 */
+			if (!context->continuedTxn)
+			{
+				context->previousLSN = metadata->lsn;
+			}
 
 			/*
 			 * It could be the current endpos, or the endpos of a previous
 			 * run.
 			 */
 			if (context->endpos != InvalidXLogRecPtr &&
-				context->endpos <= context->previousLSN)
+				context->endpos <= metadata->lsn)
 			{
 				context->reachedEndPos = true;
 
@@ -933,7 +951,7 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_KEEPALIVE:
 		{
 			/* did we reach the starting LSN positions now? */
-			if (!context->reachedStartPos)
+			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				context->reachedStartPos =
 					context->previousLSN < metadata->lsn;
@@ -1048,7 +1066,11 @@ stream_apply_sql(StreamApplyContext *context,
 		case STREAM_ACTION_UPDATE:
 		case STREAM_ACTION_DELETE:
 		{
-			if (!context->reachedStartPos && context->txnHasCommitLSN)
+			/*
+			 * We still allow continuedTxn, COMMIT message determines whether
+			 * to keep the transaction or abort it.
+			 */
+			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				return true;
 			}
@@ -1087,7 +1109,11 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_EXECUTE:
 		{
-			if (!context->reachedStartPos && context->txnHasCommitLSN)
+			/*
+			 * We still allow continuedTxn, COMMIT message determines whether
+			 * to keep the transaction or abort it.
+			 */
+			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				return true;
 			}
@@ -1151,7 +1177,11 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_TRUNCATE:
 		{
-			if (!context->reachedStartPos && context->txnHasCommitLSN)
+			/*
+			 * We still allow continuedTxn, COMMIT message determines whether
+			 * to keep the transaction or abort it.
+			 */
+			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				return true;
 			}
@@ -1332,6 +1362,7 @@ stream_apply_init_context(StreamApplyContext *context,
 	}
 
 	context->reachedStartPos = false;
+	context->continuedTxn = false;
 	context->reachedEOF = false;
 
 	context->connStrings = connStrings;

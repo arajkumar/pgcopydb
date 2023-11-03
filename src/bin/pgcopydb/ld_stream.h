@@ -377,7 +377,7 @@ typedef struct StreamApplyContext
 	uint64_t replay_lsn;        /* from the pgcopydb sentinel */
 
 	bool reachedStartPos;
-	bool txnHasCommitLSN;
+	bool continuedTxn;
 	bool reachedEndPos;
 	bool reachedEOF;
 	bool transactionInProgress;
