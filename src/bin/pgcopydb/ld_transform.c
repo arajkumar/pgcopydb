@@ -1062,9 +1062,19 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 		{
 			if (mesg->isTransaction)
 			{
-				log_error("Failed to parse BEGIN: "
-						  "transaction already in progress");
-				return false;
+				txn = &(mesg->command.tx);
+
+				log_notice("Ignore incomplete transaction xid %lld "
+						   "at %X/%X",
+						   (long long) txn->xid,
+						   LSN_FORMAT_ARGS(txn->beginLSN));
+
+				(void) FreeLogicalMessage(mesg);
+
+				/* then prepare a new one, reusing the same memory area */
+				LogicalMessage empty = { 0 };
+
+				*mesg = empty;
 			}
 
 			mesg->isTransaction = true;
