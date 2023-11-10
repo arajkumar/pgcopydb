@@ -35,6 +35,9 @@
 static bool updateStreamCounters(StreamContext *context,
 								 LogicalMessageMetadata *metadata);
 
+static bool
+truncateJSONFileToLSN(StreamSpecs *context,
+					  LogicalMessageMetadata *metadata);
 
 /*
  * stream_init_specs initializes Change Data Capture streaming specifications
@@ -509,6 +512,17 @@ startLogicalStreaming(StreamSpecs *specs)
 			return false;
 		}
 
+		LogicalMessageMetadata metadata = {
+			.action = STREAM_ACTION_BEGIN,
+			.lsn = specs->startpos,
+		};
+
+		if (!truncateJSONFileToLSN(specs, &metadata))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		/* ignore errors, try again unless asked to stop */
 		bool cleanExit = pgsql_stream_logical(&stream, &context);
 
@@ -727,6 +741,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 
 		return false;
 	}
+	specs->restartLSN = lsn;
 
 	return true;
 }
@@ -1586,7 +1601,7 @@ findMessageInWalFile(const char *walFile,
 	{
 		LogicalMessageMetadata *message = &(content.messages[i]);
 		if (message->lsn == metadata->lsn &&
-			message->xid == metadata->xid &&
+			/*message->xid == metadata->xid && */
 			message->action == metadata->action)
 		{
 			*found = true;
@@ -1596,25 +1611,24 @@ findMessageInWalFile(const char *walFile,
 		*startLinePosition += strlen(content.lines[i]) + 1; /* +1 for \n */
 	}
 
-	return false;
+	return true;
 }
 
 
 static bool
-resolveWalFileName(LogicalStreamContext *context,
+resolveWalFileName(StreamSpecs *context,
 				   uint64_t lsn,
 				   char *walFileNamePtr)
 {
-	StreamContext *privateContext = (StreamContext *) context->private;
 	char wal[MAXPGPATH] = { 0 };
 	char partialFileName[MAXPGPATH] = { 0 };
 	XLogSegNo segno;
 
 	XLByteToSeg(lsn, segno, context->WalSegSz);
-	XLogFileName(wal, context->timeline, segno, context->WalSegSz);
+	XLogFileName(wal, context->system.timeline, segno, context->WalSegSz);
 
 	sformat(partialFileName, sizeof(partialFileName), "%s/%s.json.partial",
-			privateContext->paths.dir,
+			context->paths.dir,
 			wal);
 
 	/* Partial file is the first place to look for */
@@ -1626,7 +1640,7 @@ resolveWalFileName(LogicalStreamContext *context,
 
 	char walFileName[MAXPGPATH] = { 0 };
 	sformat(walFileName, sizeof(walFileName), "%s/%s.json",
-			privateContext->paths.dir,
+			context->paths.dir,
 			wal);
 
 	if (file_exists(walFileName))
@@ -1663,11 +1677,9 @@ resolveWalFileName(LogicalStreamContext *context,
  * message is not yet streamed and we can keep writing to the latest file.
  */
 static bool
-truncateJSONFileToLSN(LogicalStreamContext *context,
+truncateJSONFileToLSN(StreamSpecs *context,
 					  LogicalMessageMetadata *metadata)
 {
-	StreamContext *privateContext = (StreamContext *) context->private;
-
 	char walFile[MAXPGPATH] = { 0 };
 	char latest[MAXPGPATH] = { 0 };
 	bool found = false;
@@ -1678,12 +1690,11 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 	 * latest file acts as an endpoint to stop the search.
 	 */
 	sformat(latest, sizeof(latest), "%s/latest",
-			privateContext->paths.dir);
+			context->paths.dir);
 
 	if (!file_exists(latest))
 	{
-		log_error("BUG: latest file \"%s\" does not exist", latest);
-		return false;
+		return true;
 	}
 
 	if (!normalize_filename(latest, latest, MAXPGPATH))
@@ -1702,7 +1713,7 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 	uint64_t lsn = metadata->lsn;
 	int startLinePosition = 0;
 
-	while (!found || !streq(walFile, latest))
+	while (!streq(walFile, latest))
 	{
 		if (!resolveWalFileName(context, lsn, walFile))
 		{
@@ -1735,6 +1746,11 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 
 		/* Move to the next WAL segment */
 		lsn += context->WalSegSz;
+
+		if (found)
+		{
+			break;
+		}
 	}
 
 	char walFileToTruncate[MAXPGPATH] = { 0 };
@@ -1804,12 +1820,17 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 	/* Now latest must point to walFileToTruncate if both are different */
 	if (!streq(latest, walFileToTruncate))
 	{
-		if (!stream_update_latest_symlink(privateContext,
-					walFileToTruncate))
+		sformat(latest, sizeof(latest), "%s/latest",
+				context->paths.dir);
+		if (!unlink_file(latest))
 		{
-			log_error("Failed to update latest symlink to \"%s\", "
-					  "see above for details",
-					  walFileToTruncate);
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!create_symbolic_link((char *) walFileToTruncate, latest))
+		{
+			/* errors have already been logged */
 			return false;
 		}
 	}
@@ -1878,24 +1899,24 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 	 * When streaming resumed for a partially applied txn, have we reached a
 	 * message that wasn't flushed in the previous command?
 	 */
-	if (!privateContext->reachedStartPos)
-	{
-		/*
-		 * Find the WAL segment file for the given LSN, and open it to
-		 * determine the offset of the LSN in the file. If we can't find the
-		 * go to the next segment file until we there is none.
-		 *
-		 * Once we find the offset of the LSN in the WAL segment file, we can
-		 * trim the file to that offset and start streaming from there.
-		 */
-		if (!truncateJSONFileToLSN(context, metadata))
-		{
-			log_error("Failed to find WAL segment file for LSN %X/%X",
-					  LSN_FORMAT_ARGS(metadata->lsn));
-			return false;
-		}
-		privateContext->reachedStartPos = true;
-	}
+	/*if (!privateContext->reachedStartPos) */
+	/*{ */
+	/*	/1* */
+	/*	 * Find the WAL segment file for the given LSN, and open it to */
+	/*	 * determine the offset of the LSN in the file. If we can't find the */
+	/*	 * go to the next segment file until we there is none. */
+	/*	 * */
+	/*	 * Once we find the offset of the LSN in the WAL segment file, we can */
+	/*	 * trim the file to that offset and start streaming from there. */
+	/*	 *1/ */
+	/*	if (!truncateJSONFileToLSN(privateContext, metadata)) */
+	/*	{ */
+	/*		log_error("Failed to find WAL segment file for LSN %X/%X", */
+	/*				  LSN_FORMAT_ARGS(metadata->lsn)); */
+	/*		return false; */
+	/*	} */
+	/*	privateContext->reachedStartPos = true; */
+	/*} */
 
 	if (!prepareMessageJSONbuffer(context))
 	{

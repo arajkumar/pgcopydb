@@ -438,6 +438,7 @@ struct StreamSpecs
 	char origin[NAMEDATALEN];
 
 	uint64_t startpos;
+	uint64_t restartLSN;
 	uint64_t endpos;
 	CopyDBSentinel sentinel;
 
