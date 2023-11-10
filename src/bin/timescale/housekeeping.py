@@ -42,7 +42,6 @@ env = os.environ.copy()
 
 
 def run_cmd(cmd: str) -> str:
-    global env
     result = subprocess.run(cmd, shell=True, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code ")
@@ -74,6 +73,9 @@ def is_txn_state_file(f: Path) -> bool:
         for num_line, line in enumerate(file, start=1):
             if num_line == 1 and line.startswith(CONTENT_PREFIX):
                 is_first_line_txn = True
+            # txn_state_file should only have 1 line. If we found more than 1
+            # line, we should return false as we are not sure if it is a
+            # txn_state_file.
             if num_line > 1:
                 return False
     return is_first_line_txn
@@ -135,7 +137,6 @@ def sleep():
 
 
 def housekeeping(stop_event=None):
-
     work_dir = env["PGCOPYDB_DIR"]
     if work_dir is not None:
         work_dir = Path(work_dir).absolute()

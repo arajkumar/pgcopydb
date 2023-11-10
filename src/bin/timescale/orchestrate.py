@@ -13,10 +13,16 @@ import queue
 from housekeeping import start_housekeeping
 from pathlib import Path
 
+# If the process is not running on a TTY then reading from stdin will raise and
+# exception. We read from stdin to start the switch-over phase. If it's not a
+# TTY the switch-over can be started by sending a SIGUSR1 signal to the
+# process.
 IS_TTY = os.isatty(0)
 DELAY_THRESHOLD = 30  # Megabytes.
 
 env = os.environ.copy()
+
+LIVE_MIGRATION_DOCKER = env.get('LIVE_MIGRATION_DOCKER') == 'true'
 
 
 class Command:
@@ -99,6 +105,7 @@ def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
         while True:
             k = input()
             if k.lower() == key.lower():
+                print(f"Received key press event: '{key}'")
                 notify_queue.put(1)
                 notify_queue.task_done()
                 return
@@ -107,10 +114,6 @@ def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
 
 
 def wait_for_sigusr1(notify_queue) -> queue.Queue:
-    """
-    waits for the 'key' to be pressed. It returns a keypress_event queue
-    that becomes non-empty when the required 'key' is pressed (and ENTER).
-    """
 
     def handler(signum, frame):
         print("Received signal")
@@ -152,8 +155,6 @@ def pgcopydb_init_env(work_dir: Path):
     env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
     env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
 
-    print(env)
-
     (work_dir / "logs").mkdir(exist_ok=False)
 
 
@@ -181,7 +182,7 @@ def create_snapshot_and_follow():
     snapshot_proc = Command(command=snapshot_command, use_shell=True,
                             log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
 
-    time.sleep(5)
+    time.sleep(10)
 
     print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc ...")
     follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
@@ -225,15 +226,20 @@ def wait_for_DBs_to_sync():
 
     while True:
         delay_mb = get_delay()
-        print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. Press 's' (and ENTER) to stop live-replay")
+        if not IS_TTY and LIVE_MIGRATION_DOCKER:
+            print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. To stop live-replay, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>'")
+        elif not IS_TTY:
+            print(f"[WATCH] Source DB - Target DB=> {delay_mb}MB. To stop live - replay, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+        else:
+            print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. Press 's' (and ENTER) to stop live-replay")
         if not analyzed and delay_mb < DELAY_THRESHOLD:
-            print("Starting analyze on Target DB. This might take sometime to complete ...")
+            print("Starting analyze on Target DB. This might take a long time to complete ...")
             run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
             print("Analyze complete")
             analyzed = True
             continue
         if not key_event_queue.empty():
-            print("Received key press event: 's'")
+            print("Live-replay stopped")
             break
         time.sleep(10)
 
@@ -276,8 +282,7 @@ def wait_for_LSN_to_sync():
         file = open(endpos_follow_log, 'r')
         done = False
         for line in file:
-            l = line.strip()
-            if is_endpos_streamed(l):
+            if is_endpos_streamed(line.strip()):
                 print("End position LSN has been streamed successfully")
                 done = True
                 break
@@ -358,7 +363,12 @@ if __name__ == "__main__":
     follow_proc.terminate_process_including_children()
     print("Stopped")
 
-    print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need Press 'c' (and ENTER) to continue")
+    if not IS_TTY and LIVE_MIGRATION_DOCKER:
+        print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'docker kill -s=USR1 <container_name>'")
+    elif not IS_TTY:
+        print(f"[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'kill -s=USR1 {os.getpid()}' to continue")
+    else:
+        print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need Press 'c' (and ENTER) to continue")
     notify_queue = queue.Queue(maxsize=1)
     wait_for_sigusr1(notify_queue)
     if IS_TTY:
@@ -366,7 +376,6 @@ if __name__ == "__main__":
 
     while True:
         if not notify_queue.empty():
-            print("Received key press event: 'c'")
             print("Continuing ...")
             break
         time.sleep(1)

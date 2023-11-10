@@ -1,0 +1,46 @@
+name: Docker Timescale
+
+on:
+  push:
+    branches:
+      - team-data-ingest
+  pull_request:
+    branches:
+      - team-data-ingest
+
+jobs:
+  docker-ts:
+    name: Push Docker image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Make version
+        run: make version
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.ORG_DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.ORG_DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: timescaledev/live-migration
+          flavor: |
+            latest=false
+          tags: |
+            type=edge
+            type=edge,branch=team-data-ingest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' && github.ref == 'team-data-ingest'}}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          file: ./Dockerfile.live-migration

@@ -1,7 +1,7 @@
 #
 # Define a base image with all our build dependencies.
 #
-FROM postgres:14-bullseye as build
+FROM debian:bookworm-slim as build
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -9,6 +9,7 @@ RUN apt-get update \
     libicu-dev \
     libkrb5-dev \
     libssl-dev \
+	libzstd-dev \
     libedit-dev \
     libreadline-dev \
     libpam-dev \
@@ -25,7 +26,9 @@ RUN apt-get update \
     tmux \
     watch \
     lsof \
-    psutils \
+	psmisc \
+	gdb \
+    strace \
 	valgrind \
     postgresql-common \
     libpq5 \
@@ -50,7 +53,7 @@ RUN make -s clean && make -s -j8 install
 #
 # Now the "run" image, as small as possible
 #
-FROM debian:bullseye-slim as run
+FROM debian:bookworm-slim as run
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -60,15 +63,23 @@ RUN apt-get update \
     tmux \
     watch \
     lsof \
-    psutils \
+	psmisc \
     libpq5 \
     postgresql-client-common \
-    postgresql-client \
+    postgresql-client-15 \
+	python3 \
 	&& rm -rf /var/lib/apt/lists/*
 
 RUN adduser --disabled-password --gecos '' --home /var/lib/postgres docker
 RUN adduser docker sudo
 
-COPY --from=build /usr/lib/postgresql/13/bin/pgcopydb /usr/local/bin
+COPY --from=build /usr/lib/postgresql/15/bin/pgcopydb /usr/local/bin
 
-USER docker
+RUN mkdir /opt/timescale
+COPY src/bin/timescale /opt/timescale
+WORKDIR /opt/timescale
+ENV PGCOPYDB_DIR=/opt/timescale/ts_cdc
+ENV LIVE_MIGRATION_DOCKER=true
+ENV HOUSEKEEPING_INTERVAL=5
+
+CMD ["python3", "-u", "/opt/timescale/orchestrate.py"]
