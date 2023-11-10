@@ -35,6 +35,9 @@
 static bool updateStreamCounters(StreamContext *context,
 								 LogicalMessageMetadata *metadata);
 
+static bool
+truncateJSONFileToLSN(LogicalStreamContext *context,
+					  LogicalMessageMetadata *metadata);
 
 /*
  * stream_init_specs initializes Change Data Capture streaming specifications
@@ -1596,7 +1599,7 @@ findMessageInWalFile(const char *walFile,
 		*startLinePosition += strlen(content.lines[i]) + 1; /* +1 for \n */
 	}
 
-	return false;
+	return true;
 }
 
 
@@ -1607,22 +1610,10 @@ resolveWalFileName(LogicalStreamContext *context,
 {
 	StreamContext *privateContext = (StreamContext *) context->private;
 	char wal[MAXPGPATH] = { 0 };
-	char partialFileName[MAXPGPATH] = { 0 };
 	XLogSegNo segno;
 
 	XLByteToSeg(lsn, segno, context->WalSegSz);
 	XLogFileName(wal, context->timeline, segno, context->WalSegSz);
-
-	sformat(partialFileName, sizeof(partialFileName), "%s/%s.json.partial",
-			privateContext->paths.dir,
-			wal);
-
-	/* Partial file is the first place to look for */
-	if (file_exists(partialFileName))
-	{
-		strlcpy(walFileNamePtr, partialFileName, MAXPGPATH);
-		return true;
-	}
 
 	char walFileName[MAXPGPATH] = { 0 };
 	sformat(walFileName, sizeof(walFileName), "%s/%s.json",
@@ -1634,6 +1625,19 @@ resolveWalFileName(LogicalStreamContext *context,
 		strlcpy(walFileNamePtr, walFileName, MAXPGPATH);
 		return true;
 	}
+
+	char partialFileName[MAXPGPATH] = { 0 };
+	sformat(partialFileName, sizeof(partialFileName), "%s/%s.json.partial",
+			privateContext->paths.dir,
+			wal);
+
+	/* Partial file is the first place to look for */
+	if (file_exists(partialFileName))
+	{
+		strlcpy(walFileNamePtr, partialFileName, MAXPGPATH);
+		return true;
+	}
+
 	return false;
 }
 
@@ -1682,8 +1686,7 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 
 	if (!file_exists(latest))
 	{
-		log_error("BUG: latest file \"%s\" does not exist", latest);
-		return false;
+		return true;
 	}
 
 	if (!normalize_filename(latest, latest, MAXPGPATH))
@@ -1702,7 +1705,7 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 	uint64_t lsn = metadata->lsn;
 	int startLinePosition = 0;
 
-	while (!found || !streq(walFile, latest))
+	while (!streq(walFile, latest))
 	{
 		if (!resolveWalFileName(context, lsn, walFile))
 		{
@@ -1735,6 +1738,11 @@ truncateJSONFileToLSN(LogicalStreamContext *context,
 
 		/* Move to the next WAL segment */
 		lsn += context->WalSegSz;
+
+		if (found)
+		{
+			break;
+		}
 	}
 
 	char walFileToTruncate[MAXPGPATH] = { 0 };
