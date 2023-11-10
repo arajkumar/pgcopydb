@@ -39,7 +39,7 @@ indent:
 	citus_indent
 
 build: version
-	docker build -t pgcopydb .
+	docker build -t live-migration .
 
 echo-version: GIT-VERSION-FILE
 	@awk '{print $$3}' $<
