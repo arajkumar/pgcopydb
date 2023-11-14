@@ -410,7 +410,14 @@ stream_init_context(StreamSpecs *specs)
 	 * compared to the startpos, and we ensure that we start writing to a file
 	 * of startpos.
 	 */
-	privateContext->maxWrittenLSN = specs->startpos;
+	if (specs->maxWrittenLSN == InvalidXLogRecPtr)
+	{
+		privateContext->maxWrittenLSN = specs->startpos;
+	}
+	else
+	{
+		privateContext->maxWrittenLSN = specs->maxWrittenLSN;
+	}
 
 	/* transform needs some catalog lookups (pkey, type oid) */
 	privateContext->catalog = specs->catalog;
@@ -673,7 +680,12 @@ streamCheckResumePosition(StreamSpecs *specs)
 		 */
 		int lineNb = lastLineNb;
 
-		for (; lineNb > 0; lineNb--)
+		long truncationSize = latestStreamedContent.fileSize;
+		int lastLineLength = 0;
+
+		uint64_t maxLSN = latest->lsn;
+
+		for (; lineNb >= 0; lineNb--)
 		{
 			LogicalMessageMetadata *previous = &(messages[lineNb]);
 
@@ -683,11 +695,77 @@ streamCheckResumePosition(StreamSpecs *specs)
 			}
 			else
 			{
-				break;
+				if (latest->action == STREAM_ACTION_INSERT ||
+					latest->action == STREAM_ACTION_UPDATE ||
+					latest->action == STREAM_ACTION_DELETE ||
+					latest->action == STREAM_ACTION_TRUNCATE ||
+					latest->action == STREAM_ACTION_BEGIN)
+				{
+					latest = previous;
+				}
+				else
+				{
+					break;
+				}
+			}
+
+			lastLineLength = strlen(latestStreamedContent.lines[lineNb]) + 1;
+			truncationSize -= lastLineLength;
+
+			if (latest->lsn > maxLSN)
+			{
+				maxLSN = latest->lsn;
 			}
 		}
 
+		/*
+		 * If we have a lineNb < 0, it means that we have a sequence of messages
+		 * with the same LSN, and that we have reached the beginning of the
+		 * file. In that case, we want to truncate the whole file.
+		 */
+		if (lineNb < 0)
+		{
+			truncationSize = 0;
+		}
+		else
+		{
+			truncationSize += lastLineLength;
+		}
+
+		char latestDuplicateFile[MAXPGPATH] = { 0 };
+		sformat(latestDuplicateFile, sizeof(latestDuplicateFile),
+				"%s.duplicate",
+				latestStreamedContent.filename);
+
+		if (!unlink_file(latestDuplicateFile))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!duplicate_file(latestStreamedContent.filename,
+					        latestDuplicateFile))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		log_info("Truncate file \"%s\" to %ld bytes",
+				 latestStreamedContent.filename,
+				 truncationSize);
+		if (truncate(latestStreamedContent.filename, truncationSize) != 0)
+		{
+			log_error("Failed to truncate file \"%s\" to %ld bytes: %m",
+					  latestDuplicateFile,
+					  truncationSize);
+			return false;
+		}
+
+		/* lineNb points at previous, move to latest */
+		lineNb ++;
+
 		specs->startpos = latest->lsn;
+		specs->maxWrittenLSN = maxLSN;
 		specs->startposComputedFromJSON = true;
 		specs->startposActionFromJSON = latest->action;
 
@@ -696,7 +774,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 				 "line %d",
 				 LSN_FORMAT_ARGS(specs->startpos),
 				 latestStreamedContent.filename,
-				 lineNb);
+				 lineNb + 1); /* lines are counted starting at zero */
 
 		char *latestMessage = latestStreamedContent.lines[lineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
@@ -1621,10 +1699,7 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 		 * same message as the latest flushed in our JSON file when it's
 		 * actually a new message.
 		 */
-		privateContext->reachedStartPos =
-			privateContext->startpos < metadata->lsn ||
-			(privateContext->startpos == metadata->lsn &&
-			 metadata->action != privateContext->startposActionFromJSON);
+		privateContext->reachedStartPos = privateContext->startpos == metadata->lsn;
 	}
 
 	if (!privateContext->reachedStartPos)
@@ -1941,6 +2016,7 @@ stream_read_file(StreamContent *content)
 		return false;
 	}
 
+	content->fileSize = size;
 	content->count = countLines(content->buffer);
 	content->lines = (char **) calloc(content->count, sizeof(char *));
 	content->count = splitLines(content->buffer, content->lines, content->count);
@@ -2657,6 +2733,14 @@ stream_cleanup_context(StreamSpecs *specs)
 	success = success && unlink_file(specs->paths.tlifile);
 	success = success && unlink_file(specs->paths.tlihistfile);
 
+	log_debug("stream_cleanup_context(%d): remove \"%s\", \"%s\", \"%s\"",
+			  success,
+			  specs->paths.walsegsizefile,
+			  specs->paths.tlifile,
+			  specs->paths.tlihistfile);
+
+	specs->system.timeline = 0;
+
 	return success;
 }
 
@@ -2780,6 +2864,10 @@ stream_read_context(CDCPaths *paths,
 	free(wal_segment_size);
 	free(tli);
 	free(history);
+
+	log_debug("stream_read_context: wal_segment_size %d timeline %d",
+			  *WalSegSz,
+			  system->timeline);
 
 	return true;
 }

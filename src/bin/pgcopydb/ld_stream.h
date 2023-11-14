@@ -394,6 +394,7 @@ typedef struct StreamApplyContext
 typedef struct StreamContent
 {
 	char filename[MAXPGPATH];
+	long fileSize;
 	int count;
 	char *buffer;
 	char **lines;                     /* malloc'ed area */
@@ -439,6 +440,9 @@ struct StreamSpecs
 
 	uint64_t startpos;
 	uint64_t endpos;
+
+	uint64_t maxWrittenLSN;
+
 	CopyDBSentinel sentinel;
 
 	bool startposComputedFromJSON;
