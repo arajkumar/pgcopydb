@@ -10,22 +10,23 @@ import shutil
 import tempfile
 import threading
 import queue
+from housekeeping import start_housekeeping
+from pathlib import Path
 
-DELAY_THRESHOLD = 30 # Megabytes.
-
-WORK_DIR = os.path.join(tempfile.gettempdir(), "ts_cdc")
-shutil.rmtree(WORK_DIR, ignore_errors=True)
-os.makedirs(WORK_DIR, exist_ok=True)
-os.makedirs(os.path.join(tempfile.gettempdir(), "pgcopydb"), exist_ok=True)
+# If the process is not running on a TTY then reading from stdin will raise and
+# exception. We read from stdin to start the switch-over phase. If it's not a
+# TTY the switch-over can be started by sending a SIGUSR1 signal to the
+# process.
+IS_TTY = os.isatty(0)
+DELAY_THRESHOLD = 30  # Megabytes.
 
 env = os.environ.copy()
-for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
-    if key not in env or env[key] == "" or env[key] == None:
-        raise ValueError(f"${key} not found")
 
-### Helper functions.
+LIVE_MIGRATION_DOCKER = env.get('LIVE_MIGRATION_DOCKER') == 'true'
+
+
 class Command:
-    def __init__(self, command: str = "", env = env, use_shell: bool = False, log_path: str = ""):
+    def __init__(self, command: str = "", env=env, use_shell: bool = False, log_path: str = ""):
         self.command = command
         if log_path == "":
             self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env)
@@ -51,7 +52,7 @@ class Command:
             #
             # If we do not give these signals during the program execution (as and when required),
             # then pgcopydb hangs indefinitely (for some reason) even if it has completed its execution.
-            raise RuntimeError(f"command '{self.command}' exited with {self.process.returncode} code")
+            raise RuntimeError(f"command '{self.command}' exited with {self.process.returncode} code stderr={self.process.stderr}")
 
     def wait(self):
         """
@@ -68,6 +69,7 @@ class Command:
     def kill(self):
         self.process.kill()
 
+
 def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
     stdout = subprocess.PIPE
     stderr = subprocess.PIPE
@@ -78,11 +80,13 @@ def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) ->
         stderr = open(fname_stderr, "w")
     result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
     if result.returncode != 0 and not ignore_non_zero_code:
-        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code ")
+        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code stderr={result.stderr} stdout={result.stdout}")
     return str(result.stdout)
+
 
 def psql(uri: str, sql: str):
     return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d {uri} -c " {sql} " """
+
 
 def run_sql(execute_on_target: bool, sql: str):
     dest = "$PGCOPYDB_SOURCE_PGURI"
@@ -90,22 +94,33 @@ def run_sql(execute_on_target: bool, sql: str):
         dest = "$PGCOPYDB_TARGET_PGURI"
     run_cmd(psql(dest, sql))
 
-def wait_for_keypress(key: str) -> queue.Queue:
+
+def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
     """
     waits for the 'key' to be pressed. It returns a keypress_event queue
     that becomes non-empty when the required 'key' is pressed (and ENTER).
     """
-    notify_queue = queue.Queue(maxsize=1)
+
     def key_e():
         while True:
             k = input()
             if k.lower() == key.lower():
+                print(f"Received key press event: '{key}'")
                 notify_queue.put(1)
                 notify_queue.task_done()
                 return
     key_event = threading.Thread(target=key_e)
     key_event.start()
-    return notify_queue
+
+
+def wait_for_sigusr1(notify_queue) -> queue.Queue:
+
+    def handler(signum, frame):
+        print("Received signal")
+        notify_queue.put(1)
+        notify_queue.task_done()
+    signal.signal(signal.SIGUSR1, handler)
+
 
 def extract_lsn_and_snapshot(log_line: str):
     """
@@ -126,15 +141,22 @@ def extract_lsn_and_snapshot(log_line: str):
 
     return lsn, snapshot_id
 
-### Helper functions ends.
 
-def pgcopydb_init_env():
-    env["PGCOPYDB_DIR"] = WORK_DIR
-    env["PGCOPYDB_SWITCH_OVER_DIR"] = env["PGCOPYDB_DIR"] + "/switch_over"
-    env["PGCOPYDB_METADATA_DIR"] = env["PGCOPYDB_SWITCH_OVER_DIR"] + "/caggs_metadata"
+def pgcopydb_init_env(work_dir: Path):
 
-    os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
-    os.makedirs(f"{WORK_DIR}/logs", exist_ok=False)
+    global env
+
+    for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
+        if key not in env or env[key] == "" or env[key] is None:
+            raise ValueError(f"${key} not found")
+
+    env["PGCOPYDB_DIR"] = str(work_dir.absolute())
+    switch_over_dir = (work_dir / "switch_over").absolute()
+    env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
+    env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
+
+    (work_dir / "logs").mkdir(exist_ok=False)
+
 
 def check_timescaledb_version():
     result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
@@ -146,25 +168,28 @@ def check_timescaledb_version():
     if source_ts_version != target_ts_version:
         raise RuntimeError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
 
+
 def cleanup_replication_progress():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
     if run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb' or slot_name = 'switchover');")) == "t":
         raise RuntimeError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
 
+
 def create_snapshot_and_follow():
     print("Creating snapshot ...")
     snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
     snapshot_proc = Command(command=snapshot_command, use_shell=True,
-                                    log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
+                            log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
 
-    time.sleep(5)
+    time.sleep(10)
 
     print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc ...")
     follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
     follow_proc = Command(command=follow_command, use_shell=True,
-                                log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
+                          log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
     return (snapshot_proc, follow_proc)
+
 
 def migrate_existing_data():
     run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
@@ -184,7 +209,8 @@ def migrate_existing_data():
     print(f"Completed in {time_taken:.1f}m")
 
     run_sql(execute_on_target=True,
-        sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
+            sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
+
 
 def wait_for_DBs_to_sync():
     def get_delay():
@@ -193,28 +219,38 @@ def wait_for_DBs_to_sync():
 
     analyzed = False
     analyze_cmd = 'psql -A -t -d $PGCOPYDB_TARGET_PGURI -c " analyze verbose; " '
-    key_event_queue = wait_for_keypress(key="s")
+    key_event_queue = queue.Queue(maxsize=1)
+    wait_for_sigusr1(key_event_queue)
+    if IS_TTY:
+        wait_for_keypress(key_event_queue, key="s")
+
     while True:
         delay_mb = get_delay()
-        print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. Press 's' (and ENTER) to stop live-replay")
+        if not IS_TTY and LIVE_MIGRATION_DOCKER:
+            print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. To stop live-replay, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>'")
+        elif not IS_TTY:
+            print(f"[WATCH] Source DB - Target DB=> {delay_mb}MB. To stop live - replay, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+        else:
+            print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. Press 's' (and ENTER) to stop live-replay")
         if not analyzed and delay_mb < DELAY_THRESHOLD:
-            print("Starting analyze on Target DB. This might take sometime to complete ...")
+            print("Starting analyze on Target DB. This might take a long time to complete ...")
             run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
             print("Analyze complete")
             analyzed = True
             continue
         if not key_event_queue.empty():
-            print("Received key press event: 's'")
+            print("Live-replay stopped")
             break
         time.sleep(10)
+
 
 def wait_for_LSN_to_sync():
     switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --plugin wal2json --slot-name switchover"
     switchover_snapshot_proc = Command(command=switchover_snapshot_command, use_shell=True,
-                                            log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
+                                       log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
     switchover_snapshot_log = f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot_stderr.log"
 
-    time.sleep(10) # Wait for snapshot to create.
+    time.sleep(10)  # Wait for snapshot to create.
 
     end_pos_lsn = ""
     with open(switchover_snapshot_log, 'r') as file:
@@ -232,7 +268,7 @@ def wait_for_LSN_to_sync():
     print(f"Streaming upto {end_pos_lsn} (Last LSN) ...")
     endpos_follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --resume"
     endpos_follow_proc = Command(endpos_follow_command, use_shell=True,
-                                        log_path=f"{env['PGCOPYDB_DIR']}/logs/endpos_follow")
+                                 log_path=f"{env['PGCOPYDB_DIR']}/logs/endpos_follow")
 
     endpos_follow_log = f"{env['PGCOPYDB_DIR']}/logs/endpos_follow_stderr.log"
 
@@ -246,8 +282,7 @@ def wait_for_LSN_to_sync():
         file = open(endpos_follow_log, 'r')
         done = False
         for line in file:
-            l = line.strip()
-            if is_endpos_streamed(l):
+            if is_endpos_streamed(line.strip()):
                 print("End position LSN has been streamed successfully")
                 done = True
                 break
@@ -257,8 +292,10 @@ def wait_for_LSN_to_sync():
     endpos_follow_proc.kill()
     return switchover_snapshot_proc
 
+
 def copy_sequences():
     run_cmd("pgcopydb copy sequences", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
+
 
 def migrate_caggs_metadata():
     print(f"Dumping metadata from Source DB to {env['PGCOPYDB_METADATA_DIR']} ...")
@@ -275,18 +312,34 @@ def migrate_caggs_metadata():
     time_taken = (time.time() - start) / 60
     print(f"Completed in {time_taken:.1f}m")
 
+
 def enable_caggs_policies():
     run_sql(execute_on_target=True,
-                 sql="select alter_job(job_id, scheduled => true) from timescaledb_information.jobs where application_name like 'Refresh Continuous%';")
+            sql="select alter_job(job_id, scheduled => true) from timescaledb_information.jobs where application_name like 'Refresh Continuous%';")
     run_sql(execute_on_target=True,
-                 sql="select timescaledb_post_restore();")
+            sql="select timescaledb_post_restore();")
+
 
 def cleanup():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR")
 
+
 if __name__ == "__main__":
-    pgcopydb_init_env()
+
+    work_dir = os.getenv("PGCOPYDB_DIR")
+    if work_dir is not None:
+        work_dir = Path(work_dir)
+        # This is needed because cleanup doesn't support --dir
+        pgcopydb_dir = Path(tempfile.gettempdir()) / "pgcopydb"
+        pgcopydb_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        work_dir = Path(tempfile.gettempdir()) / "pgcopydb"
+
+    shutil.rmtree(str(work_dir), ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    pgcopydb_init_env(work_dir)
 
     print("Verifying TimescaleDB version in Source DB and Target DB ...")
     check_timescaledb_version()
@@ -299,6 +352,7 @@ if __name__ == "__main__":
     print("Migrating existing data from Source DB to Target DB ...")
     migrate_existing_data()
     snapshot_proc.terminate()
+    (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
     print("Applying buffered transactions ...")
     run_cmd("pgcopydb stream sentinel set apply")
@@ -309,11 +363,19 @@ if __name__ == "__main__":
     follow_proc.terminate_process_including_children()
     print("Stopped")
 
-    print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need Press 'c' (and ENTER) to continue")
-    event_queue = wait_for_keypress(key="c")
+    if not IS_TTY and LIVE_MIGRATION_DOCKER:
+        print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'docker kill -s=USR1 <container_name>'")
+    elif not IS_TTY:
+        print(f"[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'kill -s=USR1 {os.getpid()}' to continue")
+    else:
+        print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need Press 'c' (and ENTER) to continue")
+    notify_queue = queue.Queue(maxsize=1)
+    wait_for_sigusr1(notify_queue)
+    if IS_TTY:
+        wait_for_keypress(notify_queue, key="c")
+
     while True:
-        if not event_queue.empty():
-            print("Received key press event: 'c'")
+        if not notify_queue.empty():
             print("Continuing ...")
             break
         time.sleep(1)
@@ -338,4 +400,7 @@ if __name__ == "__main__":
     cleanup()
 
     print("Migration successfully completed")
+
+    housekeeping_stop_event.set()
+    housekeeping_thread.join()
     sys.exit(0)
