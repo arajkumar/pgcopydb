@@ -12,6 +12,7 @@ import threading
 import queue
 from housekeeping import start_housekeeping
 from pathlib import Path
+from urllib.parse import urlparse
 
 # If the process is not running on a TTY then reading from stdin will raise and
 # exception. We read from stdin to start the switch-over phase. If it's not a
@@ -190,12 +191,42 @@ def create_snapshot_and_follow():
                           log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
     return (snapshot_proc, follow_proc)
 
+def dbname_from_uri(uri: str) -> str:
+    result = urlparse(uri)
+    # Input `uri`: 'postgres://tsdb:abcd@a.timescaledb.io:26479/rbac_test?sslmode=require'
+    # result.path[1]: '/rbac_test'
+    return result.path[1:]  # Remove leading '/'
 
 def migrate_existing_data():
-    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
-
     print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
     start = time.time()
+
+    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
+    source_dbname = dbname_from_uri(source_pg_uri)
+    roles_file_path = f"{env['PGCOPYDB_DIR']}/roles.sql"
+    dump_roles = f"""pg_dumpall -d $PGCOPYDB_SOURCE_PGURI --quote-all-identifiers --roles-only --no-role-passwords -l {source_dbname} --file={roles_file_path}"""
+    run_cmd(dump_roles)
+
+    # When using MST, Aiven roles modify parameters like "pg_qualstats.enabled" that are not permitted on cloud.
+    # Hence, we remove Aiven roles assuming they are not being used for tasks other than ones specific to Aiven/MST.
+    filter_stmts = f"""
+sed -i -E \
+-e '/CREATE ROLE "postgres";/d' \
+-e '/ALTER ROLE "postgres"/d' \
+-e 's/(NO)*SUPERUSER//g' \
+-e 's/(NO)*REPLICATION//g' \
+-e 's/(NO)*BYPASSRLS//g' \
+-e 's/GRANTED BY "[^"]*"//g' \
+-e '/CREATE ROLE "tsdbadmin";/d' \
+-e '/ALTER ROLE "tsdbadmin"/d' \
+-e '/TO "tsdbadmin/d' \
+-e '/CREATE ROLE "_aiven";/d' \
+-e '/ALTER ROLE "_aiven"/d' \
+{roles_file_path}"""
+    run_cmd(filter_stmts)
+
+    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
+
     pgdump_command = f"pg_dump -d $PGCOPYDB_SOURCE_PGURI --jobs 8 --no-owner --no-privileges --no-tablespaces --quote-all-identifiers --format d --file $PGCOPYDB_DIR/dump --exclude-table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
     run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pg_dump_existing_data")
     time_taken = (time.time() - start) / 60
@@ -203,6 +234,10 @@ def migrate_existing_data():
 
     print(f"Restoring from {env['PGCOPYDB_DIR']}/dump ...")
     start = time.time()
+
+    restore_roles = f"""psql -X -d $PGCOPYDB_TARGET_PGURI -v ON_ERROR_STOP=1 --echo-errors -f {roles_file_path}"""
+    run_cmd(restore_roles)
+
     pgrestore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --no-owner --no-privileges --no-tablespaces -v --format d $PGCOPYDB_DIR/dump"
     run_cmd(pgrestore_command, f"{env['PGCOPYDB_DIR']}/logs/pg_restore_existing_data", ignore_non_zero_code=True)
     time_taken = (time.time() - start) / 60
