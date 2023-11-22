@@ -423,6 +423,7 @@ follow_prepare_mode_switch(StreamSpecs *streamSpecs,
 						   LogicalStreamMode previousMode,
 						   LogicalStreamMode currentMode)
 {
+
 	log_info("Catching-up from existing on-disk files");
 
 	if (streamSpecs->system.timeline == 0)
