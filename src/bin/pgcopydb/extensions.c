@@ -148,7 +148,7 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 						 config->relname);
 
 				/* apply extcondition to the source table */
-				char qname[NAMEDATALEN * 2 + 5] = { 0 };
+				char qname[PG_NAMEDATALEN_FQ] = { 0 };
 
 				sformat(qname, sizeof(qname), "%s.%s",
 						config->nspname,
@@ -168,8 +168,9 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 
 				bool truncate = false;
 				PGSQL *src = &(copySpecs->sourceSnapshot.pgsql);
+				uint64_t bytesTransmitted = 0;
 
-				if (!pg_copy(src, &dst, sql, qname, truncate))
+				if (!pg_copy(src, &dst, sql, qname, truncate, &bytesTransmitted))
 				{
 					/* errors have already been logged */
 					return false;

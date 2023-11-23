@@ -169,7 +169,7 @@ void log_log(int level, const char *file, int line, const char *fmt, ...)
 
   /* Get current time */
   gettimeofday(&t, NULL);
-  lt = localtime(&t);
+  lt = localtime(&t.tv_sec);
 
   char *json_string = NULL;
 
@@ -180,10 +180,12 @@ void log_log(int level, const char *file, int line, const char *fmt, ...)
 	  JSON_Value *js = json_value_init_object();
 	  JSON_Object *jsobj = json_value_get_object(js);
 
-	  char buf[32] = { 0 };
 
+	  char timebuf[32] = { 0 };
+	  char buf[128] = { 0 };
 	  /* always use the long time format when preparing JSON */
-	  buf[strftime(buf, sizeof(buf), LOG_TFORMAT_LONG, lt)] = '\0';
+	  timebuf[strftime(timebuf, sizeof(timebuf), LOG_TFORMAT_LONG, lt)] = '\0';
+	  snprintf(buf, sizeof(buf), "%s.%03d", timebuf, (int)t.tv_usec / 1000);
 
 	  /*
 	   * See Postgres docs for key names
@@ -228,10 +230,11 @@ void log_log(int level, const char *file, int line, const char *fmt, ...)
 	}
 	else if (L.errFmt == LOG_FORMAT_TEXT)
 	{
+		char timebuf[32] = { 0 };
 		char buf[128] = { 0 };
 
-		buf[strftime(buf, sizeof(buf), L.tformat, lt)] = '\0';
-		sprintf(buf + strlen(buf), ".%03d", (int)t.tv_usec / 1000);
+		timebuf[strftime(timebuf, sizeof(timebuf), L.tformat, lt)] = '\0';
+		snprintf(buf, sizeof(buf), "%s.%03d", timebuf, (int)t.tv_usec / 1000);
 
 		if (L.useColors)
 		{
@@ -276,10 +279,12 @@ void log_log(int level, const char *file, int line, const char *fmt, ...)
 	  else if (L.fpFmt == LOG_FORMAT_TEXT)
 	  {
 		  va_list args;
-		  char buf[32];
+		  char timebuf[32] = { 0 };
+		  char buf[128] = { 0 };
 
-		  /* always use the long time format when writting to file */
-		  buf[strftime(buf, sizeof(buf), LOG_TFORMAT_LONG, lt)] = '\0';
+		  /* always use the long time format when preparing JSON */
+		  timebuf[strftime(timebuf, sizeof(timebuf), LOG_TFORMAT_LONG, lt)] = '\0';
+		  snprintf(buf, sizeof(buf), "%s.%03d", timebuf, (int)t.tv_usec / 1000);
 
 		  /* always add all the details when writting to file */
 		  pg_fprintf(L.fp, "%s %d %s %s ",

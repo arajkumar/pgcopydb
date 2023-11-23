@@ -13,9 +13,11 @@
 #include "copydb.h"
 #include "queue_utils.h"
 #include "pgsql.h"
+#include "schema.h"
 
 #define OUTPUT_BEGIN "BEGIN; -- "
 #define OUTPUT_COMMIT "COMMIT; -- "
+#define OUTPUT_ROLLBACK "ROLLBACK; -- "
 #define OUTPUT_SWITCHWAL "-- SWITCH WAL "
 #define OUTPUT_KEEPALIVE "-- KEEPALIVE "
 #define OUTPUT_ENDPOS "-- ENDPOS "
@@ -41,7 +43,8 @@ typedef enum
 	STREAM_ACTION_MESSAGE = 'M',
 	STREAM_ACTION_SWITCH = 'X',
 	STREAM_ACTION_KEEPALIVE = 'K',
-	STREAM_ACTION_ENDPOS = 'E'
+	STREAM_ACTION_ENDPOS = 'E',
+	STREAM_ACTION_ROLLBACK = 'R'
 } StreamAction;
 
 typedef struct InternalMessage
@@ -134,30 +137,30 @@ typedef struct LogicalMessageTupleArray
 
 typedef struct LogicalMessageInsert
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	LogicalMessageTupleArray new;   /* {"columns": ...} */
 } LogicalMessageInsert;
 
 typedef struct LogicalMessageUpdate
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	LogicalMessageTupleArray old;   /* {"identity": ...} */
 	LogicalMessageTupleArray new;   /* {"columns": ...} */
 } LogicalMessageUpdate;
 
 typedef struct LogicalMessageDelete
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	LogicalMessageTupleArray old;   /* {"identity": ...} */
 } LogicalMessageDelete;
 
 typedef struct LogicalMessageTruncate
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 } LogicalMessageTruncate;
 
 typedef struct LogicalMessageSwitchWAL
@@ -205,9 +208,11 @@ typedef struct LogicalTransaction
 	uint32_t xid;
 	uint64_t beginLSN;
 	uint64_t commitLSN;
+	uint64_t rollbackLSN;
 	char timestamp[PG_MAX_TIMESTAMP];
 	bool continued;
 	bool commit;
+	bool rollback;
 
 	uint32_t count;                     /* number of statements */
 	LogicalTransactionStatement *first;
@@ -283,9 +288,6 @@ typedef struct StreamContext
 	uint64_t endpos;
 	bool apply;
 
-	bool reachedStartPos;
-	StreamAction startposActionFromJSON;
-
 	bool stdIn;
 	bool stdOut;
 
@@ -316,6 +318,8 @@ typedef struct StreamContext
 	FILE *sqlFile;
 
 	StreamCounters counters;
+
+	bool transactionInProgress;
 } StreamContext;
 
 
@@ -366,6 +370,7 @@ typedef struct StreamApplyContext
 	uint32_t WalSegSz;          /* information about source database */
 
 	uint64_t previousLSN;       /* register COMMIT LSN progress */
+	uint64_t switchLSN;         /* helps to find the next .sql file to apply */
 
 	LSNTracking *lsnTrackingList;
 
@@ -375,7 +380,9 @@ typedef struct StreamApplyContext
 	uint64_t replay_lsn;        /* from the pgcopydb sentinel */
 
 	bool reachedStartPos;
+	bool continuedTxn;
 	bool reachedEndPos;
+	bool reachedEOF;
 	bool transactionInProgress;
 	bool logSQL;
 
@@ -436,9 +443,6 @@ struct StreamSpecs
 	uint64_t endpos;
 	CopyDBSentinel sentinel;
 
-	bool startposComputedFromJSON;
-	StreamAction startposActionFromJSON;
-
 	LogicalStreamMode mode;
 
 	bool restart;
@@ -488,6 +492,7 @@ bool stream_init_for_mode(StreamSpecs *specs, LogicalStreamMode mode);
 
 char * LogicalStreamModeToString(LogicalStreamMode mode);
 
+bool stream_check_in_out(StreamSpecs *specs);
 bool stream_init_context(StreamSpecs *specs);
 
 bool startLogicalStreaming(StreamSpecs *specs);
@@ -590,6 +595,7 @@ bool stream_write_endpos(FILE *out, LogicalMessageEndpos *endpos);
 
 bool stream_write_begin(FILE *out, LogicalTransaction *tx);
 bool stream_write_commit(FILE *out, LogicalTransaction *tx);
+bool stream_write_rollback(FILE *out, LogicalTransaction *tx);
 
 bool stream_write_insert(FILE *out, LogicalMessageInsert *insert);
 bool stream_write_truncate(FILE *out, LogicalMessageTruncate *truncate);
@@ -606,10 +612,6 @@ bool parseMessage(StreamContext *privateContext, char *message, JSON_Value *json
 bool streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 											 LogicalTransactionStatement *stmt);
 
-bool computeTxnMetadataFilename(uint32_t xid,
-								const char *dir,
-								char *filename);
-bool writeTxnMetadataFile(LogicalTransaction *txn, const char *dir);
 
 bool GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
 												char **nspname, char **relname);
@@ -647,7 +649,9 @@ bool stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context);
 bool stream_apply_wait_for_sentinel(StreamSpecs *specs,
 									StreamApplyContext *context);
 
-bool stream_apply_sync_sentinel(StreamApplyContext *context);
+bool stream_apply_sync_sentinel(StreamApplyContext *context,
+								bool findDurableLSN);
+
 bool stream_apply_send_sync_sentinel(StreamApplyContext *context);
 bool stream_apply_fetch_sync_sentinel(StreamApplyContext *context);
 
@@ -668,9 +672,6 @@ bool setupReplicationOrigin(StreamApplyContext *context, bool logSQL);
 bool computeSQLFileName(StreamApplyContext *context);
 
 bool parseSQLAction(const char *query, LogicalMessageMetadata *metadata);
-bool readTxnCommitLSN(StreamApplyContext *context,
-					  LogicalMessageMetadata *metadata);
-bool parseTxnMetadataFile(const char *filename, LogicalMessageMetadata *metadata);
 
 bool stream_apply_track_insert_lsn(StreamApplyContext *context,
 								   uint64_t sourceLSN);
@@ -685,6 +686,9 @@ bool stream_apply_read_lsn_tracking(StreamApplyContext *context);
 bool stream_replay(StreamSpecs *specs);
 bool stream_apply_replay(StreamSpecs *specs);
 bool stream_replay_line(void *ctx, const char *line, bool *stop);
+bool stream_replay_reached_endpos(StreamSpecs *specs,
+								  StreamApplyContext *context,
+								  bool stop);
 
 /* follow.c */
 bool follow_export_snapshot(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
@@ -692,7 +696,9 @@ bool follow_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 bool follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 
 bool follow_init_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel);
-bool follow_get_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel);
+bool follow_get_sentinel(StreamSpecs *specs,
+						 CopyDBSentinel *sentinel,
+						 bool verbose);
 bool follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 
 bool followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);

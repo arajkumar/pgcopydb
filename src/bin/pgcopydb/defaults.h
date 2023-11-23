@@ -9,7 +9,7 @@
 #include "git-version.h"
 
 /* additional version information for printing version on CLI */
-#define PGCOPYDB_VERSION "0.13"
+#define PGCOPYDB_VERSION "0.14"
 
 #ifdef GIT_VERSION
 #define VERSION_STRING GIT_VERSION
@@ -50,16 +50,12 @@
 
 #define POSTGRES_CONNECT_TIMEOUT "10"
 
-
-/* retry PQping for a maximum of 15 mins, up to 2 secs between attemps */
-#define POSTGRES_PING_RETRY_TIMEOUT 900               /* seconds */
+/* retry PQping for a maximum of 1 min, up to 2 secs between attemps */
+#define POSTGRES_PING_RETRY_TIMEOUT 60               /* seconds */
 #define POSTGRES_PING_RETRY_CAP_SLEEP_TIME (2 * 1000) /* milliseconds */
 #define POSTGRES_PING_RETRY_BASE_SLEEP_TIME 5         /* milliseconds */
 
 #define POSTGRES_PORT 5432
-
-/* masqurade  passwords with that value in logs */
-#define PASSWORD_MASK "****"
 
 /* default replication slot and origin for logical replication */
 #define REPLICATION_ORIGIN "pgcopydb"

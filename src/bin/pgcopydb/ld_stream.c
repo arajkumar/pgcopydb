@@ -225,8 +225,10 @@ stream_init_for_mode(StreamSpecs *specs, LogicalStreamMode mode)
 	}
 	else if (specs->mode == STREAM_MODE_REPLAY && mode == STREAM_MODE_CATCHUP)
 	{
+		specs->stdIn = false;
+		specs->stdOut = false;
+
 		/* we keep the transform queue around */
-		(void) 0;
 	}
 	else
 	{
@@ -287,6 +289,46 @@ LogicalStreamModeToString(LogicalStreamMode mode)
 
 
 /*
+ * stream_check_in_out checks that the stdIn and stdOut file descriptors are
+ * still valid: EBADF could happen when a PIPE is Broken for lack of a
+ * reader/writer process.
+ */
+bool
+stream_check_in_out(StreamSpecs *specs)
+{
+	if (specs->stdIn)
+	{
+		char buf[0];
+
+		if (read(fileno(specs->in), buf, 0) != 0)
+		{
+			log_error("Failed to read from input PIPE: %m");
+			return false;
+		}
+	}
+
+	if (specs->stdOut)
+	{
+		char buf[0];
+
+		if (fwrite(buf, sizeof(char), 0, specs->in) != 0)
+		{
+			log_error("Failed to write to output PIPE: %m");
+			return false;
+		}
+
+		if (fflush(specs->out) != 0)
+		{
+			log_error("Failed to flush output PIPE: %m");
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * stream_init_context initializes a LogicalStreamContext.
  */
 bool
@@ -296,26 +338,30 @@ stream_init_context(StreamSpecs *specs)
 
 	privateContext->endpos = specs->endpos;
 	privateContext->startpos = specs->startpos;
-	privateContext->startposActionFromJSON = specs->startposActionFromJSON;
 
 	privateContext->mode = specs->mode;
+
+	privateContext->transformQueue = &(specs->transformQueue);
+
+	privateContext->paths = specs->paths;
+
+	privateContext->connStrings = specs->connStrings;
+
+	/*
+	 * When using PIPEs for inter-process communication, makes sure the PIPEs
+	 * are ready for us to use and not broken, as in EBADF.
+	 */
 	privateContext->stdIn = specs->stdIn;
 	privateContext->stdOut = specs->stdOut;
 
 	privateContext->in = specs->in;
 	privateContext->out = specs->out;
 
-	privateContext->transformQueue = &(specs->transformQueue);
-
-	privateContext->paths = specs->paths;
-	privateContext->startpos = specs->startpos;
-
-	privateContext->connStrings = specs->connStrings;
-
-	privateContext->metadata.action = STREAM_ACTION_UNKNOWN;
-	privateContext->previous.action = STREAM_ACTION_UNKNOWN;
-
-	privateContext->lastWriteTime = 0;
+	if (!stream_check_in_out(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	/*
 	 * When streaming is resumed, transactions are sent in full even if we wrote
@@ -326,19 +372,10 @@ stream_init_context(StreamSpecs *specs)
 	 * However, note that if the last message is COMMIT, the streaming will
 	 * resume from the next transaction.
 	 */
-	if (specs->startposComputedFromJSON &&
-		(specs->startposActionFromJSON == STREAM_ACTION_BEGIN ||
-		 specs->startposActionFromJSON == STREAM_ACTION_INSERT ||
-		 specs->startposActionFromJSON == STREAM_ACTION_UPDATE ||
-		 specs->startposActionFromJSON == STREAM_ACTION_DELETE ||
-		 specs->startposActionFromJSON == STREAM_ACTION_TRUNCATE))
-	{
-		privateContext->reachedStartPos = false;
-	}
-	else
-	{
-		privateContext->reachedStartPos = true;
-	}
+	privateContext->metadata.action = STREAM_ACTION_UNKNOWN;
+	privateContext->previous.action = STREAM_ACTION_UNKNOWN;
+
+	privateContext->lastWriteTime = 0;
 
 	/*
 	 * Initializing maxWrittenLSN as startpos at the beginning of migration or
@@ -411,9 +448,23 @@ startLogicalStreaming(StreamSpecs *specs)
 	 * continue streaming.
 	 */
 	bool retry = true;
+	uint64_t retries = 0;
+	uint64_t waterMarkLSN = InvalidXLogRecPtr;
 
 	while (retry)
 	{
+		if (!stream_check_in_out(specs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+		{
+			log_error("Streaming process has been signaled to stop");
+			return false;
+		}
+
 		if (!pgsql_init_stream(&stream,
 							   specs->connStrings->logrep_pguri,
 							   specs->slot.plugin,
@@ -452,11 +503,22 @@ startLogicalStreaming(StreamSpecs *specs)
 
 		if (cleanExit)
 		{
-			log_info("Streamed up to write_lsn %X/%X, flush_lsn %X/%X, stopping",
+			log_info("Streamed up to write_lsn %X/%X, flush_lsn %X/%X, stopping: "
+					 "endpos is %X/%X",
 					 LSN_FORMAT_ARGS(context.tracking->written_lsn),
-					 LSN_FORMAT_ARGS(context.tracking->flushed_lsn));
+					 LSN_FORMAT_ARGS(context.tracking->flushed_lsn),
+					 LSN_FORMAT_ARGS(context.endpos));
 		}
-		else if (!(asked_to_stop || asked_to_stop_fast || asked_to_quit))
+		else if (retries > 0 &&
+				 context.tracking->written_lsn == waterMarkLSN)
+		{
+			log_warn("Streaming got interrupted at %X/%X, and did not make "
+					 "any progress from previous attempt, stopping now",
+					 LSN_FORMAT_ARGS(context.tracking->written_lsn));
+
+			return false;
+		}
+		else if (retry)
 		{
 			log_warn("Streaming got interrupted at %X/%X, reconnecting in 1s",
 					 LSN_FORMAT_ARGS(context.tracking->written_lsn));
@@ -473,7 +535,10 @@ startLogicalStreaming(StreamSpecs *specs)
 		/* sleep for one entire second before retrying */
 		if (retry)
 		{
-			(void) pg_usleep(1 * 1000 * 1000);
+			++retries;
+			waterMarkLSN = context.tracking->written_lsn;
+
+			(void) pg_usleep(1 * 1000 * 1000); /* 1s */
 		}
 	}
 
@@ -579,45 +644,14 @@ streamCheckResumePosition(StreamSpecs *specs)
 		LogicalMessageMetadata *messages = latestStreamedContent.messages;
 		LogicalMessageMetadata *latest = &(messages[lastLineNb]);
 
-		/*
-		 * We could have several messages following each-other with the same
-		 * LSN, typically a sequence like:
-		 *
-		 *  {"action":"I","xid":"492","lsn":"0/244BEE0", ...}
-		 *  {"action":"K","lsn":"0/244BEE0", ...}
-		 *  {"action":"E","lsn":"0/244BEE0"}
-		 *
-		 * In that case we want to remember the latest message action as being
-		 * INSERT rather than ENDPOS.
-		 */
-		int lineNb = lastLineNb;
-
-		for (; lineNb > 0; lineNb--)
-		{
-			LogicalMessageMetadata *previous = &(messages[lineNb]);
-
-			if (previous->lsn == latest->lsn)
-			{
-				latest = previous;
-			}
-			else
-			{
-				break;
-			}
-		}
-
 		specs->startpos = latest->lsn;
-		specs->startposComputedFromJSON = true;
-		specs->startposActionFromJSON = latest->action;
 
 		log_info("Resuming streaming at LSN %X/%X "
-				 "from first message with that LSN read in JSON file \"%s\", "
-				 "line %d",
+				 "from JSON file \"%s\" ",
 				 LSN_FORMAT_ARGS(specs->startpos),
-				 latestStreamedContent.filename,
-				 lineNb);
+				 latestStreamedContent.filename);
 
-		char *latestMessage = latestStreamedContent.lines[lineNb];
+		char *latestMessage = latestStreamedContent.lines[lastLineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
 	}
 
@@ -817,6 +851,29 @@ stream_write_json(LogicalStreamContext *context, bool previous)
 
 	destroyPQExpBuffer(buffer);
 	free(metadata->jsonBuffer);
+
+	/*
+	 * Maintain the transaction progress based on the BEGIN and COMMIT messages
+	 * received from replication slot. We don't care about the other messages.
+	 */
+	if (metadata->action == STREAM_ACTION_BEGIN)
+	{
+		privateContext->transactionInProgress = true;
+	}
+	else if (metadata->action == STREAM_ACTION_COMMIT)
+	{
+		privateContext->transactionInProgress = false;
+	}
+	/*
+	 * We are not expecting STREAM_ACTION_ROLLBACK here. It's a custom
+	 * message we write directly to the "latest" file using
+	 * stream_write_internal_message to abort the last incomplete transaction.
+	 */
+	else if (metadata->action == STREAM_ACTION_ROLLBACK)
+	{
+		log_error("BUG: STREAM_ACTION_ROLLBACK is not expected here");
+		return false;
+	}
 
 	return true;
 }
@@ -1155,6 +1212,33 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 			return false;
 		}
 	}
+
+	/*
+	 * On graceful exit, ROLLBACK the last incomplete transaction.
+	 * As we resume from a consistent point, there's no concern about
+	 * the transaction being rolled back here.
+	 *
+	 * TODO: For process crashes (e.g., segmentation faults), this
+	 * method won't work, potentially leaving incomplete transactions.
+	 * To handle this, we should read the last message from the "latest"
+	 * file and rollback any incomplete transaction found.
+	 */
+	if (time_to_abort &&
+		privateContext->jsonFile != NULL &&
+		privateContext->transactionInProgress)
+	{
+		InternalMessage rollback = {
+			.action = STREAM_ACTION_ROLLBACK,
+			.lsn = context->cur_record_lsn
+		};
+
+		if (!stream_write_internal_message(context, &rollback))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
 
 	/*
 	 * If we have a JSON file currently opened, then close it.
@@ -1525,40 +1609,6 @@ prepareMessageMetadataFromContext(LogicalStreamContext *context)
 	/* in case of filtering, early exit */
 	if (metadata->filterOut)
 	{
-		return true;
-	}
-
-	/*
-	 * When streaming resumed for a partially applied txn, have we reached a
-	 * message that wasn't flushed in the previous command?
-	 */
-	if (!privateContext->reachedStartPos)
-	{
-		/*
-		 * Also the same LSN might be assigned to a BEGIN message, a COMMIT
-		 * message, and a KEEPALIVE message. Avoid skipping what looks like the
-		 * same message as the latest flushed in our JSON file when it's
-		 * actually a new message.
-		 */
-		privateContext->reachedStartPos =
-			privateContext->startpos < metadata->lsn ||
-			(privateContext->startpos == metadata->lsn &&
-			 metadata->action != privateContext->startposActionFromJSON);
-	}
-
-	if (!privateContext->reachedStartPos)
-	{
-		metadata->filterOut = true;
-
-		log_debug("Skipping write for action %c for XID %u at LSN %X/%X: "
-				  "startpos %X/%X not been reached",
-				  metadata->action,
-				  metadata->xid,
-				  LSN_FORMAT_ARGS(metadata->lsn),
-				  LSN_FORMAT_ARGS(privateContext->startpos));
-
-		*previous = *metadata;
-
 		return true;
 	}
 
@@ -2125,6 +2175,11 @@ StreamActionFromChar(char action)
 			return STREAM_ACTION_ENDPOS;
 		}
 
+		case 'R':
+		{
+			return STREAM_ACTION_ROLLBACK;
+		}
+
 		default:
 		{
 			log_error("Failed to parse JSON message action: \"%c\"", action);
@@ -2198,6 +2253,11 @@ StreamActionToString(StreamAction action)
 		case STREAM_ACTION_ENDPOS:
 		{
 			return "ENDPOS";
+		}
+
+		case STREAM_ACTION_ROLLBACK:
+		{
+			return "ROLLBACK";
 		}
 
 		default:
@@ -2575,6 +2635,9 @@ stream_cleanup_context(StreamSpecs *specs)
 	success = success && unlink_file(specs->paths.walsegsizefile);
 	success = success && unlink_file(specs->paths.tlifile);
 	success = success && unlink_file(specs->paths.tlihistfile);
+
+	/* reset the timeline, so that we always read from the disk */
+	specs->system.timeline = 0;
 
 	return success;
 }
