@@ -95,22 +95,24 @@ vacuum_worker(CopyDataSpec *specs)
 
 	while (!stop)
 	{
-		QMessage mesg = { 0 };
-		bool recv_ok = queue_receive(&(specs->vacuumQueue), &mesg);
+		QMessage *mesg = (QMessage *) calloc(1, sizeof(QMessage));
+		bool recv_ok = queue_receive(&(specs->vacuumQueue), mesg);
 
 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
 			log_error("VACUUM worker has been interrupted");
+			free(mesg);
 			return false;
 		}
 
 		if (!recv_ok)
 		{
 			/* errors have already been logged */
+			free(mesg);
 			return false;
 		}
 
-		switch (mesg.type)
+		switch (mesg->type)
 		{
 			case QMSG_TYPE_STOP:
 			{
@@ -121,17 +123,19 @@ vacuum_worker(CopyDataSpec *specs)
 
 			case QMSG_TYPE_TABLEOID:
 			{
-				if (!vacuum_analyze_table_by_oid(specs, mesg.data.oid))
+				if (!vacuum_analyze_table_by_oid(specs, mesg->data.oid))
 				{
+					++errors;
+
+					log_error("Failed to vacuum table with oid %u, "
+							  "see above for details",
+							  mesg->data.oid);
+
 					if (specs->failFast)
 					{
-						log_error("Failed to vacuum table with oid %u, "
-								  "see above for details",
-								  mesg.data.oid);
+						free(mesg);
 						return false;
 					}
-
-					++errors;
 				}
 				break;
 			}
@@ -139,11 +143,13 @@ vacuum_worker(CopyDataSpec *specs)
 			default:
 			{
 				log_error("Received unknown message type %ld on vacuum queue %d",
-						  mesg.type,
+						  mesg->type,
 						  specs->vacuumQueue.qId);
 				break;
 			}
 		}
+
+		free(mesg);
 	}
 
 	bool success = (stop == true && errors == 0);
@@ -227,7 +233,7 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 
 	if (!pgsql_execute(&dst, vacuum))
 	{
-		/* errors have already been logged */
+		log_error("Failed to run command, see above for details: %s", vacuum);
 		return false;
 	}
 

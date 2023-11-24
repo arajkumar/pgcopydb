@@ -1,27 +1,46 @@
+ARG PGVERSION=16
+
 FROM debian:bullseye-slim
+
+ARG PGVERSION
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
+	gnupg \
     openssl \
 	sudo \
     tmux \
     watch \
     lsof \
-    psutils \
+	psmisc \
+    htop \
+	strace \
+	gdb \
     libpq5 \
     postgresql-client-common \
-    postgresql-client-13 \
     curl \
 	git \
     jq \
 	&& rm -rf /var/lib/apt/lists/*
 
+RUN curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+RUN echo "deb http://apt.postgresql.org/pub/repos/apt bullseye-pgdg main ${PGVERSION}" > /etc/apt/sources.list.d/pgdg.list
+
+# bypass initdb of a "main" cluster
+RUN echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
+RUN apt-get update \
+	&& DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+     postgresql-${PGVERSION} \
+	&& rm -rf /var/lib/apt/lists/*
+
 WORKDIR /usr/src/
 RUN git clone --depth 1 https://github.com/devrimgunduz/pagila.git
 
-RUN adduser --disabled-password --gecos '' --home /var/lib/postgres docker
-RUN adduser docker sudo
+#RUN adduser --disabled-password --gecos '' --home /var/lib/postgres docker
+#RUN adduser docker sudo
+RUN useradd -rm -d /var/lib/postgres -s /bin/bash -g postgres -G sudo docker
+RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 COPY --from=pgcopydb /usr/local/bin/pgcopydb /usr/local/bin
 COPY .psqlrc /var/lib/postgres

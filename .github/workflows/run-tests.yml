@@ -17,6 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        PGVERSION:
+          - 16
         TEST:
           - ci
           - pagila
@@ -33,6 +35,7 @@ jobs:
           - follow-wal2json
           - follow-9.6
           - follow-data-only
+          - endpos-in-multi-wal-txn
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3

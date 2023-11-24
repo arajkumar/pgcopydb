@@ -273,22 +273,10 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	 */
 	if (!copydb_start_table_data_workers(specs))
 	{
-		log_error("Failed to start table data COPY workers, "
+		log_fatal("Failed to start table data COPY workers, "
 				  "see above for details");
 
-		/* send TERM signal to all the process in our process group */
-		if (!kill(0, SIGTERM))
-		{
-			log_error("Failed to send TERM signal our process group");
-			return false;
-		}
-
-		/* and wait for all the sub-processes to terminate */
-		if (!copydb_wait_for_subprocesses(specs->failFast))
-		{
-			log_error("Some sub-processes have exited with error status, "
-					  "see above for details");
-		}
+		(void) copydb_fatal_exit();
 
 		return false;
 	}
@@ -307,6 +295,8 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 		if (!copydb_add_copy(specs, table->oid, tableSpecs->part.partNumber))
 		{
 			/* errors have already been logged */
+			(void) copydb_fatal_exit();
+
 			return false;
 		}
 	}
@@ -314,15 +304,14 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	/*
 	 * Add the STOP messages to the queue now, one STOP message per worker.
 	 */
-	for (int i = 0; i < specs->tableJobs; i++)
+	if (!copydb_copy_supervisor_send_stop(specs))
 	{
-		QMessage stop = { .type = QMSG_TYPE_STOP };
+		log_fatal("Failed to send STOP messages to the COPY queue");
 
-		if (!queue_send(&(specs->copyQueue), &stop))
-		{
-			/* errors have already been logged */
-			return false;
-		}
+		/* we still need to make sure the COPY processes terminate */
+		(void) copydb_fatal_exit();
+
+		return false;
 	}
 
 	/*
@@ -332,6 +321,14 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	{
 		log_error("Some COPY worker process(es) have exited with error, "
 				  "see above for details");
+
+		/* make sure vacuum and create index processes see a STOP message */
+		if (!vacuum_send_stop(specs) ||
+			!copydb_index_workers_send_stop(specs))
+		{
+			(void) copydb_fatal_exit();
+		}
+
 		return false;
 	}
 
@@ -352,7 +349,42 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 	success = success && vacuum_send_stop(specs);
 	success = success && copydb_index_workers_send_stop(specs);
 
-	return success;
+	if (!success)
+	{
+		/*
+		 * The other subprocesses need to see a STOP message to stop their
+		 * processing. Failing to send the STOP messages means that the main
+		 * pgcopydb never finishes, and we want to ensure the command
+		 * terminates.
+		 */
+		(void) copydb_fatal_exit();
+
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_copy_supervisor_send_stop sends the STOP messages to the copy queue,
+ * one STOP message per worker.
+ */
+bool
+copydb_copy_supervisor_send_stop(CopyDataSpec *specs)
+{
+	for (int i = 0; i < specs->tableJobs; i++)
+	{
+		QMessage stop = { .type = QMSG_TYPE_STOP };
+
+		if (!queue_send(&(specs->copyQueue), &stop))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
@@ -440,6 +472,7 @@ copydb_start_table_data_workers(CopyDataSpec *specs)
 bool
 copydb_table_data_worker(CopyDataSpec *specs)
 {
+	uint64_t errors = 0;
 	pid_t pid = getpid();
 
 	log_notice("Started table data COPY worker %d [%d]", pid, getppid());
@@ -453,8 +486,8 @@ copydb_table_data_worker(CopyDataSpec *specs)
 
 	while (true)
 	{
-		QMessage mesg = { 0 };
-		bool recv_ok = queue_receive(&(specs->copyQueue), &mesg);
+		QMessage *mesg = (QMessage *) calloc(1, sizeof(QMessage));
+		bool recv_ok = queue_receive(&(specs->copyQueue), mesg);
 
 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
@@ -468,26 +501,44 @@ copydb_table_data_worker(CopyDataSpec *specs)
 			break;
 		}
 
-		switch (mesg.type)
+		switch (mesg->type)
 		{
 			case QMSG_TYPE_STOP:
 			{
 				log_debug("Stop message received by COPY worker");
 				(void) copydb_close_snapshot(specs);
+				free(mesg);
 				return true;
 			}
 
 			case QMSG_TYPE_TABLEPOID:
 			{
 				if (!copydb_copy_data_by_oid(specs,
-											 mesg.data.tp.oid,
-											 mesg.data.tp.part))
+											 mesg->data.tp.oid,
+											 mesg->data.tp.part))
 				{
 					log_error("Failed to copy data for table with oid %u "
 							  "and part number %u, see above for details",
-							  mesg.data.tp.oid,
-							  mesg.data.tp.part);
-					return false;
+							  mesg->data.tp.oid,
+							  mesg->data.tp.part);
+
+					++errors;
+
+					if (specs->failFast)
+					{
+						free(mesg);
+						return false;
+					}
+
+					/* clean-up our target connection state for next table */
+					(void) copydb_close_snapshot(specs);
+
+					if (!copydb_set_snapshot(specs))
+					{
+						/* errors have already been logged */
+						free(mesg);
+						return false;
+					}
 				}
 				break;
 			}
@@ -495,17 +546,19 @@ copydb_table_data_worker(CopyDataSpec *specs)
 			default:
 			{
 				log_error("Received unknown message type %ld on table queue %d",
-						  mesg.type,
+						  mesg->type,
 						  specs->copyQueue.qId);
 				break;
 			}
 		}
+
+		free(mesg);
 	}
 
 	/* terminate our connection to the source database now */
 	(void) copydb_close_snapshot(specs);
 
-	return false;
+	return errors == 0;
 }
 
 
@@ -965,6 +1018,14 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 		return false;
 	}
 
+	/* set GUC values for the target connection */
+	if (!pgsql_set_gucs(&dst, dstSettings))
+	{
+		log_fatal("Failed to set our GUC settings on the target connection, "
+				  "see above for details");
+		return false;
+	}
+
 	/* when using `pgcopydb copy table-data`, we don't truncate */
 	bool truncate = tableSpecs->section != DATA_SECTION_TABLE_DATA;
 
@@ -1056,7 +1117,8 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 		++attempts;
 
 		/* ignore previous attempts, we need only one success here */
-		success = pg_copy(src, &dst, copySrc->data, copyDst->data, truncate);
+		success = pg_copy(src, &dst, copySrc->data, copyDst->data, truncate,
+						  &(summary->bytesTransmitted));
 
 		if (success)
 		{
@@ -1123,6 +1185,7 @@ copydb_prepare_copy_query(CopyTableDataSpec *tableSpecs,
 						  bool source)
 {
 	SourceTable *table = tableSpecs->sourceTable;
+	bool isFirst = true;
 
 	if (source)
 	{
@@ -1134,17 +1197,29 @@ copydb_prepare_copy_query(CopyTableDataSpec *tableSpecs,
 
 		for (int i = 0; i < table->attributes.count; i++)
 		{
-			char *attname = table->attributes.array[i].attname;
+			SourceTableAttribute *attribute = &(table->attributes.array[i]);
+			char *attname = attribute->attname;
 
-			if (i > 0)
+			/* Generated columns cannot be used in COPY */
+			if (attribute->attisgenerated)
+			{
+				log_notice("Skipping %s in COPY as it is a generated column", attname);
+				continue;
+			}
+
+			if (!isFirst)
 			{
 				appendPQExpBufferStr(query, ", ");
+			}
+			else
+			{
+				isFirst = false;
 			}
 
 			appendPQExpBuffer(query, "%s", attname);
 		}
 
-		appendPQExpBuffer(query, " FROM %s ", tableSpecs->sourceTable->qname);
+		appendPQExpBuffer(query, " FROM only %s ", tableSpecs->sourceTable->qname);
 
 		/*
 		 * On a source COPY query we might want to add filtering.
@@ -1195,11 +1270,20 @@ copydb_prepare_copy_query(CopyTableDataSpec *tableSpecs,
 
 		for (int i = 0; i < table->attributes.count; i++)
 		{
-			char *attname = table->attributes.array[i].attname;
+			SourceTableAttribute *attribute = &(table->attributes.array[i]);
+			char *attname = attribute->attname;
 
-			if (i == 0)
+			/* Generated columns cannot be used in COPY */
+			if (attribute->attisgenerated)
+			{
+				log_notice("Skipping %s in COPY as it is a generated column", attname);
+				continue;
+			}
+
+			if (isFirst)
 			{
 				appendPQExpBufferStr(query, "(");
+				isFirst = false;
 			}
 			else
 			{

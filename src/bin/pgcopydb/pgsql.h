@@ -242,7 +242,6 @@ void pgsql_set_retry_policy(ConnectionRetryPolicy *retryPolicy,
 							int maxR,
 							int maxSleepTime,
 							int baseSleepTime);
-void pgsql_set_main_loop_retry_policy(ConnectionRetryPolicy *retryPolicy);
 void pgsql_set_interactive_retry_policy(ConnectionRetryPolicy *retryPolicy);
 int pgsql_compute_connection_retry_sleep_time(ConnectionRetryPolicy *retryPolicy);
 bool pgsql_retry_policy_expired(ConnectionRetryPolicy *retryPolicy);
@@ -312,7 +311,8 @@ bool validate_connection_string(const char *connectionString);
 bool pgsql_truncate(PGSQL *pgsql, const char *qname);
 
 bool pg_copy(PGSQL *src, PGSQL *dst,
-			 const char *srcQname, const char *dstQname, bool truncate);
+			 const char *srcQname, const char *dstQname,
+			 bool truncate, uint64_t *bytesTransmitted);
 
 bool pg_copy_from_stdin(PGSQL *pgsql, const char *qname);
 bool pg_copy_row_from_stdin(PGSQL *pgsql, char *fmt, ...);

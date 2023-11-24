@@ -29,8 +29,9 @@ After following the instructions for installing the repository, in this
 example in a Docker image for Rocky Linux (``docker run --rm -it
 rockylinux:9``), then we get the following::
 
-   # dnf search pgcopydb
-   ...
+   # dnf search --all --quiet pgcopydb
+   ======================== Name & Description & URL Matched: pgcopydb ========================
+   pgcopydb.x86_64 : Automate pg_dump | pg_restore between two running Postgres servers
    pgcopydb_11.x86_64 : Automate pg_dump | pg_restore between two running Postgres servers
    pgcopydb_12.x86_64 : Automate pg_dump | pg_restore between two running Postgres servers
    pgcopydb_13.x86_64 : Automate pg_dump | pg_restore between two running Postgres servers
@@ -52,7 +53,7 @@ stable.
 
 To use this docker image::
 
-  $ docker run --rm -it dimitri/pgcopydb:v0.13 pgcopydb --version
+  $ docker run --rm -it dimitri/pgcopydb:v0.14 pgcopydb --version
 
 __ https://hub.docker.com/r/dimitri/pgcopydb#!
 
