@@ -16,6 +16,7 @@ import json
 from housekeeping import start_housekeeping
 from pathlib import Path
 from urllib.parse import urlparse
+from time import perf_counter
 
 # If the process is not running on a TTY then reading from stdin will raise and
 # exception. We read from stdin to start the switch-over phase. If it's not a
@@ -24,11 +25,20 @@ from urllib.parse import urlparse
 IS_TTY = os.isatty(0)
 DELAY_THRESHOLD = 30  # Megabytes.
 SCRIPT_VERSION = "0.0.1"
+IS_POSTGRES_SOURCE = False
 
 env = os.environ.copy()
 
 LIVE_MIGRATION_DOCKER = env.get('LIVE_MIGRATION_DOCKER') == 'true'
 
+class timeit:
+    def __enter__(self):
+        self.start = perf_counter()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.time = perf_counter() - self.start
+        print(f"Completed in {self.time:.1f}s")
 
 class RedactedException(Exception):
     def __init__(self, err, redacted):
@@ -301,6 +311,11 @@ def pgcopydb_init_env(work_dir: Path):
     (work_dir / "logs").mkdir(exist_ok=False)
     os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
 
+@telemetry_command("check_source_is_timescale")
+def check_source_is_timescale():
+    result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
+    return result == "t\n"
+
 @telemetry_command("check_timescaledb_version")
 def check_timescaledb_version():
     result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
@@ -315,7 +330,8 @@ def check_timescaledb_version():
 @telemetry_command("cleanup_replication_progress")
 def cleanup_replication_progress():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
-    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
+    if not IS_POSTGRES_SOURCE:
+        run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
     if run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb' or slot_name = 'switchover');")) == "t":
         raise ValueError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
 
@@ -350,22 +366,116 @@ def dbname_from_uri(uri: str) -> str:
         return result.path[1:]
 
 
-@telemetry_command("migrate_existing_data")
-def migrate_existing_data():
-    print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
-    start = time.time()
+@telemetry_command("migrate_existing_data_from_pg")
+def migrate_existing_data_from_pg():
+    print(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+    with timeit():
+        pgdump_command = " ".join(["pg_dump",
+                                   "-d",
+                                   "$PGCOPYDB_SOURCE_PGURI",
+                                   "--format=plain",
+                                   "--quote-all-identifiers",
+                                   "--no-tablespaces",
+                                   "--no-owner",
+                                   "--no-privileges",
+                                   "--schema-only",
+                                   "--section=pre-data",
+                                   "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
+                                   "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
+                                   ])
+        run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_dump")
 
-    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
-    source_dbname = dbname_from_uri(source_pg_uri)
-    if source_dbname == "":
-        raise ValueError("unable to extract dbname from uri")
-    roles_file_path = f"{env['PGCOPYDB_DIR']}/roles.sql"
-    dump_roles = f"""pg_dumpall -d $PGCOPYDB_SOURCE_PGURI --quote-all-identifiers --roles-only --no-role-passwords -l {source_dbname} --file={roles_file_path}"""
-    run_cmd(dump_roles)
+    print("Restoring pre-data ...")
+    with timeit():
+        psql_command = " ".join(["psql",
+                                 "-X",
+                                 "-d",
+                                 "$PGCOPYDB_TARGET_PGURI",
+                                 "--echo-errors",
+                                 "-f",
+                                 "$PGCOPYDB_DIR/pre-data-dump.sql",
+                                 ])
+        run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore", ignore_non_zero_code=True)
 
-    # When using MST, Aiven roles modify parameters like "pg_qualstats.enabled" that are not permitted on cloud.
-    # Hence, we remove Aiven roles assuming they are not being used for tasks other than ones specific to Aiven/MST.
-    filter_stmts = f"""
+    create_hypertable_message = """Now, let's transform your regular tables into hypertables.
+Execute the following command for each table you want to convert on the target DB:
+    `SELECT create_hypertable('<table name>', '<time column name>', chunk_time_interval => INTERVAL '<chunk interval>');`
+Once you are done"""
+    key_event_queue = queue.Queue(maxsize=1)
+    wait_for_sigusr1(key_event_queue)
+    if IS_TTY:
+        wait_for_keypress(key_event_queue, key="c")
+    if not IS_TTY and LIVE_MIGRATION_DOCKER:
+        print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>' to continue")
+    elif not IS_TTY:
+        print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}' to continue")
+    else:
+        print(f"{create_hypertable_message}, press 'c' (and ENTER) to continue")
+    key_event_queue.get()
+
+    copy_table_data = " ".join(["pgcopydb",
+                             "copy",
+                             "table-data",
+                             "--source",
+                             "$PGCOPYDB_SOURCE_PGURI",
+                             "--target",
+                             "$PGCOPYDB_TARGET_PGURI",
+                             "--snapshot",
+                             "$(cat ${PGCOPYDB_DIR}/snapshot)",
+                             "--table-jobs",
+                             "8",
+                             "--restart",
+                             "--not-consistent",
+                             ])
+    print("pgcopydb copy table-data ...")
+    with timeit():
+        run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
+
+    print(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+    with timeit():
+        pgdump_command = " ".join(["pg_dump",
+                                   "-d",
+                                   "$PGCOPYDB_SOURCE_PGURI",
+                                   "--format=plain",
+                                   "--quote-all-identifiers",
+                                   "--no-tablespaces",
+                                   "--no-owner",
+                                   "--no-privileges",
+                                   "--schema-only",
+                                   "--section=post-data",
+                                   "--file=$PGCOPYDB_DIR/post-data-dump.sql",
+                                   "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
+                                   ])
+        run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_dump")
+
+    print("Restoring post-data ...")
+    with timeit() as t:
+        psql_command = " ".join(["psql",
+                                 "-X",
+                                 "-d",
+                                 "$PGCOPYDB_TARGET_PGURI",
+                                 "--echo-errors",
+                                 "-f",
+                                 "$PGCOPYDB_DIR/post-data-dump.sql",
+                                 ])
+        run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_restore", ignore_non_zero_code=True)
+
+@telemetry_command("migrate_roles")
+def migrate_roles():
+    print(f"Dumping roles to {env['PGCOPYDB_DIR']}/roles.sql ...")
+    with timeit():
+        source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
+        source_dbname = dbname_from_uri(source_pg_uri)
+        if source_dbname == "":
+            raise ValueError("unable to extract dbname from uri")
+        roles_file_path = f"{env['PGCOPYDB_DIR']}/roles.sql"
+
+        dump_roles = f"""pg_dumpall -d $PGCOPYDB_SOURCE_PGURI --quote-all-identifiers --roles-only --no-role-passwords -l {source_dbname} --file={roles_file_path}"""
+        run_cmd(dump_roles)
+
+        # When using MST, Aiven roles modify parameters like "pg_qualstats.enabled" that are not permitted on cloud.
+        # Hence, we remove Aiven roles assuming they are not being used for tasks other than ones specific to Aiven/MST.
+        filter_stmts = f"""
 sed -i -E \
 -e '/CREATE ROLE "postgres";/d' \
 -e '/ALTER ROLE "postgres"/d' \
@@ -379,7 +489,16 @@ sed -i -E \
 -e '/CREATE ROLE "_aiven";/d' \
 -e '/ALTER ROLE "_aiven"/d' \
 {roles_file_path}"""
-    run_cmd(filter_stmts)
+        run_cmd(filter_stmts)
+
+        restore_roles = f"""psql -X -d $PGCOPYDB_TARGET_PGURI -v ON_ERROR_STOP=1 --echo-errors -f {roles_file_path}"""
+        run_cmd(restore_roles)
+
+
+@telemetry_command("migrate_existing_data")
+def migrate_existing_data():
+    print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
+    start = time.time()
 
     run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
 
@@ -391,14 +510,10 @@ sed -i -E \
     print(f"Restoring from {env['PGCOPYDB_DIR']}/dump ...")
     start = time.time()
 
-    restore_roles = f"""psql -X -d $PGCOPYDB_TARGET_PGURI -v ON_ERROR_STOP=1 --echo-errors -f {roles_file_path}"""
-    run_cmd(restore_roles)
-
     pgrestore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --no-owner --no-privileges --no-tablespaces -v --format d $PGCOPYDB_DIR/dump"
     run_cmd(pgrestore_command, f"{env['PGCOPYDB_DIR']}/logs/pg_restore_existing_data", ignore_non_zero_code=True)
     time_taken = (time.time() - start) / 60
     print(f"Completed in {time_taken:.1f}m")
-
     run_sql(execute_on_target=True,
             sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
 
@@ -434,7 +549,6 @@ def wait_for_DBs_to_sync():
             analyzed = True
             continue
         if not key_event_queue.empty():
-            print("Live-replay stopped")
             break
         time.sleep(10)
 
@@ -490,7 +604,7 @@ def wait_for_LSN_to_sync():
 
 @telemetry_command("copy_sequences")
 def copy_sequences():
-    run_cmd("pgcopydb copy sequences", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
+    run_cmd("pgcopydb copy sequences --resume --not-consistent", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
 
 
 @telemetry_command("migrate_caggs_metadata")
@@ -520,11 +634,11 @@ def enable_caggs_policies():
 @telemetry_command("cleanup")
 def cleanup():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
-    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR")
+    if not IS_POSTGRES_SOURCE:
+        run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR")
 
 
 if __name__ == "__main__":
-
     work_dir = os.getenv("PGCOPYDB_DIR")
     if work_dir is not None:
         work_dir = Path(work_dir)
@@ -539,16 +653,29 @@ if __name__ == "__main__":
 
     pgcopydb_init_env(work_dir)
 
-    print("Verifying TimescaleDB version in Source DB and Target DB ...")
-    check_timescaledb_version()
+    force_postgres_source = os.getenv("POSTGRES_SOURCE") == "true"
+    if not force_postgres_source and check_source_is_timescale():
+        print("Migrating from Timescale to Timescale ...")
+        print("Verifying TimescaleDB version in Source DB and Target DB ...")
+        check_timescaledb_version()
+    else:
+        print("Migrating from Postgres to Timescale ...")
+        IS_POSTGRES_SOURCE = True
 
     print("Cleaning up any replication progress ...")
     cleanup_replication_progress()
 
     snapshot_proc, follow_proc = create_snapshot_and_follow()
 
+    print("Migrating roles from Source DB to Target DB ...")
+    migrate_roles()
+
     print("Migrating existing data from Source DB to Target DB ...")
-    migrate_existing_data()
+    if IS_POSTGRES_SOURCE:
+        migrate_existing_data_from_pg()
+    else:
+        migrate_existing_data()
+
     snapshot_proc.terminate()
     (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
@@ -557,9 +684,13 @@ if __name__ == "__main__":
 
     wait_for_DBs_to_sync()
 
-    print("Waiting for live-replay to stop ...")
-    follow_proc.terminate_process_including_children()
-    print("Stopped")
+    if IS_POSTGRES_SOURCE:
+        print("Stopping live-replay ...")
+        run_cmd("pgcopydb stream sentinel set endpos --current")
+    else:
+        print("Waiting for live-replay to stop ...")
+        follow_proc.terminate_process_including_children()
+        print("Stopped")
 
     if not IS_TTY and LIVE_MIGRATION_DOCKER:
         print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'docker kill -s=USR1 <container_name>'")
@@ -572,27 +703,29 @@ if __name__ == "__main__":
     if IS_TTY:
         wait_for_keypress(notify_queue, key="c")
 
-    while True:
-        if not notify_queue.empty():
-            print("Continuing ...")
-            break
-        time.sleep(1)
+    notify_queue.get()
+    print("Continuing ...")
+
     # At this moment, user has finished verifying data integrity. He is ready to resume the migration process
     # and move into the switch-over phase. Note, the traffic remains halted ATM.
 
-    print("Syncing last LSN in Source DB to Target DB ...")
-    switchover_snapshot_proc = wait_for_LSN_to_sync()
+    if not IS_POSTGRES_SOURCE:
+        print("Syncing last LSN in Source DB to Target DB ...")
+        switchover_snapshot_proc = wait_for_LSN_to_sync()
 
     print("Copying sequences ...")
     copy_sequences()
 
-    print("Migrating caggs metadata ...")
-    migrate_caggs_metadata()
+    if not IS_POSTGRES_SOURCE:
+        print("Migrating caggs metadata ...")
+        migrate_caggs_metadata()
 
-    switchover_snapshot_proc.terminate()
+        switchover_snapshot_proc.terminate()
 
-    print("Enabling continuous aggregates refresh policies ...")
-    enable_caggs_policies()
+        print("Enabling continuous aggregates refresh policies ...")
+        enable_caggs_policies()
+
+        follow_proc.terminate_process_including_children()
 
     print("Cleaning up replication data ...")
     cleanup()

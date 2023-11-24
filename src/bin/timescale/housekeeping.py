@@ -132,10 +132,6 @@ def sort_files_by_name(abs_files):
     return result
 
 
-def sleep():
-    time.sleep(HOUSEKEEPING_INTERVAL)
-
-
 def housekeeping(stop_event=None):
     work_dir = env["PGCOPYDB_DIR"]
     if work_dir is not None:
@@ -153,7 +149,7 @@ def housekeeping(stop_event=None):
 
         files = get_files_in_dir(cdc_dir)
         if len(files) == 0:
-            sleep()
+            stop_event.wait(timeout=HOUSEKEEPING_INTERVAL)
             continue
         files_no_ext = [filename_no_ext(f) for f in files]
         sorted_files = sort_files_by_name(files_no_ext)
@@ -184,7 +180,7 @@ def housekeeping(stop_event=None):
                 count += 1
         if count > 0:
             print(f"Cleaned up {count} transaction files")
-        sleep()
+        stop_event.wait(timeout=HOUSEKEEPING_INTERVAL)
 
 
 def start_housekeeping(new_env):
