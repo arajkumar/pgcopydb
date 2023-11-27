@@ -17,6 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        PGVERSION:
+          - 16
         TEST:
           - ci
           - pagila
@@ -24,10 +26,16 @@ jobs:
           - unit
           - blobs
           - filtering
-          - cdc
-          - follow
-          - follow-9.6
           - extensions
+          - timescaledb
+          - cdc-low-level
+          - cdc-test-decoding
+          - cdc-endpos-between-transaction
+          - cdc-wal2json
+          - follow-wal2json
+          - follow-9.6
+          - follow-data-only
+          - endpos-in-multi-wal-txn
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3

@@ -9,6 +9,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "postgres_fe.h"
+#include "libpq-fe.h"
+#include "pqexpbuffer.h"
+
 #include "copydb.h"
 #include "env_utils.h"
 #include "lock_utils.h"
@@ -18,7 +22,6 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
-#include "runprogram.h"
 
 
 /*
@@ -63,10 +66,7 @@ copydb_copy_all_table_data(CopyDataSpec *specs)
 		const char *signalStr = signal_to_string(signal);
 
 		log_warn("Received signal %s, terminating", signalStr);
-
-		/* ensure we return false, signaling something unexpected happened */
-		++errors;
-		goto terminate;
+		return false;
 	}
 
 	/* Now write that we successfully finished copying all indexes */
@@ -74,40 +74,6 @@ copydb_copy_all_table_data(CopyDataSpec *specs)
 	{
 		log_warn("Failed to write the tracking file \%s\"",
 				 specs->cfPaths.done.indexes);
-	}
-
-terminate:
-
-	/*
-	 * Now that all the sub-processes are done, we can also unlink the table
-	 * and index concurrency semaphore, and the vacuum and create index queues.
-	 */
-	if (!semaphore_finish(&(specs->tableSemaphore)))
-	{
-		log_warn("Failed to remove table concurrency semaphore %d, "
-				 "see above for details",
-				 specs->tableSemaphore.semId);
-	}
-
-	if (!semaphore_finish(&(specs->indexSemaphore)))
-	{
-		log_warn("Failed to remove index concurrency semaphore %d, "
-				 "see above for details",
-				 specs->indexSemaphore.semId);
-	}
-
-	if (!queue_unlink(&(specs->vacuumQueue)))
-	{
-		log_warn("Failed to remove VACUUM process queue %d, "
-				 "see above for details",
-				 specs->vacuumQueue.qId);
-	}
-
-	if (!queue_unlink(&(specs->indexQueue)))
-	{
-		log_warn("Failed to remove CREATE INDEX process queue %d, "
-				 "see above for details",
-				 specs->indexQueue.qId);
 	}
 
 	return errors == 0;
@@ -124,79 +90,99 @@ copydb_process_table_data(CopyDataSpec *specs)
 {
 	int errors = 0;
 
-	/*
-	 * Now create as many VACUUM ANALYZE sub-processes as needed, per
-	 * --table-jobs. Could be exposed separately as --vacuumJobs too, but
-	 * that's not been done at this time.
-	 */
 	log_trace("copydb_process_table_data: \"%s\"", specs->cfPaths.tbldir);
 
 	/*
-	 * Are blobs table data? well pg_dump --section sayth yes.
+	 * Take care of extensions configuration table in an auxilliary process.
 	 */
-	if (!copydb_start_blob_process(specs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!copydb_start_index_workers(specs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!vacuum_start_workers(specs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!copydb_start_seq_process(specs))
+	if (!copydb_start_extension_data_process(specs))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
 	/*
-	 * Now create as many sub-process as needed, per --table-jobs.
+	 * When we have fetch information for zero table then specs->tableJobs is
+	 * zero too and we won't send any STOP message in the index and vacuum
+	 * queues.
+	 *
+	 * That
 	 */
-	if (copydb_process_table_data_with_workers(specs))
+	if (specs->tableJobs > 0)
 	{
-		/* write that we successfully finished copying all tables */
-		if (!write_file("", 0, specs->cfPaths.done.tables))
+		/*
+		 * First start the COPY data workers with their supervisor and IPC
+		 * infrastructure (queues).
+		 */
+		if (!copydb_start_copy_supervisor(specs))
 		{
-			log_warn("Failed to write the tracking file \%s\"",
-					 specs->cfPaths.done.tables);
+			/* errors have already been logged */
+			++errors;
+		}
+
+		/*
+		 * Start as many index worker process as --index-jobs
+		 */
+		if (errors == 0 && !copydb_start_index_workers(specs))
+		{
+			/* errors have already been logged */
+			++errors;
+		}
+
+		/*
+		 * Now create as many VACUUM ANALYZE sub-processes as needed, per
+		 * --table-jobs. Could be exposed separately as --vacuumJobs too, but
+		 * that's not been done at this time.
+		 */
+		if (errors == 0 && !vacuum_start_workers(specs))
+		{
+			/* errors have already been logged */
+			++errors;
 		}
 	}
 	else
 	{
-		/* errors have been logged, make sure to send stop messages */
-		++errors;
+		log_info("STEP 4: skipping COPY, no table selected");
+		log_info("STEP 6: skipping CREATE INDEX, no table selected");
+		log_info("STEP 7: skipping contraints, no table selected");
+		log_info("STEP 8: skipping VACUUM, no table selected");
 	}
-
-	log_info("COPY phase is done, "
-			 "now waiting for vacuum, index, blob, and sequences processes");
 
 	/*
-	 * Now that the COPY processes are done, signal this is the end to the
-	 * vacuum and CREATE INDEX sub-processes by adding the STOP message to
-	 * their queues.
+	 * Are blobs table data? well pg_dump --section sayth yes.
 	 */
-	if (!vacuum_send_stop(specs))
+	if (errors == 0 && !copydb_start_blob_process(specs))
 	{
 		/* errors have already been logged */
 		++errors;
 	}
 
-	if (!copydb_index_workers_send_stop(specs))
+	/*
+	 * Start an auxilliary process to reset sequences on the target database.
+	 */
+	if (errors == 0 && !copydb_start_seq_process(specs))
 	{
 		/* errors have already been logged */
 		++errors;
 	}
 
-	if (!copydb_wait_for_subprocesses())
+	/* when errors happened, signal all processes to terminate now */
+	if (errors > 0)
+	{
+		log_error("Failed to start some worker processes, "
+				  "see above for details");
+
+		/* send TERM signal to all the process in our process group */
+		if (!kill(0, SIGTERM))
+		{
+			log_error("Failed to send TERM signal our process group");
+
+			/* refrain from early return here, we want to waitpid() */
+			++errors;
+		}
+	}
+
+	if (!copydb_wait_for_subprocesses(specs->failFast))
 	{
 		log_error("Some sub-processes have exited with error status, "
 				  "see above for details");
@@ -214,22 +200,16 @@ copydb_process_table_data(CopyDataSpec *specs)
 
 
 /*
- * copydb_start_table_data_workers create a supervisor COPY process, and then
- * as sub-process of that supervisor process creates as many sub-processes as
- * needed, per --table-jobs.
- *
- * The supervisor is needed to make this function sync: we can then just wait
- * until all the known sub-processes are done, without having to take into
- * consideration other processes not in the sub-tree.
+ * copydb_start_copy_supervisor starts a COPY supervisor process, which job is
+ * to create the copy data workers and then loop through the table partitions
+ * queue (when needed) to drive adding the table indexes to the index queue
+ * when all the partitions are done.
  */
 bool
-copydb_process_table_data_with_workers(CopyDataSpec *specs)
+copydb_start_copy_supervisor(CopyDataSpec *specs)
 {
-	log_notice("Now starting %d COPY processes", specs->tableJobs);
-
 	/*
-	 * Flush stdio channels just before fork, to avoid double-output
-	 * problems.
+	 * Flush stdio channels just before fork, to avoid double-output problems.
 	 */
 	fflush(stdout);
 	fflush(stderr);
@@ -240,78 +220,18 @@ copydb_process_table_data_with_workers(CopyDataSpec *specs)
 	{
 		case -1:
 		{
-			log_error("Failed to fork the COPY supervisor process: %m");
+			log_error("Failed to fork copy supervisor process: %m");
 			return false;
 		}
 
 		case 0:
 		{
 			/* child process runs the command */
-			log_notice("Started COPY supervisor %d [%d]", getpid(), getppid());
+			(void) set_ps_title("pgcopydb: copy supervisor");
 
-			for (int i = 0; i < specs->tableJobs; i++)
+			if (!copydb_copy_supervisor(specs))
 			{
-				/*
-				 * Flush stdio channels just before fork, to avoid
-				 * double-output problems.
-				 */
-				fflush(stdout);
-				fflush(stderr);
-
-				int fpid = fork();
-
-				switch (fpid)
-				{
-					case -1:
-					{
-						log_error("Failed to fork a COPY worker process: %m");
-						exit(EXIT_CODE_INTERNAL_ERROR);
-					}
-
-					case 0:
-					{
-						/* child process runs the command */
-						if (!copydb_process_table_data_worker(specs))
-						{
-							/* errors have already been logged */
-							exit(EXIT_CODE_INTERNAL_ERROR);
-						}
-
-						exit(EXIT_CODE_QUIT);
-					}
-
-					default:
-					{
-						/* fork succeeded, in parent */
-						break;
-					}
-				}
-			}
-
-			/* now COPY the extension configuration tables, while waiting */
-			int errors = 0;
-
-			if (!specs->skipExtensions)
-			{
-				bool createExtensions = false;
-
-				if (!copydb_copy_extensions(specs, createExtensions))
-				{
-					/* errors have already been logged */
-					++errors;
-				}
-			}
-
-			/* the COPY supervisor waits for the COPY workers */
-			if (!copydb_wait_for_subprocesses())
-			{
-				log_error("Some COPY worker process(es) have exited with error, "
-						  "see above for details");
-				++errors;
-			}
-
-			if (errors > 0)
-			{
+				log_error("Failed to copy table data, see above for details");
 				exit(EXIT_CODE_INTERNAL_ERROR);
 			}
 
@@ -325,21 +245,120 @@ copydb_process_table_data_with_workers(CopyDataSpec *specs)
 		}
 	}
 
-	/* wait until the supervisor process exits */
-	int status;
+	/* now we're done, and we want async behavior, do not wait */
+	return true;
+}
 
-	if (waitpid(fpid, &status, 0) != fpid)
+
+/*
+ * copydb_copy_supervisor creates the copyQueue and if needed the
+ * copyDoneQueue too, then starts --table-jobs COPY table data workers to
+ * process table oids from the queue.
+ */
+bool
+copydb_copy_supervisor(CopyDataSpec *specs)
+{
+	pid_t pid = getpid();
+
+	log_notice("Started COPY supervisor %d [%d]", pid, getppid());
+
+	if (!queue_create(&(specs->copyQueue), "copy table-data"))
 	{
-		log_error("Failed to wait for COPY supervisor process %d: %m", fpid);
+		log_error("Failed to create the COPY process queue");
 		return false;
 	}
 
-	int returnCode = WEXITSTATUS(status);
-
-	if (returnCode != 0)
+	/*
+	 * Start COPY table-data workers, as many as --table-jobs.
+	 */
+	if (!copydb_start_table_data_workers(specs))
 	{
-		log_error("COPY supervisor process exited with return code %d",
-				  returnCode);
+		log_fatal("Failed to start table data COPY workers, "
+				  "see above for details");
+
+		(void) copydb_fatal_exit();
+
+		return false;
+	}
+
+	/*
+	 * Now fill-in the COPY data queue with the table OIDs / part number.
+	 */
+	CopyTableDataSpecsArray *tableSpecsArray = &(specs->tableSpecsArray);
+
+	for (int tableIndex = 0; tableIndex < tableSpecsArray->count; tableIndex++)
+	{
+		/* initialize our TableDataProcess entry now */
+		CopyTableDataSpec *tableSpecs = &(tableSpecsArray->array[tableIndex]);
+		SourceTable *table = tableSpecs->sourceTable;
+
+		if (!copydb_add_copy(specs, table->oid, tableSpecs->part.partNumber))
+		{
+			/* errors have already been logged */
+			(void) copydb_fatal_exit();
+
+			return false;
+		}
+	}
+
+	/*
+	 * Add the STOP messages to the queue now, one STOP message per worker.
+	 */
+	if (!copydb_copy_supervisor_send_stop(specs))
+	{
+		log_fatal("Failed to send STOP messages to the COPY queue");
+
+		/* we still need to make sure the COPY processes terminate */
+		(void) copydb_fatal_exit();
+
+		return false;
+	}
+
+	/*
+	 * Now just wait for the table-data COPY processes to be done.
+	 */
+	if (!copydb_wait_for_subprocesses(specs->failFast))
+	{
+		log_error("Some COPY worker process(es) have exited with error, "
+				  "see above for details");
+
+		/* make sure vacuum and create index processes see a STOP message */
+		if (!vacuum_send_stop(specs) ||
+			!copydb_index_workers_send_stop(specs))
+		{
+			(void) copydb_fatal_exit();
+		}
+
+		return false;
+	}
+
+	/* write that we successfully finished copying all tables */
+	if (!write_file("", 0, specs->cfPaths.done.tables))
+	{
+		log_warn("Failed to write the tracking file \%s\"",
+				 specs->cfPaths.done.tables);
+	}
+
+	bool success = true;
+
+	/*
+	 * Now that the COPY processes are done, signal this is the end to the
+	 * vacuum and CREATE INDEX sub-processes by adding the STOP message to
+	 * their queues.
+	 */
+	success = success && vacuum_send_stop(specs);
+	success = success && copydb_index_workers_send_stop(specs);
+
+	if (!success)
+	{
+		/*
+		 * The other subprocesses need to see a STOP message to stop their
+		 * processing. Failing to send the STOP messages means that the main
+		 * pgcopydb never finishes, and we want to ensure the command
+		 * terminates.
+		 */
+		(void) copydb_fatal_exit();
+
 		return false;
 	}
 
@@ -348,27 +367,115 @@ copydb_process_table_data_with_workers(CopyDataSpec *specs)
 
 
 /*
- * copydb_process_table_data_worker stats a sub-process that walks through the
- * array of tables to COPY over from the source database to the target
- * database.
- *
- * Each process walks through the entire array, and for each entry:
- *
- *  - acquires a semaphore to enter the critical section, alone
- *    - check if the current entry is already done, or being processed
- *    - if not, create the lock file
- *  - exit the critical section
- *  - if we created a lock file, process the selected table
+ * copydb_copy_supervisor_send_stop sends the STOP messages to the copy queue,
+ * one STOP message per worker.
  */
 bool
-copydb_process_table_data_worker(CopyDataSpec *specs)
+copydb_copy_supervisor_send_stop(CopyDataSpec *specs)
 {
-	int errors = 0;
-	int copies = 0;
+	for (int i = 0; i < specs->tableJobs; i++)
+	{
+		QMessage stop = { .type = QMSG_TYPE_STOP };
 
-	log_notice("Started COPY worker %d [%d]", getpid(), getppid());
+		if (!queue_send(&(specs->copyQueue), &stop))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
 
-	CopyTableDataSpecsArray *tableSpecsArray = &(specs->tableSpecsArray);
+	return true;
+}
+
+
+/*
+ * copydb_add_copy sends a message to the COPY queue to process a given table,
+ * or a given table partition.
+ */
+bool
+copydb_add_copy(CopyDataSpec *specs, uint32_t oid, uint32_t part)
+{
+	QMessage mesg = {
+		.type = QMSG_TYPE_TABLEPOID,
+		.data.tp = { .oid = oid, .part = part }
+	};
+
+	if (!queue_send(&(specs->copyQueue), &mesg))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_start_table_data_workers create as many sub-process as needed, per
+ * --table-jobs.
+ */
+bool
+copydb_start_table_data_workers(CopyDataSpec *specs)
+{
+	log_info("STEP 4: starting %d table data COPY processes", specs->tableJobs);
+
+	for (int i = 0; i < specs->tableJobs; i++)
+	{
+		/*
+		 * Flush stdio channels just before fork, to avoid
+		 * double-output problems.
+		 */
+		fflush(stdout);
+		fflush(stderr);
+
+		int fpid = fork();
+
+		switch (fpid)
+		{
+			case -1:
+			{
+				log_error("Failed to fork a COPY worker process: %m");
+				return false;
+			}
+
+			case 0:
+			{
+				/* child process runs the command */
+				(void) set_ps_title("pgcopydb: copy worker");
+
+				if (!copydb_table_data_worker(specs))
+				{
+					/* errors have already been logged */
+					exit(EXIT_CODE_INTERNAL_ERROR);
+				}
+
+				exit(EXIT_CODE_QUIT);
+			}
+
+			default:
+			{
+				/* fork succeeded, in parent */
+				break;
+			}
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_table_data_worker is a worker process that loops over messages
+ * received from a queue, each message being the Oid of an index to create on
+ * the target database.
+ */
+bool
+copydb_table_data_worker(CopyDataSpec *specs)
+{
+	uint64_t errors = 0;
+	pid_t pid = getpid();
+
+	log_notice("Started table data COPY worker %d [%d]", pid, getppid());
 
 	/* connect once to the source database for the whole process */
 	if (!copydb_set_snapshot(specs))
@@ -377,162 +484,264 @@ copydb_process_table_data_worker(CopyDataSpec *specs)
 		return false;
 	}
 
-	for (int tableIndex = 0; tableIndex < tableSpecsArray->count; tableIndex++)
+	while (true)
 	{
-		/* initialize our TableDataProcess entry now */
-		CopyTableDataSpec *tableSpecs = &(tableSpecsArray->array[tableIndex]);
+		QMessage *mesg = (QMessage *) calloc(1, sizeof(QMessage));
+		bool recv_ok = queue_receive(&(specs->copyQueue), mesg);
 
-		/* reuse the same connection to the source database */
-		tableSpecs->sourceSnapshot = specs->sourceSnapshot;
-
-		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
-			int signal = get_current_signal(SIGTERM);
-			const char *signalStr = signal_to_string(signal);
-
-			log_debug("Received signal %s, terminating", signalStr);
+			log_error("COPY worker has been interrupted");
 			break;
 		}
 
-		bool isDone = false;
-		bool isBeingProcessed = false;
-
-		if (!copydb_table_is_being_processed(specs,
-											 tableSpecs,
-											 &isDone,
-											 &isBeingProcessed))
+		if (!recv_ok)
 		{
 			/* errors have already been logged */
-			return false;
+			break;
 		}
 
-		/*
-		 * Skip tables that have been entirely done already either on a
-		 * previous run, or by a concurrent process while we were busy with our
-		 * own work.
-		 *
-		 * Also skip tables that have been claimed by another of the COPY
-		 * worker processes.
-		 */
-		if (isDone || isBeingProcessed)
+		switch (mesg->type)
 		{
-			continue;
-		}
-
-		/*
-		 * 1. Now COPY the TABLE DATA from the source to the destination.
-		 */
-		bool copySucceeded = true;
-
-		/* check for exclude-table-data filtering */
-		if (!tableSpecs->sourceTable->excludeData)
-		{
-			++copies;
-
-			/*
-			 * If we fail to copy a given table, continue looping. Otherwise
-			 * pgcopydb just continues processing all tables anyways (we wait
-			 * until all the sub-processes are finished, but we don't go and
-			 * signal them to stop immediately). We'd better continue with as
-			 * many processes as --table-jobs was given.
-			 */
-			if (!copydb_copy_table(specs, tableSpecs))
+			case QMSG_TYPE_STOP:
 			{
-				/* errors have already been logged */
-				copySucceeded = false;
-				++errors;
+				log_debug("Stop message received by COPY worker");
+				(void) copydb_close_snapshot(specs);
+				free(mesg);
+				return true;
+			}
+
+			case QMSG_TYPE_TABLEPOID:
+			{
+				if (!copydb_copy_data_by_oid(specs,
+											 mesg->data.tp.oid,
+											 mesg->data.tp.part))
+				{
+					log_error("Failed to copy data for table with oid %u "
+							  "and part number %u, see above for details",
+							  mesg->data.tp.oid,
+							  mesg->data.tp.part);
+
+					++errors;
+
+					if (specs->failFast)
+					{
+						free(mesg);
+						return false;
+					}
+
+					/* clean-up our target connection state for next table */
+					(void) copydb_close_snapshot(specs);
+
+					if (!copydb_set_snapshot(specs))
+					{
+						/* errors have already been logged */
+						free(mesg);
+						return false;
+					}
+				}
+				break;
+			}
+
+			default:
+			{
+				log_error("Received unknown message type %ld on table queue %d",
+						  mesg->type,
+						  specs->copyQueue.qId);
+				break;
 			}
 		}
 
-		/* enter the critical section to communicate that we're done */
-		if (copySucceeded)
-		{
-			if (!copydb_mark_table_as_done(specs, tableSpecs))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-		}
-
-		/*
-		 * 2. Send the indexes and constraints attached to this table to the
-		 *    index job queue.
-		 *
-		 * 3. Send the table to the VACUUM ANALYZE job queue.
-		 *
-		 * If a partial COPY is happening, check that all the other parts are
-		 * done. This check should be done in the critical section too. Only
-		 * one process can see all parts as done already, and that's the one
-		 * finishing last.
-		 */
-		bool allPartsDone = false;
-		bool indexesAreBeingProcessed = false;
-
-		if (!copydb_table_parts_are_all_done(specs,
-											 tableSpecs,
-											 &allPartsDone,
-											 &indexesAreBeingProcessed))
-		{
-			/* errors have already been logged */
-			++errors;
-		}
-
-		if (specs->dirState.indexCopyIsDone &&
-			specs->section != DATA_SECTION_CONSTRAINTS)
-		{
-			log_info("Skipping indexes, already done on a previous run");
-		}
-		else if (allPartsDone && !indexesAreBeingProcessed)
-		{
-			if (!copydb_add_table_indexes(specs, tableSpecs))
-			{
-				log_warn("Failed to add the indexes for %s, "
-						 "see above for details",
-						 tableSpecs->qname);
-				log_warn("Consider `pgcopydb copy indexes` to try again");
-				++errors;
-			}
-
-			if (!vacuum_add_table(specs, tableSpecs))
-			{
-				log_warn("Failed to queue VACUUM ANALYZE %s [%u]",
-						 tableSpecs->qname,
-						 tableSpecs->sourceTable->oid);
-				++errors;
-			}
-		}
+		free(mesg);
 	}
 
 	/* terminate our connection to the source database now */
 	(void) copydb_close_snapshot(specs);
-
-	log_debug("copydb_process_table_data_worker: done %d copies, %d errors",
-			  copies,
-			  errors);
 
 	return errors == 0;
 }
 
 
 /*
- * copydb_table_is_being_processed checks lock and done files to see if a given
- * table is already being processed, or has already been processed entirely by
- * another process. In which case the table is to be skipped by the current
- * process.
+ * copydb_copy_data_by_oid finds the SourceTable entry by its OID and then
+ * COPY the table data to the target database.
  */
 bool
-copydb_table_is_being_processed(CopyDataSpec *specs,
-								CopyTableDataSpec *tableSpecs,
-								bool *isDone,
-								bool *isBeingProcessed)
+copydb_copy_data_by_oid(CopyDataSpec *specs, uint32_t oid, uint32_t part)
+{
+	SourceTable *table = NULL;
+
+	log_trace("copydb_copy_data_by_oid: %u [%d]", oid, part);
+
+	uint32_t toid = oid;
+	HASH_FIND(hh, specs->catalog.sourceTableHashByOid, &toid, sizeof(toid), table);
+
+	if (table == NULL)
+	{
+		log_error("Failed to find table %u in sourceTableHashByOid", oid);
+		return false;
+	}
+
+	if (table->partsArray.count < part)
+	{
+		log_error("Failed to find part %d for table %s (%u), "
+				  "which has only %d parts",
+				  part,
+				  table->qname,
+				  table->oid,
+				  table->partsArray.count);
+		return false;
+	}
+
+	CopyTableDataSpec tableSpecs = { 0 };
+
+	if (!copydb_init_table_specs(&tableSpecs, specs, table, part))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	log_trace("copydb_copy_data_by_oid: %u %s, part %d",
+			  oid,
+			  table->qname,
+			  part);
+
+	char psTitle[BUFSIZE] = { 0 };
+
+	if (table->partsArray.count > 0)
+	{
+		sformat(psTitle, sizeof(psTitle), "pgcopydb: copy %s [%d/%d]",
+				table->qname,
+				part + 1,
+				table->partsArray.count);
+	}
+	else
+	{
+		sformat(psTitle, sizeof(psTitle), "pgcopydb: copy %s", table->qname);
+	}
+
+	(void) set_ps_title(psTitle);
+
+	/*
+	 * Skip tables that have been entirely done already on a previous run.
+	 */
+	bool isDone = false;
+
+	if (!copydb_table_create_lockfile(specs, &tableSpecs, &isDone))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (isDone)
+	{
+		log_info("Skipping table %s (%u), already done on a previous run",
+				 tableSpecs.sourceTable->qname,
+				 tableSpecs.sourceTable->oid);
+		return true;
+	}
+
+	/*
+	 * 1. Now COPY the TABLE DATA from the source to the destination.
+	 */
+	if (!table->excludeData)
+	{
+		if (!copydb_copy_table(specs, &tableSpecs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	if (!copydb_mark_table_as_done(specs, &tableSpecs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * 2. Send the indexes and constraints attached to this table to the
+	 *    index job queue.
+	 *
+	 * If a partial COPY is happening, check that all the other parts are done.
+	 * This check should be done in the critical section too. Only one process
+	 * can see all parts as done already, and that's the one finishing last.
+	 */
+	if (specs->dirState.indexCopyIsDone &&
+		specs->section != DATA_SECTION_CONSTRAINTS)
+	{
+		log_info("Skipping indexes, already done on a previous run");
+	}
+	else
+	{
+		bool allPartsDone = false;
+		bool indexesAreBeingProcessed = false;
+
+		if (!copydb_table_parts_are_all_done(specs,
+											 &tableSpecs,
+											 &allPartsDone,
+											 &indexesAreBeingProcessed))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+		else if (allPartsDone && !indexesAreBeingProcessed)
+		{
+			/*
+			 * The VACUUM command takes a conflicting lock with the CREATE
+			 * INDEX and ALTER TABLE commands used for indexes and constraints,
+			 * and as a result we send a table to the vacuum queue only after
+			 * its indexes have all been built.
+			 *
+			 * When a table has no indexes though, we never reach the code that
+			 * checks if all the indexes have been built already. In that case,
+			 * just add the table to the vacuum queue already.
+			 */
+			if (tableSpecs.sourceTable->firstIndex == NULL)
+			{
+				if (!specs->skipVacuum)
+				{
+					SourceTable *sourceTable = tableSpecs.sourceTable;
+
+					if (!vacuum_add_table(specs, sourceTable->oid))
+					{
+						log_error("Failed to queue VACUUM ANALYZE %s [%u]",
+								  sourceTable->qname,
+								  sourceTable->oid);
+						return false;
+					}
+				}
+			}
+			else if (!copydb_add_table_indexes(specs, &tableSpecs))
+			{
+				log_error("Failed to add the indexes for %s, "
+						  "see above for details",
+						  tableSpecs.sourceTable->qname);
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_table_create_lockfile checks done file to see if a given table has
+ * already been processed in a previous run, and creates the lockfile to
+ * register progress for command: pgcopydb list progress.
+ */
+bool
+copydb_table_create_lockfile(CopyDataSpec *specs,
+							 CopyTableDataSpec *tableSpecs,
+							 bool *isDone)
 {
 	if (specs->dirState.tableCopyIsDone)
 	{
-		log_info("Skipping table %s, already done on a previous run",
-				 tableSpecs->qname);
+		log_notice("Skipping table %s, already done on a previous run",
+				   tableSpecs->sourceTable->qname);
 
 		*isDone = true;
-		*isBeingProcessed = false;
 		return true;
 	}
 
@@ -542,14 +751,10 @@ copydb_table_is_being_processed(CopyDataSpec *specs,
 	/*
 	 * If the doneFile exists, then the table has been processed already,
 	 * skip it.
-	 *
-	 * If the lockFile exists, then the table is currently being processed
-	 * by another worker process, skip it.
 	 */
 	if (file_exists(tableSpecs->tablePaths.doneFile))
 	{
 		*isDone = true;
-		*isBeingProcessed = false;
 		(void) semaphore_unlock(&(specs->tableSemaphore));
 
 		return true;
@@ -580,26 +785,29 @@ copydb_table_is_being_processed(CopyDataSpec *specs,
 		/* if we can signal the pid, it is still running */
 		if (kill(tableSummary.pid, 0) == 0)
 		{
-			*isBeingProcessed = true;
 			(void) semaphore_unlock(&(specs->tableSemaphore));
 
-			log_trace("Skipping table %s processed by concurrent worker %d",
-					  tableSpecs->qname, tableSummary.pid);
+			log_error("Failed to start table-data COPY worker for table %s (%u), "
+					  "lock file \"%s\" is owned by running process %d",
+					  tableSpecs->sourceTable->qname,
+					  tableSpecs->sourceTable->oid,
+					  tableSpecs->tablePaths.lockFile,
+					  tableSummary.pid);
 
-			return true;
+			return false;
 		}
 		else
 		{
-			log_warn("Found stale pid %d in file \"%s\", removing it "
-					 "and processing table %s",
-					 tableSummary.pid,
-					 tableSpecs->tablePaths.lockFile,
-					 tableSpecs->qname);
+			log_notice("Found stale pid %d in file \"%s\", removing it "
+					   "and processing table %s",
+					   tableSummary.pid,
+					   tableSpecs->tablePaths.lockFile,
+					   tableSpecs->sourceTable->qname);
 
 			/* stale pid, remove the old lockFile now, then process the table */
 			if (!unlink_file(tableSpecs->tablePaths.lockFile))
 			{
-				log_error("Failed to remove the lockFile \"%s\"",
+				log_error("Failed to remove the stale lockFile \"%s\"",
 						  tableSpecs->tablePaths.lockFile);
 				(void) semaphore_unlock(&(specs->tableSemaphore));
 				return false;
@@ -610,12 +818,7 @@ copydb_table_is_being_processed(CopyDataSpec *specs,
 	}
 
 	/*
-	 * Otherwise, the table is not being processed yet.
-	 */
-	*isBeingProcessed = false;
-
-	/*
-	 * First, write the lockFile, with a summary of what's going-on.
+	 * Now, write the lockFile, with a summary of what's going-on.
 	 */
 	CopyTableSummary emptySummary = { 0 };
 	CopyTableSummary *summary =
@@ -626,23 +829,22 @@ copydb_table_is_being_processed(CopyDataSpec *specs,
 	summary->pid = getpid();
 	summary->table = tableSpecs->sourceTable;
 
-	if (IS_EMPTY_STRING_BUFFER(tableSpecs->part.copyQuery))
+	/* "COPY " is 5 bytes, then 1 for \0 */
+	int len = strlen(tableSpecs->sourceTable->qname) + 5 + 1;
+	summary->command = (char *) calloc(len, sizeof(char));
+
+	if (summary->command == NULL)
 	{
-		sformat(summary->command, sizeof(summary->command),
-				"COPY %s",
-				tableSpecs->qname);
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
 	}
-	else
-	{
-		sformat(summary->command, sizeof(summary->command),
-				"COPY %s",
-				tableSpecs->part.copyQuery);
-	}
+
+	sformat(summary->command, len, "COPY %s", tableSpecs->sourceTable->qname);
 
 	if (!open_table_summary(summary, tableSpecs->tablePaths.lockFile))
 	{
 		log_info("Failed to create the lock file for table %s at \"%s\"",
-				 tableSpecs->qname,
+				 tableSpecs->sourceTable->qname,
 				 tableSpecs->tablePaths.lockFile);
 
 		/* end of the critical section */
@@ -673,36 +875,6 @@ copydb_mark_table_as_done(CopyDataSpec *specs,
 	/* enter the critical section to communicate that we're done */
 	(void) semaphore_lock(&(specs->tableSemaphore));
 
-	/****************************/
-	/* Start TS post-copy hook  */
-	if (!IS_EMPTY_STRING_BUFFER(specs->hookPostCopy) && !file_exists(tableSpecs->tablePaths.hookPostCopyDoneFile))
-	{
-		/*
-		 * run the post-copy hook, if the hook fails, we return false and the table will not be marked as done, and it'll retry
-		 */
-		Program prog = run_program(specs->hookPostCopy, "post-copy", tableSpecs->source_pguri, tableSpecs->target_pguri, tableSpecs->qname, tableSpecs->sourceSnapshot.snapshot, NULL);
-		if (prog.returnCode != 0)
-		{
-			errno = prog.error;
-			char command[BUFSIZE] = { 0 };
-			(void) snprintf_program_command_line(&prog, command, BUFSIZE);
-			log_error("Failed to run post-copy hook \"%s\": %m", command);
-			free_program(&prog);
-			return false;
-		}
-		free_program(&prog);
-
-		/* drop our done file */
-		if (!write_file("", 0, tableSpecs->tablePaths.hookPostCopyDoneFile))
-		{
-			/* errors have already been logged */
-			(void) semaphore_unlock(&(specs->tableSemaphore));
-			return false;
-		}
-	}
-	/* Finish TS post-copy hook */
-	/****************************/
-
 	if (!unlink_file(tableSpecs->tablePaths.lockFile))
 	{
 		log_error("Failed to remove the lockFile \"%s\"",
@@ -722,7 +894,7 @@ copydb_mark_table_as_done(CopyDataSpec *specs,
 	}
 
 	log_debug("Wrote summary for table %s at \"%s\"",
-			  tableSpecs->qname,
+			  tableSpecs->sourceTable->qname,
 			  tableSpecs->tablePaths.doneFile);
 
 	/* end of the critical section */
@@ -834,15 +1006,23 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 	}
 
 	/* we want to set transaction snapshot to the main one on the source */
-	PGSQL *src = &(tableSpecs->sourceSnapshot.pgsql);
+	PGSQL *src = &(specs->sourceSnapshot.pgsql);
 	PGSQL dst = { 0 };
 
 	CopyTableSummary *summary = tableSpecs->summary;
 
 	/* initialize our connection to the target database */
-	if (!pgsql_init(&dst, tableSpecs->target_pguri, PGSQL_CONN_TARGET))
+	if (!pgsql_init(&dst, tableSpecs->connStrings->target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
+		return false;
+	}
+
+	/* set GUC values for the target connection */
+	if (!pgsql_set_gucs(&dst, dstSettings))
+	{
+		log_fatal("Failed to set our GUC settings on the target connection, "
+				  "see above for details");
 		return false;
 	}
 
@@ -874,7 +1054,7 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 		/* if the truncate done file already exists, it's been done already */
 		if (!file_exists(tableSpecs->tablePaths.truncateDoneFile))
 		{
-			if (!pgsql_truncate(&dst, tableSpecs->qname))
+			if (!pgsql_truncate(&dst, tableSpecs->sourceTable->qname))
 			{
 				/* errors have already been logged */
 				(void) semaphore_unlock(&(specs->tableSemaphore));
@@ -896,64 +1076,57 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 		truncate = false;
 	}
 
-	/*********************************************************/
-	/* Start TS pre-copy hook, entering the critical section */
-	(void) semaphore_lock(&(specs->tableSemaphore));
-
-	if (!IS_EMPTY_STRING_BUFFER(specs->hookPreCopy) && !file_exists(tableSpecs->tablePaths.hookPreCopyDoneFile))
-	{
-		Program prog = run_program(specs->hookPreCopy, "pre-copy", tableSpecs->source_pguri, tableSpecs->target_pguri, tableSpecs->qname, tableSpecs->sourceSnapshot.snapshot, NULL);
-		if (prog.returnCode != 0)
-		{
-			errno = prog.error;
-			char command[BUFSIZE] = { 0 };
-			(void) snprintf_program_command_line(&prog, command, BUFSIZE);
-			log_error("Failed to run pre-copy hook \"%s\": %m", command);
-			free_program(&prog);
-			return false;
-		}
-		free_program(&prog);
-
-		/* drop our done file */
-		if (!write_file("", 0, tableSpecs->tablePaths.hookPreCopyDoneFile))
-		{
-			/* errors have already been logged */
-			(void) semaphore_unlock(&(specs->tableSemaphore));
-			return false;
-		}
-	}
-
-	(void) semaphore_unlock(&(specs->tableSemaphore));
-	/* Finish TS pre-copy hook, exiting the critical section */
-	/*********************************************************/
+	truncate = false;
 
 	/* Now copy the data from source to target */
-	log_info("%s", summary->command);
+	log_notice("%s", summary->command);
 
 	/* COPY FROM tablename, or maybe COPY FROM (SELECT ... WHERE ...) */
-	char *copySource = tableSpecs->qname;
+	PQExpBuffer copySrc = createPQExpBuffer();
+	PQExpBuffer copyDst = createPQExpBuffer();
 
-	if (tableSpecs->part.partCount > 1)
+	if (copySrc == NULL || copyDst == NULL)
 	{
-		copySource = tableSpecs->part.copyQuery;
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (!copydb_prepare_copy_query(tableSpecs, copySrc, true))
+	{
+		/* errors have already been logged */
+		destroyPQExpBuffer(copySrc);
+		return false;
+	}
+
+	if (!copydb_prepare_copy_query(tableSpecs, copyDst, false))
+	{
+		/* errors have already been logged */
+		destroyPQExpBuffer(copySrc);
+		destroyPQExpBuffer(copyDst);
+		return false;
 	}
 
 	int attempts = 0;
 	int maxAttempts = 5;        /* allow 5 attempts total, 4 retries */
 
 	bool retry = true;
+	bool success = false;
 
-	while (retry)
+	while (!success && retry)
 	{
 		++attempts;
 
-		if (pg_copy(src, &dst, copySource, tableSpecs->qname, truncate))
+		/* ignore previous attempts, we need only one success here */
+		success = pg_copy(src, &dst, copySrc->data, copyDst->data, truncate,
+						  &(summary->bytesTransmitted));
+
+		if (success)
 		{
 			/* success, get out of the retry loop */
 			if (attempts > 1)
 			{
 				log_info("Table %s COPY succeeded after %d attempts",
-						 tableSpecs->qname,
+						 tableSpecs->sourceTable->qname,
 						 attempts);
 			}
 			break;
@@ -971,14 +1144,14 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 		{
 			log_error("Failed to copy table %s even after %d attempts, "
 					  "see above for details",
-					  tableSpecs->qname,
+					  tableSpecs->sourceTable->qname,
 					  attempts);
 		}
 		else if (retry)
 		{
 			log_info("Failed to copy table %s (connection exception), "
 					 "retrying in %dms (attempt %d)",
-					 tableSpecs->qname,
+					 tableSpecs->sourceTable->qname,
 					 POSTGRES_PING_RETRY_CAP_SLEEP_TIME,
 					 attempts);
 		}
@@ -993,6 +1166,144 @@ copydb_copy_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 			/* sleep a couple seconds then retry */
 			pg_usleep(POSTGRES_PING_RETRY_CAP_SLEEP_TIME * 1000);
 		}
+	}
+
+	destroyPQExpBuffer(copySrc);
+	destroyPQExpBuffer(copyDst);
+
+	return success;
+}
+
+
+/*
+ * copydb_prepare_copy_query prepares a COPY query using the list of attribute
+ * names from the SourceTable instance.
+ */
+bool
+copydb_prepare_copy_query(CopyTableDataSpec *tableSpecs,
+						  PQExpBuffer query,
+						  bool source)
+{
+	SourceTable *table = tableSpecs->sourceTable;
+	bool isFirst = true;
+
+	if (source)
+	{
+		/*
+		 * Always use a sub-query as the copy source, that's easier to hack
+		 * around if comes a time when sophistication is required.
+		 */
+		appendPQExpBufferStr(query, "(SELECT ");
+
+		for (int i = 0; i < table->attributes.count; i++)
+		{
+			SourceTableAttribute *attribute = &(table->attributes.array[i]);
+			char *attname = attribute->attname;
+
+			/* Generated columns cannot be used in COPY */
+			if (attribute->attisgenerated)
+			{
+				log_notice("Skipping %s in COPY as it is a generated column", attname);
+				continue;
+			}
+
+			if (!isFirst)
+			{
+				appendPQExpBufferStr(query, ", ");
+			}
+			else
+			{
+				isFirst = false;
+			}
+
+			appendPQExpBuffer(query, "%s", attname);
+		}
+
+		appendPQExpBuffer(query, " FROM only %s ", tableSpecs->sourceTable->qname);
+
+		/*
+		 * On a source COPY query we might want to add filtering.
+		 */
+		if (tableSpecs->part.partCount > 1)
+		{
+			/*
+			 * The way schema_list_partitions prepares the boundaries is non
+			 * overlapping, so we can use the BETWEEN operator to select our source
+			 * rows in the COPY sub-query.
+			 */
+			if (streq(tableSpecs->part.partKey, "ctid"))
+			{
+				if (tableSpecs->part.max == -1)
+				{
+					/* the last part for ctid splits covers "extra" relpages */
+					appendPQExpBuffer(query,
+									  " WHERE ctid >= '(%lld,0)'::tid",
+									  (long long) tableSpecs->part.min + 1);
+				}
+				else
+				{
+					appendPQExpBuffer(query,
+									  " WHERE ctid >= '(%lld,0)'::tid"
+									  " and ctid < '(%lld,0)'::tid",
+									  (long long) tableSpecs->part.min,
+									  (long long) tableSpecs->part.max + 1);
+				}
+			}
+			else
+			{
+				appendPQExpBuffer(query,
+								  " WHERE %s BETWEEN %lld AND %lld ",
+								  tableSpecs->part.partKey,
+								  (long long) tableSpecs->part.min,
+								  (long long) tableSpecs->part.max);
+			}
+		}
+
+		appendPQExpBufferStr(query, ")");
+	}
+	else
+	{
+		/*
+		 * For the destination query, use the table(...) syntax.
+		 */
+		appendPQExpBuffer(query, "%s", tableSpecs->sourceTable->qname);
+
+		for (int i = 0; i < table->attributes.count; i++)
+		{
+			SourceTableAttribute *attribute = &(table->attributes.array[i]);
+			char *attname = attribute->attname;
+
+			/* Generated columns cannot be used in COPY */
+			if (attribute->attisgenerated)
+			{
+				log_notice("Skipping %s in COPY as it is a generated column", attname);
+				continue;
+			}
+
+			if (isFirst)
+			{
+				appendPQExpBufferStr(query, "(");
+				isFirst = false;
+			}
+			else
+			{
+				appendPQExpBufferStr(query, ", ");
+			}
+
+			appendPQExpBuffer(query, "%s", attname);
+		}
+
+		if (table->attributes.count > 0)
+		{
+			appendPQExpBufferStr(query, ")");
+		}
+	}
+
+	if (PQExpBufferBroken(query))
+	{
+		log_error("Failed to create COPY query for %s: out of memory",
+				  tableSpecs->sourceTable->qname);
+		return false;
 	}
 
 	return true;

@@ -10,13 +10,8 @@ set -e
 #  - PGCOPYDB_TABLE_JOBS
 #  - PGCOPYDB_INDEX_JOBS
 
-
-#
-# pgcopydb list tables include a retry loop, so we use that as a proxy to
-# depend on the source/target Postgres images to be ready
-#
-pgcopydb list tables --source ${PGCOPYDB_SOURCE_PGURI}
-pgcopydb list tables --source ${PGCOPYDB_TARGET_PGURI}
+# make sure source and target databases are ready
+pgcopydb ping
 
 #
 # Now create a user that's going to be the owner of our database
@@ -35,9 +30,24 @@ EOF
 PAGILA_SOURCE_PGURI="postgres://pagila:0wn3d@source/pagila"
 PAGILA_TARGET_PGURI="postgres://pagila:0wn3d@target/pagila"
 
+psql -d ${PAGILA_SOURCE_PGURI} <<EOF
+create extension ltree;
+create extension hstore;
+EOF
+
 grep -v "OWNER TO postgres" /usr/src/pagila/pagila-schema.sql > /tmp/pagila-schema.sql
 
 psql -o /tmp/s.out -d ${PAGILA_SOURCE_PGURI} -1 -f /tmp/pagila-schema.sql
 psql -o /tmp/d.out -d ${PAGILA_SOURCE_PGURI} -1 -f /usr/src/pagila/pagila-data.sql
 
-pgcopydb clone --source ${PAGILA_SOURCE_PGURI} --target ${PAGILA_TARGET_PGURI}
+pgcopydb clone --skip-ext-comments       \
+         --source ${PAGILA_SOURCE_PGURI} \
+         --target ${PAGILA_TARGET_PGURI}
+
+pgcopydb compare schema \
+         --source ${PAGILA_SOURCE_PGURI} \
+         --target ${PAGILA_TARGET_PGURI}
+
+pgcopydb compare data \
+         --source ${PAGILA_SOURCE_PGURI} \
+         --target ${PAGILA_TARGET_PGURI}

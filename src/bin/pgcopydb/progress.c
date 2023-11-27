@@ -70,7 +70,7 @@ copydb_prepare_schema_json_file(CopyDataSpec *copySpecs)
 	}
 
 	/* array of tables */
-	SourceTableArray *tableArray = &(copySpecs->sourceTableArray);
+	SourceTableArray *tableArray = &(copySpecs->catalog.sourceTableArray);
 
 	log_trace("copydb_prepare_schema_json_file: %d tables", tableArray->count);
 
@@ -81,7 +81,7 @@ copydb_prepare_schema_json_file(CopyDataSpec *copySpecs)
 	}
 
 	/* array of indexes */
-	SourceIndexArray *indexArray = &(copySpecs->sourceIndexArray);
+	SourceIndexArray *indexArray = &(copySpecs->catalog.sourceIndexArray);
 
 	log_trace("copydb_prepare_schema_json_file: %d indexes", indexArray->count);
 
@@ -92,7 +92,7 @@ copydb_prepare_schema_json_file(CopyDataSpec *copySpecs)
 	}
 
 	/* array of sequences */
-	SourceSequenceArray *sequenceArray = &(copySpecs->sequenceArray);
+	SourceSequenceArray *sequenceArray = &(copySpecs->catalog.sequenceArray);
 
 	log_trace("copydb_prepare_schema_json_file: %d sequences",
 			  sequenceArray->count);
@@ -124,7 +124,7 @@ copydb_prepare_schema_json_file(CopyDataSpec *copySpecs)
 
 
 /*
- * copydb_filtering_as_json prepares the filtering setup of the CopyDataSpecs
+ * copydb_setup_as_json prepares the filtering setup of the CopyDataSpecs
  * as a JSON object within the given JSON_Value.
  */
 static bool
@@ -143,17 +143,12 @@ copydb_setup_as_json(CopyDataSpec *copySpecs,
 	}
 
 	/* source and target URIs, without passwords */
-	char scrubbedSourceURI[MAXCONNINFO] = { 0 };
-	char scrubbedTargetURI[MAXCONNINFO] = { 0 };
+	ConnStrings *dsn = &(copySpecs->connStrings);
+	char *source = dsn->safeSourcePGURI.pguri;
+	char *target = dsn->safeTargetPGURI.pguri;
 
-	(void) parse_and_scrub_connection_string(copySpecs->source_pguri,
-											 scrubbedSourceURI);
-
-	(void) parse_and_scrub_connection_string(copySpecs->target_pguri,
-											 scrubbedTargetURI);
-
-	json_object_set_string(jsSetupObj, "source_pguri", scrubbedSourceURI);
-	json_object_set_string(jsSetupObj, "target_pguri", scrubbedTargetURI);
+	json_object_set_string(jsSetupObj, "source_pguri", source);
+	json_object_set_string(jsSetupObj, "target_pguri", target);
 
 	json_object_set_number(jsSetupObj,
 						   "table-jobs",
@@ -165,7 +160,7 @@ copydb_setup_as_json(CopyDataSpec *copySpecs,
 
 	json_object_set_number(jsSetupObj,
 						   "split-tables-larger-than",
-						   (double) copySpecs->splitTablesLargerThan);
+						   (double) copySpecs->splitTablesLargerThan.bytes);
 
 	/* attach the JSON array to the main JSON object under the provided key */
 	json_object_set_value(jsobj, key, jsSetup);
@@ -200,6 +195,22 @@ copydb_filtering_as_json(CopyDataSpec *copySpecs,
 						   "type",
 						   filterTypeToString(filters->type));
 
+	/* include-only-schema */
+	if (filters->includeOnlySchemaList.count > 0)
+	{
+		JSON_Value *jsSchema = json_value_init_array();
+		JSON_Array *jsSchemaArray = json_value_get_array(jsSchema);
+
+		for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
+		{
+			char *nspname = filters->includeOnlySchemaList.array[i].nspname;
+
+			json_array_append_string(jsSchemaArray, nspname);
+		}
+
+		json_object_set_value(jsFilterObj, "include-only-schema", jsSchema);
+	}
+
 	/* exclude-schema */
 	if (filters->excludeSchemaList.count > 0)
 	{
@@ -219,7 +230,7 @@ copydb_filtering_as_json(CopyDataSpec *copySpecs,
 	/* exclude table lists */
 	struct section
 	{
-		char name[NAMEDATALEN];
+		char name[PG_NAMEDATALEN];
 		SourceFilterTableList *list;
 	};
 
@@ -292,6 +303,7 @@ copydb_table_array_as_json(SourceTableArray *tableArray,
 		json_object_set_number(jsTableObj, "oid", (double) table->oid);
 		json_object_set_string(jsTableObj, "schema", table->nspname);
 		json_object_set_string(jsTableObj, "name", table->relname);
+		json_object_set_string(jsTableObj, "qname", table->qname);
 
 		json_object_set_number(jsTableObj, "reltuples", (double) table->reltuples);
 		json_object_set_number(jsTableObj, "bytes", (double) table->bytes);
@@ -304,6 +316,30 @@ copydb_table_array_as_json(SourceTableArray *tableArray,
 							   table->restoreListName);
 
 		json_object_set_string(jsTableObj, "part-key", table->partKey);
+
+		/* now add table attributes (columns) */
+		SourceTableAttributeArray *attributes = &(table->attributes);
+
+		JSON_Value *jsAttrs = json_value_init_array();
+		JSON_Array *jsAttrArray = json_value_get_array(jsAttrs);
+
+		for (int attrIndex = 0; attrIndex < attributes->count; attrIndex++)
+		{
+			SourceTableAttribute *attr = &(attributes->array[attrIndex]);
+
+			JSON_Value *jsAttr = json_value_init_object();
+			JSON_Object *jsAttrObj = json_value_get_object(jsAttr);
+
+			json_object_set_number(jsAttrObj, "attnum", attr->attnum);
+			json_object_set_number(jsAttrObj, "atttypid", attr->atttypid);
+			json_object_set_string(jsAttrObj, "attname", attr->attname);
+			json_object_set_boolean(jsAttrObj, "attisprimary", attr->attisprimary);
+			json_object_set_boolean(jsAttrObj, "attisgenerated", attr->attisgenerated);
+
+			json_array_append_value(jsAttrArray, jsAttr);
+		}
+
+		json_object_set_value(jsTableObj, "cols", jsAttrs);
 
 		/* if we have COPY partitioning, create an array of parts */
 		JSON_Value *jsParts = json_value_init_array();
@@ -339,6 +375,29 @@ copydb_table_array_as_json(SourceTableArray *tableArray,
 			json_object_set_value(jsTableObj, "parts", jsParts);
 		}
 
+		/* append source and target checksums if we have them */
+		if (table->sourceChecksum.rowcount > 0)
+		{
+			json_object_dotset_number(jsTableObj,
+									  "check.source.rowcount",
+									  table->sourceChecksum.rowcount);
+
+			json_object_dotset_string(jsTableObj,
+									  "check.source.checksum",
+									  table->sourceChecksum.checksum);
+		}
+
+		if (table->targetChecksum.rowcount > 0)
+		{
+			json_object_dotset_number(jsTableObj,
+									  "check.target.rowcount",
+									  table->targetChecksum.rowcount);
+
+			json_object_dotset_string(jsTableObj,
+									  "check.target.checksum",
+									  table->targetChecksum.checksum);
+		}
+
 		json_array_append_value(jsTableArray, jsTable);
 	}
 
@@ -371,6 +430,7 @@ copydb_index_array_as_json(SourceIndexArray *indexArray,
 		json_object_set_number(jsIndexObj, "oid", (double) index->indexOid);
 		json_object_set_string(jsIndexObj, "schema", index->indexNamespace);
 		json_object_set_string(jsIndexObj, "name", index->indexRelname);
+		json_object_set_string(jsIndexObj, "qname", index->indexQname);
 
 		json_object_set_boolean(jsIndexObj, "isPrimary", index->isPrimary);
 		json_object_set_boolean(jsIndexObj, "isUnique", index->isUnique);
@@ -389,6 +449,7 @@ copydb_index_array_as_json(SourceIndexArray *indexArray,
 		json_object_set_number(jsTableObj, "oid", (double) index->tableOid);
 		json_object_set_string(jsTableObj, "schema", index->tableNamespace);
 		json_object_set_string(jsTableObj, "name", index->tableRelname);
+		json_object_set_string(jsTableObj, "qname", index->tableQname);
 
 		json_object_set_value(jsIndexObj, "table", jsTable);
 
@@ -450,6 +511,7 @@ copydb_seq_array_as_json(SourceSequenceArray *sequenceArray,
 		json_object_set_number(jsSeqObj, "oid", (double) seq->oid);
 		json_object_set_string(jsSeqObj, "schema", seq->nspname);
 		json_object_set_string(jsSeqObj, "name", seq->relname);
+		json_object_set_string(jsSeqObj, "qname", seq->qname);
 
 		json_object_set_number(jsSeqObj, "last-value", (double) seq->lastValue);
 		json_object_set_boolean(jsSeqObj, "is-called", (double) seq->isCalled);
@@ -476,8 +538,8 @@ copydb_seq_array_as_json(SourceSequenceArray *sequenceArray,
 bool
 copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 {
-	log_debug("copydb_parse_schema_json_file: \"%s\"",
-			  copySpecs->cfPaths.schemafile);
+	log_notice("Reading catalogs from file \"%s\"",
+			   copySpecs->cfPaths.schemafile);
 
 	if (!file_exists(copySpecs->cfPaths.schemafile))
 	{
@@ -507,25 +569,30 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 
 	log_debug("copydb_parse_schema_json_file: parsing %d tables", tableCount);
 
-	copySpecs->sourceTableArray.count = tableCount;
-	copySpecs->sourceTableArray.array =
+	copySpecs->catalog.sourceTableArray.count = tableCount;
+	copySpecs->catalog.sourceTableArray.array =
 		(SourceTable *) calloc(tableCount, sizeof(SourceTable));
 
-	if (copySpecs->sourceTableArray.array == NULL)
+	if (copySpecs->catalog.sourceTableArray.array == NULL)
 	{
 		log_fatal(ALLOCATION_FAILED_ERROR);
 		return false;
 	}
 
+	/* prepare the SourceTable hash tables */
+	SourceTable *sourceTableHashByOid = NULL;
+	SourceTable *sourceTableHashByQName = NULL;
+
 	for (int tableIndex = 0; tableIndex < tableCount; tableIndex++)
 	{
-		SourceTable *table = &(copySpecs->sourceTableArray.array[tableIndex]);
+		SourceTable *table = &(copySpecs->catalog.sourceTableArray.array[tableIndex]);
 		JSON_Object *jsTable = json_array_get_object(jsTableArray, tableIndex);
 
 		table->oid = json_object_get_number(jsTable, "oid");
 
 		char *schema = (char *) json_object_get_string(jsTable, "schema");
 		char *name = (char *) json_object_get_string(jsTable, "name");
+		char *qname = (char *) json_object_get_string(jsTable, "qname");
 
 		char *bytesPretty =
 			(char *) json_object_get_string(jsTable, "bytes-pretty");
@@ -537,6 +604,14 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 
 		strlcpy(table->nspname, schema, sizeof(table->nspname));
 		strlcpy(table->relname, name, sizeof(table->relname));
+		strlcpy(table->qname, qname, sizeof(table->qname));
+
+		/* add the current table to the Hash-by-OID */
+		HASH_ADD(hh, sourceTableHashByOid, oid, sizeof(uint32_t), table);
+
+		/* also add the current table to the Hash-by-QName */
+		size_t len = strlen(table->qname);
+		HASH_ADD(hhQName, sourceTableHashByQName, qname, len, table);
 
 		table->reltuples = json_object_get_number(jsTable, "reltuples");
 		table->bytes = json_object_get_number(jsTable, "bytes");
@@ -550,6 +625,42 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 
 		strlcpy(table->partKey, partKey, sizeof(table->partKey));
 
+		if (json_object_has_value(jsTable, "cols"))
+		{
+			JSON_Array *jsAttrsArray = json_object_get_array(jsTable, "cols");
+			int attrsCount = json_array_get_count(jsAttrsArray);
+
+			table->attributes.count = attrsCount;
+			table->attributes.array =
+				(SourceTableAttribute *)
+				calloc(attrsCount, sizeof(SourceTableAttribute));
+
+			if (table->attributes.array == NULL)
+			{
+				log_fatal(ALLOCATION_FAILED_ERROR);
+				return false;
+			}
+
+			for (int i = 0; i < attrsCount; i++)
+			{
+				SourceTableAttribute *attr = &(table->attributes.array[i]);
+				JSON_Object *jsAttr = json_array_get_object(jsAttrsArray, i);
+
+				attr->attnum = json_object_get_number(jsAttr, "attnum");
+				attr->atttypid = json_object_get_number(jsAttr, "atttypid");
+
+				strlcpy(attr->attname,
+						json_object_get_string(jsAttr, "attname"),
+						sizeof(attr->attname));
+
+				attr->attisprimary =
+					json_object_get_boolean(jsAttr, "attisprimary");
+
+				attr->attisgenerated =
+					json_object_get_boolean(jsAttr, "attisgenerated");
+			}
+		}
+
 		if (json_object_has_value(jsTable, "parts"))
 		{
 			JSON_Array *jsPartsArray = json_object_get_array(jsTable, "parts");
@@ -558,6 +669,12 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 			table->partsArray.count = partsCount;
 			table->partsArray.array =
 				(SourceTableParts *) calloc(partsCount, sizeof(SourceTableParts));
+
+			if (table->partsArray.array == NULL)
+			{
+				log_fatal(ALLOCATION_FAILED_ERROR);
+				return false;
+			}
 
 			for (int i = 0; i < partsCount; i++)
 			{
@@ -578,31 +695,42 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 		}
 	}
 
+	/* now attach the final hash table head to the specs */
+	copySpecs->catalog.sourceTableHashByOid = sourceTableHashByOid;
+	copySpecs->catalog.sourceTableHashByQName = sourceTableHashByQName;
+
 	/* index section */
 	JSON_Array *jsIndexArray = json_object_get_array(jsObj, "indexes");
 	int indexCount = json_array_get_count(jsIndexArray);
 
 	log_debug("copydb_parse_schema_json_file: parsing %d indexes", indexCount);
 
-	copySpecs->sourceIndexArray.count = indexCount;
-	copySpecs->sourceIndexArray.array =
+	copySpecs->catalog.sourceIndexArray.count = indexCount;
+	copySpecs->catalog.sourceIndexArray.array =
 		(SourceIndex *) calloc(indexCount, sizeof(SourceIndex));
 
-	if (copySpecs->sourceIndexArray.array == NULL)
+	if (copySpecs->catalog.sourceIndexArray.array == NULL)
 	{
 		log_fatal(ALLOCATION_FAILED_ERROR);
 		return false;
 	}
 
+	/* also build the index hash-table */
+	SourceIndex *sourceIndexHashByOid = copySpecs->catalog.sourceIndexHashByOid;
+
 	for (int i = 0; i < indexCount; i++)
 	{
-		SourceIndex *index = &(copySpecs->sourceIndexArray.array[i]);
+		SourceIndex *index = &(copySpecs->catalog.sourceIndexArray.array[i]);
 		JSON_Object *jsIndex = json_array_get_object(jsIndexArray, i);
 
 		index->indexOid = json_object_get_number(jsIndex, "oid");
 
+		/* add the current index to the index Hash-by-OID */
+		HASH_ADD(hh, sourceIndexHashByOid, indexOid, sizeof(uint32_t), index);
+
 		char *schema = (char *) json_object_get_string(jsIndex, "schema");
 		char *name = (char *) json_object_get_string(jsIndex, "name");
+		char *qname = (char *) json_object_get_string(jsIndex, "qname");
 		char *cols = (char *) json_object_get_string(jsIndex, "columns");
 		char *def = (char *) json_object_get_string(jsIndex, "sql");
 		char *listName =
@@ -610,8 +738,31 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 
 		strlcpy(index->indexNamespace, schema, sizeof(index->indexNamespace));
 		strlcpy(index->indexRelname, name, sizeof(index->indexRelname));
-		strlcpy(index->indexColumns, cols, sizeof(index->indexColumns));
-		strlcpy(index->indexDef, def, sizeof(index->indexDef));
+		strlcpy(index->indexQname, qname, sizeof(index->indexQname));
+
+		int lenCols = strlen(cols) + 1;
+
+		index->indexColumns = (char *) calloc(lenCols, sizeof(char));
+
+		if (index->indexColumns == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(index->indexColumns, cols, lenCols);
+
+		int lenDef = strlen(def) + 1;
+
+		index->indexDef = (char *) calloc(lenDef, sizeof(char));
+
+		if (index->indexDef == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(index->indexDef, def, lenDef);
 
 		strlcpy(index->indexRestoreListName,
 				listName,
@@ -624,9 +775,11 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 
 		schema = (char *) json_object_dotget_string(jsIndex, "table.schema");
 		name = (char *) json_object_dotget_string(jsIndex, "table.name");
+		qname = (char *) json_object_dotget_string(jsIndex, "table.qname");
 
 		strlcpy(index->tableNamespace, schema, sizeof(index->tableNamespace));
 		strlcpy(index->tableRelname, name, sizeof(index->tableRelname));
+		strlcpy(index->tableQname, name, sizeof(index->tableQname));
 
 		if (json_object_has_value(jsIndex, "constraint"))
 		{
@@ -641,7 +794,17 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 												"constraint.restore-list-name");
 
 			strlcpy(index->constraintName, name, sizeof(index->constraintName));
-			strlcpy(index->constraintDef, def, sizeof(index->constraintDef));
+
+			int len = strlen(def) + 1;
+			index->constraintDef = (char *) calloc(len, sizeof(char));
+
+			if (index->constraintDef == NULL)
+			{
+				log_fatal(ALLOCATION_FAILED_ERROR);
+				return false;
+			}
+
+			strlcpy(index->constraintDef, def, len);
 
 			if (listName != NULL)
 			{
@@ -656,6 +819,9 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 		}
 	}
 
+	/* now attach the final hash table head to the specs */
+	copySpecs->catalog.sourceIndexHashByOid = sourceIndexHashByOid;
+
 	return true;
 }
 
@@ -667,8 +833,8 @@ copydb_parse_schema_json_file(CopyDataSpec *copySpecs)
 bool
 copydb_update_progress(CopyDataSpec *copySpecs, CopyProgress *progress)
 {
-	SourceTableArray *tableArray = &(copySpecs->sourceTableArray);
-	SourceIndexArray *indexArray = &(copySpecs->sourceIndexArray);
+	SourceTableArray *tableArray = &(copySpecs->catalog.sourceTableArray);
+	SourceIndexArray *indexArray = &(copySpecs->catalog.sourceIndexArray);
 
 	progress->tableCount = tableArray->count;
 	progress->indexCount = indexArray->count;
@@ -685,10 +851,22 @@ copydb_update_progress(CopyDataSpec *copySpecs, CopyProgress *progress)
 	progress->tableInProgress.array =
 		(SourceTable *) calloc(copySpecs->tableJobs, sizeof(SourceTable));
 
+	if (progress->tableInProgress.array == NULL)
+	{
+		log_fatal(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
 	progress->tableSummaryArray.count = 0;
 	progress->tableSummaryArray.array =
 		(CopyTableSummary *) calloc(copySpecs->tableJobs,
 									sizeof(CopyTableSummary));
+
+	if (progress->tableSummaryArray.array == NULL)
+	{
+		log_fatal(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
 
 	SourceTableArray *tableInProgress = &(progress->tableInProgress);
 	CopyTableSummaryArray *summaryArray = &(progress->tableSummaryArray);
@@ -799,11 +977,22 @@ copydb_update_progress(CopyDataSpec *copySpecs, CopyProgress *progress)
 	progress->indexInProgress.array =
 		(SourceIndex *) calloc(copySpecs->indexJobs, sizeof(SourceIndex));
 
+	if (progress->indexInProgress.array == NULL)
+	{
+		log_fatal(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
 	progress->indexSummaryArray.count = 0;
 	progress->indexSummaryArray.array =
 		(CopyIndexSummary *) calloc(copySpecs->indexJobs,
 									sizeof(CopyIndexSummary));
 
+	if (progress->indexSummaryArray.array == NULL)
+	{
+		log_fatal(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
 
 	SourceIndexArray *indexInProgress = &(progress->indexInProgress);
 	CopyIndexSummaryArray *summaryArrayIdx = &(progress->indexSummaryArray);

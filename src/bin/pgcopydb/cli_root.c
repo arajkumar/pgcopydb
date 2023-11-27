@@ -27,11 +27,13 @@ CommandLine *root_subcommands_with_debug[] = {
 	&follow_command,
 	&copy__db_command,          /* backward compat */
 	&create_snapshot_command,
+	&compare_commands,
 	&copy_commands,
 	&dump_commands,
 	&restore_commands,
 	&list_commands,
 	&stream_commands,
+	&ping_command,
 	&help,
 	&version,
 	NULL
@@ -52,11 +54,13 @@ CommandLine *root_subcommands[] = {
 	&follow_command,
 	&copy__db_command,          /* backward compat */
 	&create_snapshot_command,
+	&compare_commands,
 	&copy_commands,
 	&dump_commands,
 	&restore_commands,
 	&list_commands,
 	&stream_commands,
+	&ping_command,
 	&help,
 	&version,
 	NULL
@@ -82,6 +86,7 @@ root_options(int argc, char **argv)
 	static struct option long_options[] = {
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "json", no_argument, NULL, 'J' },
@@ -125,6 +130,12 @@ root_options(int argc, char **argv)
 
 					case 2:
 					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
 					}
@@ -140,14 +151,14 @@ root_options(int argc, char **argv)
 
 			case 'd':
 			{
-				verboseCount = 2;
+				verboseCount = 3;
 				log_set_level(LOG_DEBUG);
 				break;
 			}
 
 			case 'z':
 			{
-				verboseCount = 3;
+				verboseCount = 4;
 				log_set_level(LOG_TRACE);
 				break;
 			}

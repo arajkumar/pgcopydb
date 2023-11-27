@@ -39,8 +39,7 @@ This command prefixes the following sub-commands:
     cleanup    cleanup source and target systems for logical decoding
     prefetch   Stream JSON changes from the source database and transform them to SQL
     catchup    Apply prefetched changes from SQL files to the target database
-  + create     Create resources needed for pgcopydb
-  + drop       Drop resources needed for pgcopydb
+    replay     Replay changes from the source to the target database, live
   + sentinel   Maintain a sentinel table on the source database
     receive    Stream changes from the source database
     transform  Transform changes from the source database into SQL commands
@@ -91,13 +90,11 @@ pgcopydb stream setup
 pgcopydb stream setup - Setup source and target systems for logical decoding
 
 The command ``pgcopydb stream setup`` connects to the source database and
-creates a replication slot using the logical decoding plugin `wal2json`__,
-then creates a ``pgcopydb.sentinel`` table, and then connects to the target
-database and creates a replication origin positioned at the LSN position of
-the just created replication slot.
-
-__ https://github.com/eulerto/wal2json/
-
+creates creates a ``pgcopydb.sentinel`` table, and then connects to the
+target database and creates a replication origin positioned at the LSN
+position of the logical decoding replication slot that must have been
+created already. See :ref:`pgcopydb_snapshot` to create the replication slot
+and export a snapshot.
 
 ::
 
@@ -111,6 +108,7 @@ __ https://github.com/eulerto/wal2json/
      --resume         Allow resuming operations after a failure
      --not-consistent Allow taking a new snapshot on the source database
      --snapshot       Use snapshot obtained with pg_export_snapshot
+     --plugin         Output plugin to use (test_decoding, wal2json)
      --slot-name      Stream changes recorded by this slot
      --origin         Name of the Postgres replication origin
 
@@ -132,7 +130,6 @@ step.
 
      --source         Postgres URI to the source database
      --target         Postgres URI to the target database
-     --dir            Work directory to use
      --restart        Allow restarting when temp files exist already
      --resume         Allow resuming operations after a failure
      --not-consistent Allow taking a new snapshot on the source database
@@ -148,10 +145,7 @@ pgcopydb stream prefetch
 pgcopydb stream prefetch - Stream JSON changes from the source database and transform them to SQL
 
 The command ``pgcopydb stream prefetch`` connects to the source database
-using the logical replication protocl and the given replication slot, that
-should be created with the logical decoding plugin `wal2json`__.
-
-__ https://github.com/eulerto/wal2json/
+using the logical replication protocl and the given replication slot.
 
 The prefetch command receives the changes from the source database in a
 streaming fashion, and writes them in a series of JSON files named the same
@@ -197,90 +191,42 @@ applies changes from the SQL files that have been prepared with the
      --resume         Allow resuming operations after a failure
      --not-consistent Allow taking a new snapshot on the source database
      --slot-name      Stream changes recorded by this slot
-     --endpos         LSN position where to stop receiving changes  --origin         Name of the Postgres replication origin
+     --endpos         LSN position where to stop receiving changes
+	 --origin         Name of the Postgres replication origin
 
+.. _pgcopydb_stream_replay:
 
-.. _pgcopydb_stream_create_slot:
+pgcopydb stream replay
+----------------------
 
-pgcopydb stream create slot
----------------------------
+pgcopydb stream replay - Replay changes from the source to the target database, live
 
-pgcopydb stream create slot - Create a replication slot in the source database
-
-The command ``pgcopydb stream create slot`` connects to the source database
-and executes a SQL query to create a logical replication slot using the
-plugin ``wal2json``.
+The command ``pgcopydb stream replay`` connects to the source database and
+streams changes using the logical decoding protocol, and internally streams
+those changes to a transform process and then a replay process, which
+connects to the target database and applies SQL changes.
 
 ::
 
-   pgcopydb create slot: Create a replication slot in the source database
-   usage: pgcopydb create slot
+   pgcopydb stream replay: Replay changes from the source to the target database, live
+   usage: pgcopydb stream replay
 
      --source         Postgres URI to the source database
-     --dir            Work directory to use
-     --snapshot       Use snapshot obtained with pg_export_snapshot
-     --slot-name      Use this Postgres replication slot name
-
-.. _pgcopydb_stream_create_origin:
-
-pgcopydb stream create origin
------------------------------
-
-pgcopydb stream create origin - Create a replication origin in the target database
-
-The command ``pgcopydb stream create origin`` connects to the target
-database and executes a SQL query to create a logical replication origin.
-The starting LSN position ``--startpos`` is required.
-
-::
-
-   pgcopydb stream create origin: Create a replication origin in the target database
-   usage: pgcopydb stream create origin
-
      --target         Postgres URI to the target database
      --dir            Work directory to use
-     --origin         Use this Postgres origin name
-     --start-pos      LSN position from where to start applying changes
+     --restart        Allow restarting when temp files exist already
+     --resume         Allow resuming operations after a failure
+     --not-consistent Allow taking a new snapshot on the source database
+     --slot-name      Stream changes recorded by this slot
+     --endpos         LSN position where to stop receiving changes
+     --origin         Name of the Postgres replication origin
 
-.. _pgcopydb_stream_drop_slot:
 
-pgcopydb stream drop slot
--------------------------
+This command is equivalent to running the following script::
 
-pgcopydb stream drop slot - Drop a replication slot in the source database
-
-The command ``pgcopydb stream drop slot`` connects to the source database
-and executes a SQL query to drop the logical replication slot with the given
-name (that defaults to ``pgcopydb``).
-
-::
-
-   pgcopydb stream drop slot: Drop a replication slot in the source database
-   usage: pgcopydb stream drop slot
-
-     --source         Postgres URI to the source database
-     --dir            Work directory to use
-     --slot-name      Use this Postgres replication slot name
-
-.. _pgcopydb_stream_drop_origin:
-
-pgcopydb stream drop origin
----------------------------
-
-pgcopydb stream drop origin - Drop a replication origin in the target database
-
-The command ``pgcopydb stream drop origin`` connects to the target database
-and executes a SQL query to drop the logical replication origin with the
-given name (that defaults to ``pgcopydb``).
-
-::
-
-   usage: pgcopydb stream drop origin
-
-     --target         Postgres URI to the target database
-     --dir            Work directory to use
-     --origin         Use this Postgres origin name
-
+  pgcopydb stream receive --to-stdout
+  | pgcopydb stream transform - -
+  | pgcopydb stream apply -
 
 .. _pgcopydb_stream_sentinel_create:
 
@@ -402,10 +348,7 @@ pgcopydb stream receive
 pgcopydb stream receive - Stream changes from the source database
 
 The command ``pgcopydb stream receive`` connects to the source database
-using the logical replication protocl and the given replication slot, that
-should be created with the logical decoding plugin `wal2json`__.
-
-__ https://github.com/eulerto/wal2json/
+using the logical replication protocl and the given replication slot.
 
 The receive command receives the changes from the source database in a
 streaming fashion, and writes them in a series of JSON files named the same
@@ -418,6 +361,7 @@ as their origin WAL filename (with the ``.json`` extension).
 
      --source         Postgres URI to the source database
      --dir            Work directory to use
+     --to-stdout      Stream logical decoding messages to stdout
      --restart        Allow restarting when temp files exist already
      --resume         Allow resuming operations after a failure
      --not-consistent Allow taking a new snapshot on the source database
@@ -447,6 +391,10 @@ per line.
      --resume         Allow resuming operations after a failure
      --not-consistent Allow taking a new snapshot on the source database
 
+The command supports using ``-`` as the filename for either the JSON input
+or the SQL output, or both. In that case reading from standard input and/or
+writing to standard output is implemented, in a streaming fashion. A classic
+use case is to use Unix Pipes, see :ref:`pgcopydb_stream_replay` too.
 
 pgcopydb stream apply
 ---------------------
@@ -472,6 +420,8 @@ __ https://www.postgresql.org/docs/current/replication-origins.html
      --not-consistent Allow taking a new snapshot on the source database
      --origin         Name of the Postgres replication origin
 
+This command supports using ``-`` as the filename to read from, and in that
+case reads from the standard input in a streaming fashion instead.
 
 Options
 -------
@@ -522,16 +472,22 @@ The following options are available to ``pgcopydb stream`` sub-commands:
   To be able to resume a streaming operation in a consistent way, all that's
   required is re-using the same replication slot as in previous run(s).
 
+--plugin
+
+  Logical decoding output plugin to use. The default is `test_decoding`__
+  which ships with Postgres core itself, so is probably already available on
+  your source server.
+
+  It is possible to use `wal2json`__ instead. The support for wal2json is
+  mostly historical in pgcopydb, it should not make a user visible
+  difference whether you use the default test_decoding or wal2json.
+
+  __ https://www.postgresql.org/docs/current/test-decoding.html
+  __ https://github.com/eulerto/wal2json/
+
 --slot-name
 
-  Logical replication slot to use. At the moment pgcopydb doesn't know how
-  to create the logical replication slot itself. The slot should be created
-  within the same transaction snapshot as the initial data copy.
-
-  Must be using the `wal2json`__ output plugin, available with
-  format-version 2.
-
-  __ https://github.com/eulerto/wal2json/
+  Logical decoding slot name to use.
 
 --endpos
 

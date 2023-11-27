@@ -32,6 +32,17 @@ typedef struct SearchPath
 	char matches[1024][MAXPGPATH];
 } SearchPath;
 
+typedef bool (*ReadFromStream) (void *ctx, const char *line, bool *stop);
+
+typedef struct ReadFromStreamContext
+{
+	int fd;
+	uint64_t lineno;
+	bool earlyExit;
+	ReadFromStream callback;
+	void *ctx;                  /* user-defined context */
+} ReadFromStreamContext;
+
 
 bool file_exists(const char *filename);
 bool file_is_empty(const char *filename);
@@ -47,6 +58,9 @@ bool move_file(char *sourcePath, char *destinationPath);
 bool duplicate_file(char *sourcePath, char *destinationPath);
 bool create_symbolic_link(char *sourcePath, char *targetPath);
 
+bool write_to_stream(FILE *stream, const char *buffer, size_t size);
+bool read_from_stream(FILE *stream, ReadFromStreamContext *context);
+
 void path_in_same_directory(const char *basePath,
 							const char *fileName,
 							char *destinationPath);
@@ -55,6 +69,7 @@ bool search_path_first(const char *filename, char *result, int logLevel);
 bool search_path(const char *filename, SearchPath *result);
 bool search_path_deduplicate_symlinks(SearchPath *results, SearchPath *dedup);
 bool unlink_file(const char *filename);
+void close_fd_or_exit(int fd);
 bool set_program_absolute_path(char *program, int size);
 bool normalize_filename(const char *filename, char *dst, int size);
 

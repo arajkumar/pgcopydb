@@ -10,7 +10,9 @@ This command prefixes the following sub-commands:
 ::
 
   pgcopydb list
+    databases    List databases
     extensions   List all the source extensions to copy
+    collations   List all the source collations to copy
     tables       List all the source tables to copy data from
     table-parts  List a source table copy partitions
     sequences    List all the source sequences to copy data from
@@ -19,6 +21,24 @@ This command prefixes the following sub-commands:
     schema       List the schema to migrate, formatted in JSON
     progress     List the progress
 
+
+.. _pgcopydb_list_databases:
+
+pgcopydb list databases
+-----------------------
+
+pgcopydb list databases - List databases
+
+The command ``pgcopydb list databases`` connects to the source database and
+executes a SQL query using the Postgres catalogs to get a list of all the
+databases there.
+
+::
+
+   pgcopydb list databases: List databases
+   usage: pgcopydb list databases  --source ...
+
+     --source            Postgres URI to the source database
 
 .. _pgcopydb_list_extensions:
 
@@ -36,7 +56,37 @@ extensions to COPY to the target database.
    pgcopydb list extensions: List all the source extensions to copy
    usage: pgcopydb list extensions  --source ...
 
+     --source              Postgres URI to the source database
+     --json                Format the output using JSON
+     --available-versions  List available extension versions
+     --requirements        List extensions requirements
+
+The command ``pgcopydb list extensions --available-versions`` is typically
+used with the target database. If you're using the connection string
+environment variables, that looks like the following::
+
+  $ pgcopydb list extensions --available-versions --source ${PGCOPYDB_TARGET_PGURI}
+
+.. _pgcopydb_list_collations:
+
+pgcopydb list collations
+------------------------
+
+pgcopydb list collations - List all the source collations to copy
+
+The command ``pgcopydb list collations`` connects to the source database and
+executes a SQL query using the Postgres catalogs to get a list of all the
+collations to COPY to the target database.
+
+::
+
+   pgcopydb list collations: List all the source collations to copy
+   usage: pgcopydb list collations  --source ...
+
      --source            Postgres URI to the source database
+
+The SQL query that is used lists the database collation, and then any
+non-default collation that's used in a user column or a user index.
 
 .. _pgcopydb_list_tables:
 
@@ -56,8 +106,17 @@ tables to COPY the data from.
 
      --source            Postgres URI to the source database
      --filter <filename> Use the filters defined in <filename>
+     --cache             Cache table size in relation pgcopydb.pgcopydb_table_size
+     --drop-cache        Drop relation pgcopydb.pgcopydb_table_size
      --list-skipped      List only tables that are setup to be skipped
      --without-pkey      List only tables that have no primary key
+
+The ``--cache`` option allows caching the `pg_table_size()`__ result in the
+newly created table ``pgcopydb.pgcopydb_table_size``. This is only useful in
+Postgres deployments where this computation is quite slow, and when the
+pgcopydb operation is going to be run multiple times.
+
+__ https://www.postgresql.org/docs/15/functions-admin.html#FUNCTIONS-ADMIN-DBSIZE
 
 .. _pgcopydb_list_table_parts:
 
@@ -188,7 +247,9 @@ list of all the tables and indexes that are currently being processed.
     usage: pgcopydb list progress  --source ...
 
       --source  Postgres URI to the source database
+      --summary List the summary, requires --json
       --json    Format the output using JSON
+      --dir     Work directory to use
 
 
 Options
@@ -230,6 +291,15 @@ The following options are available to ``pgcopydb dump schema``:
   Instead of listing objects that are selected for copy by the filters
   installed with the ``--filter`` option, list the objects that are going to
   be skipped when using the filters.
+
+--summary
+
+  Instead of listing current progress when the command is still running,
+  instead list the summary with timing details for each step and for all
+  tables, indexes, and constraints.
+
+  This options requires the ``--json`` option too: at the moment only this
+  output format is supported.
 
 --json
 

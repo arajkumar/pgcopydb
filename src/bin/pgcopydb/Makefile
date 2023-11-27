@@ -13,22 +13,27 @@ INCLUDES  = $(patsubst ${SRC_DIR}%.h,%.h,$(wildcard ${SRC_DIR}*.h))
 
 SRC   = $(patsubst ${SRC_DIR}%.c,%.c,$(wildcard ${SRC_DIR}*.c))
 OBJS  = $(patsubst %.c,%.o,$(SRC))
-OBJS += lib-log.o lib-commandline.o lib-parson.o lib-snprintf.o lib-strerror.o
+OBJS += lib-log.o lib-commandline.o lib-parson.o
+OBJS += lib-snprintf.o lib-strerror.o lib-dumputils.o lib-string_utils.o
+OBJS += lib-lookup3.o
 
 PG_CONFIG ?= pg_config
 BINDIR    ?= $(shell $(PG_CONFIG) --bindir)
 
 PG_SNPRINTF     = $(wildcard ${SRC_DIR}../lib/pg/snprintf.*)
+PG_DUMPUTILS    = $(wildcard ${SRC_DIR}../lib/pg/*utils.*)
 LOG_SRC         = $(wildcard ${SRC_DIR}../lib/log/src/log.*)
 COMMANDLINE_SRC = $(wildcard ${SRC_DIR}../lib/subcommands.c/commandline.*)
 PARSON_SRC      = $(wildcard ${SRC_DIR}../lib/parson/parson.*)
+JENKINS_SRC     = $(wildcard ${SRC_DIR}../lib/jenkins/lookup3.*)
 
 COMMON_LIBS  = -I${SRC_DIR}../lib/pg
 COMMON_LIBS += -I${SRC_DIR}../lib/log/src/
 COMMON_LIBS += -I${SRC_DIR}../lib/subcommands.c/
 COMMON_LIBS += -I${SRC_DIR}../lib/libs/
 COMMON_LIBS += -I${SRC_DIR}../lib/parson/
-COMMON_LIBS += -I${SRC_DIR}../lib/uthash
+COMMON_LIBS += -I${SRC_DIR}../lib/uthash/
+COMMON_LIBS += -I${SRC_DIR}../lib/jenkins/
 
 CC = $(shell $(PG_CONFIG) --cc)
 
@@ -58,6 +63,8 @@ DEFAULT_CFLAGS += $(SECURITY_CFLAGS)
 endif
 
 override CFLAGS := $(DEFAULT_CFLAGS) $(CFLAGS)
+
+JENKINS_CFLAGS = $(CFAGS) -Wno-implicit-fallthrough -Wno-format
 
 LIBS  = -L $(shell $(PG_CONFIG) --pkglibdir)
 LIBS += -L $(shell $(PG_CONFIG) --libdir)
@@ -89,6 +96,12 @@ lib-snprintf.o: $(PG_SNPRINTF)
 lib-strerror.o: $(PG_SNPRINTF)
 	$(CC) $(CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/pg/strerror.c
 
+lib-dumputils.o: $(PG_DUMPUTILS)
+	$(CC) $(CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/pg/dumputils.c
+
+lib-string_utils.o: $(PG_DUMPUTILS)
+	$(CC) $(CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/pg/string_utils.c
+
 lib-log.o: $(LOG_SRC)
 	$(CC) $(CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/log/src/log.c
 
@@ -97,6 +110,9 @@ lib-commandline.o: $(COMMANDLINE_SRC)
 
 lib-parson.o: $(PARSON_SRC)
 	$(CC) $(CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/parson/parson.c
+
+lib-lookup3.o: $(JENKINS_SRC)
+	$(CC) $(JENKINS_CFLAGS) -c -MMD -MP -MF$(DEPDIR)/$(*F).Po -MT$@ -o $@ ${SRC_DIR}../lib/jenkins/lookup3.c
 
 VERSION-FILE: git-version.h ;
 

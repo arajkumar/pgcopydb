@@ -101,12 +101,13 @@ static CommandLine restore_schema_parse_list_command =
 	make_command(
 		"parse-list",
 		"Parse pg_restore --list output from custom file",
-		" --dir <dir> [ --source <URI> ] --target <URI> ",
+		" [ <pre.list> ] ",
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --skip-extensions    Skip restoring extensions\n"
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
 		"  --not-consistent     Allow taking a new snapshot on the source database\n",
@@ -151,12 +152,15 @@ cli_restore_schema_getopts(int argc, char **argv)
 		{ "filter", required_argument, NULL, 'F' },
 		{ "filters", required_argument, NULL, 'F' },
 		{ "skip-extensions", no_argument, NULL, 'e' },
+		{ "skip-ext-comment", no_argument, NULL, 'E' },
+		{ "skip-ext-comments", no_argument, NULL, 'E' },
 		{ "restart", no_argument, NULL, 'r' },
 		{ "resume", no_argument, NULL, 'R' },
 		{ "not-consistent", no_argument, NULL, 'C' },
 		{ "snapshot", required_argument, NULL, 'N' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
@@ -173,7 +177,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:cOxXVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:D:s:cOxXFeErRCNVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -186,8 +190,8 @@ cli_restore_schema_getopts(int argc, char **argv)
 							  "see above for details.");
 					exit(EXIT_CODE_BAD_ARGS);
 				}
-				strlcpy(options.source_pguri, optarg, MAXCONNINFO);
-				log_trace("--source %s", options.source_pguri);
+				options.connStrings.source_pguri = pg_strdup(optarg);
+				log_trace("--source %s", options.connStrings.source_pguri);
 				break;
 			}
 
@@ -199,8 +203,8 @@ cli_restore_schema_getopts(int argc, char **argv)
 							  "see above for details.");
 					exit(EXIT_CODE_BAD_ARGS);
 				}
-				strlcpy(options.target_pguri, optarg, MAXCONNINFO);
-				log_trace("--target %s", options.target_pguri);
+				options.connStrings.target_pguri = pg_strdup(optarg);
+				log_trace("--target %s", options.connStrings.target_pguri);
 				break;
 			}
 
@@ -242,6 +246,13 @@ cli_restore_schema_getopts(int argc, char **argv)
 			case 'e':
 			{
 				options.skipExtensions = true;
+				log_trace("--skip-extensions");
+				break;
+			}
+
+			case 'E':
+			{
+				options.skipCommentOnExtension = true;
 				log_trace("--skip-extensions");
 				break;
 			}
@@ -308,6 +319,12 @@ cli_restore_schema_getopts(int argc, char **argv)
 
 					case 2:
 					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
 					}
@@ -323,14 +340,14 @@ cli_restore_schema_getopts(int argc, char **argv)
 
 			case 'd':
 			{
-				verboseCount = 2;
+				verboseCount = 3;
 				log_set_level(LOG_DEBUG);
 				break;
 			}
 
 			case 'z':
 			{
-				verboseCount = 3;
+				verboseCount = 4;
 				log_set_level(LOG_TRACE);
 				break;
 			}
@@ -350,7 +367,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		}
 	}
 
-	if (IS_EMPTY_STRING_BUFFER(options.target_pguri))
+	if (options.connStrings.target_pguri == NULL)
 	{
 		log_fatal("Option --target is mandatory");
 		++errors;
@@ -445,7 +462,7 @@ cli_restore_roles(int argc, char **argv)
 	(void) cli_restore_prepare_specs(&copySpecs);
 
 	if (!pg_restore_roles(&(copySpecs.pgPaths),
-						  copySpecs.target_pguri,
+						  copySpecs.connStrings.target_pguri,
 						  copySpecs.dumpPaths.rolesFilename))
 	{
 		/* errors have already been logged */
@@ -460,6 +477,40 @@ cli_restore_roles(int argc, char **argv)
 static void
 cli_restore_schema_parse_list(int argc, char **argv)
 {
+	if (argc == 1)
+	{
+		char *filename = argv[0];
+
+		log_info("Parsing Archive Content pre.list file: \"%s\"", filename);
+
+		ArchiveContentArray contents = { 0 };
+
+		if (!parse_archive_list(filename, &contents))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		log_notice("Read %d archive items in \"%s\"", contents.count, filename);
+
+		for (int i = 0; i < contents.count; i++)
+		{
+			ArchiveContentItem *item = &(contents.array[i]);
+
+			fformat(stdout,
+					"%d; %u %u %s %s\n",
+					item->dumpId,
+					item->catalogOid,
+					item->objectOid,
+					item->description ? item->description : "",
+					item->restoreListName ? item->restoreListName : "");
+		}
+
+		FreeArchiveContentArray(&contents);
+
+		exit(EXIT_CODE_QUIT);
+	}
+
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_restore_prepare_specs(&copySpecs);
@@ -521,18 +572,6 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 	CopyFilePaths *cfPaths = &(copySpecs->cfPaths);
 	PostgresPaths *pgPaths = &(copySpecs->pgPaths);
 
-	char scrubbedSourceURI[MAXCONNINFO] = { 0 };
-	char scrubbedTargetURI[MAXCONNINFO] = { 0 };
-
-	(void) parse_and_scrub_connection_string(restoreDBoptions.source_pguri,
-											 scrubbedSourceURI);
-
-	(void) parse_and_scrub_connection_string(restoreDBoptions.target_pguri,
-											 scrubbedTargetURI);
-
-	log_info("[SOURCE] Restoring database from \"%s\"", scrubbedSourceURI);
-	log_info("[TARGET] Restoring database into \"%s\"", scrubbedTargetURI);
-
 	(void) find_pg_commands(pgPaths);
 
 	char *dir =
@@ -540,11 +579,15 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 		? NULL
 		: restoreDBoptions.dir;
 
+	bool createWorkDir = true;
+
 	if (!copydb_init_workdir(copySpecs,
 							 dir,
+							 false, /* service */
+							 NULL,  /* serviceName */
 							 restoreDBoptions.restart,
 							 restoreDBoptions.resume,
-							 false))
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -552,24 +595,7 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 
 	log_info("Restoring database from existing files at \"%s\"", cfPaths->topdir);
 
-	if (!copydb_init_specs(copySpecs,
-						   restoreDBoptions.source_pguri,
-						   restoreDBoptions.target_pguri,
-						   1,    /* table jobs */
-						   1,    /* index jobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_NONE,
-						   restoreDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreDBoptions.restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   restoreDBoptions.skipExtensions,
-						   restoreDBoptions.restart,
-						   restoreDBoptions.resume,
-						   !restoreDBoptions.notConsistent))
+	if (!copydb_init_specs(copySpecs, &restoreDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -590,4 +616,15 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 	log_info("Using pg_restore for Postgres \"%s\" at \"%s\"",
 			 pgPaths->pg_version,
 			 pgPaths->pg_restore);
+
+	ConnStrings *dsn = &(copySpecs->connStrings);
+
+	if (!cli_prepare_pguris(dsn))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	char *target = dsn->safeTargetPGURI.pguri;
+	log_info("[TARGET] Restoring database into \"%s\"", target);
 }

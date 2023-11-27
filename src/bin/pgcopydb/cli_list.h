@@ -14,19 +14,27 @@
 #include "cli_common.h"
 #include "cli_root.h"
 #include "pgsql.h"
+#include "schema.h"
 
 typedef struct ListDBOptions
 {
-	char source_pguri[MAXCONNINFO];
-	char schema_name[NAMEDATALEN];
-	char table_name[NAMEDATALEN];
+	char dir[MAXPGPATH];
+
+	ConnStrings connStrings;
+
+	char schema_name[PG_NAMEDATALEN];
+	char table_name[PG_NAMEDATALEN];
 	char filterFileName[MAXPGPATH];
 
 	bool listSkipped;
 	bool noPKey;
+	bool cache;
+	bool dropCache;
+	bool summary;
+	bool availableVersions;
+	bool requirements;
 
-	uint64_t splitTablesLargerThan;
-	char splitTablesLargerThanPretty[NAMEDATALEN];
+	SplitTableLargerThan splitTablesLargerThan;
 } ListDBOptions;
 
 

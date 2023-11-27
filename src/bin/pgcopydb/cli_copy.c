@@ -29,31 +29,6 @@ static void cli_copy_indexes(int argc, char **argv);
 static void cli_copy_constraints(int argc, char **argv);
 static void cli_copy_blobs(int argc, char **argv);
 
-/* pgcopydb copy db is an alias for pgcopydb clone */
-CommandLine copy__db_command =
-	make_command(
-		"copy-db",
-		"Copy an entire database from source to target",
-		" --source ... --target ... [ --table-jobs ... --index-jobs ... ] ",
-		"  --source              Postgres URI to the source database\n"
-		"  --target              Postgres URI to the target database\n"
-		"  --dir                 Work directory to use\n"
-		"  --table-jobs          Number of concurrent COPY jobs to run\n"
-		"  --index-jobs          Number of concurrent CREATE INDEX jobs to run\n"
-		"  --drop-if-exists      On the target database, clean-up from a previous run first\n"
-		"  --roles               Also copy roles found on source to target\n"
-		"  --no-owner            Do not set ownership of objects to match the original database\n"
-		"  --no-acl              Prevent restoration of access privileges (grant/revoke commands).\n"
-		"  --no-comments         Do not output commands to restore comments\n"
-		"  --skip-large-objects  Skip copying large objects (blobs)\n"
-		"  --filters <filename>  Use the filters defined in <filename>\n"
-		"  --restart             Allow restarting when temp files exist already\n"
-		"  --resume              Allow resuming operations after a failure\n"
-		"  --not-consistent      Allow taking a new snapshot on the source database\n"
-		"  --snapshot            Use snapshot obtained with pg_export_snapshot\n",
-		cli_copy_db_getopts,
-		cli_clone);
-
 static CommandLine copy_db_command =
 	make_command(
 		"db",
@@ -71,6 +46,7 @@ static CommandLine copy_db_command =
 		"  --no-comments         Do not output commands to restore comments\n"
 		"  --skip-large-objects  Skip copying large objects (blobs)\n"
 		"  --filters <filename>  Use the filters defined in <filename>\n"
+		"  --fail-fast           Abort early in case of error\n"
 		"  --restart             Allow restarting when temp files exist already\n"
 		"  --resume              Allow resuming operations after a failure\n"
 		"  --not-consistent      Allow taking a new snapshot on the source database\n"
@@ -101,7 +77,8 @@ static CommandLine copy_roles_command =
 		" --source ... --target ... ",
 		"  --source              Postgres URI to the source database\n"
 		"  --target              Postgres URI to the target database\n"
-		"  --dir                 Work directory to use\n",
+		"  --dir                 Work directory to use\n"
+		"  --no-role-passwords   Do not dump passwords for roles\n",
 		cli_copy_db_getopts,
 		cli_copy_roles);
 
@@ -112,7 +89,8 @@ static CommandLine copy_extensions_command =
 		" --source ... --target ... ",
 		"  --source              Postgres URI to the source database\n"
 		"  --target              Postgres URI to the target database\n"
-		"  --dir                 Work directory to use\n",
+		"  --dir                 Work directory to use\n"
+		"  --requirements        List extensions requirements\n",
 		cli_copy_db_getopts,
 		cli_copy_extensions);
 
@@ -159,16 +137,17 @@ static CommandLine copy_table_data_command =
 static CommandLine copy_blobs_command =
 	make_command(
 		"blobs",
-		"Copy the blob data from ther source database to the target",
+		"Copy the blob data from the source database to the target",
 		" --source ... --target ... [ --table-jobs ... --index-jobs ... ] ",
-		"  --source          Postgres URI to the source database\n"
-		"  --target          Postgres URI to the target database\n"
-		"  --dir             Work directory to use\n"
-		"  --drop-if-exists  On the target database, drop and create large objects\n"
-		"  --restart         Allow restarting when temp files exist already\n"
-		"  --resume          Allow resuming operations after a failure\n"
-		"  --not-consistent  Allow taking a new snapshot on the source database\n"
-		"  --snapshot        Use snapshot obtained with pg_export_snapshot\n",
+		"  --source             Postgres URI to the source database\n"
+		"  --target             Postgres URI to the target database\n"
+		"  --dir                Work directory to use\n"
+		"  --large-objects-jobs Number of concurrent Large Objects jobs to run\n"
+		"  --drop-if-exists     On the target database, drop and create large objects\n"
+		"  --restart            Allow restarting when temp files exist already\n"
+		"  --resume             Allow resuming operations after a failure\n"
+		"  --not-consistent     Allow taking a new snapshot on the source database\n"
+		"  --snapshot           Use snapshot obtained with pg_export_snapshot\n",
 		cli_copy_db_getopts,
 		cli_copy_blobs);
 
@@ -611,6 +590,9 @@ cli_copy_blobs(int argc, char **argv)
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_BLOBS);
 
+	/* ensure defaults */
+	copySpecs.skipLargeObjects = false;
+
 	Summary summary = { 0 };
 	TopLevelTimings *timings = &(summary.timings);
 
@@ -629,7 +611,13 @@ cli_copy_blobs(int argc, char **argv)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!copydb_copy_blobs(&copySpecs))
+	if (!copydb_start_blob_process(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_wait_for_subprocesses(copySpecs.failFast))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -660,9 +648,9 @@ cli_copy_roles(int argc, char **argv)
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_SCHEMA);
 
 	if (!pg_copy_roles(&(copySpecs.pgPaths),
-					   copySpecs.source_pguri,
-					   copySpecs.target_pguri,
-					   copySpecs.dumpPaths.rolesFilename))
+					   &(copySpecs.connStrings),
+					   copySpecs.dumpPaths.rolesFilename,
+					   copySpecs.noRolesPasswords))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_TARGET);

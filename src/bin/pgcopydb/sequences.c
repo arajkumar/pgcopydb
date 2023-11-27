@@ -28,13 +28,15 @@
 bool
 copydb_prepare_sequence_specs(CopyDataSpec *specs, PGSQL *pgsql)
 {
-	SourceSequenceArray *sequenceArray = &(specs->sequenceArray);
+	SourceSequenceArray *sequenceArray = &(specs->catalog.sequenceArray);
 
 	if (!schema_list_sequences(pgsql, &(specs->filters), sequenceArray))
 	{
 		/* errors have already been logged */
 		return false;
 	}
+
+	SourceSequence *sourceSeqHashByOid = NULL;
 
 	log_info("Fetching information for %d sequences", sequenceArray->count);
 
@@ -44,20 +46,49 @@ copydb_prepare_sequence_specs(CopyDataSpec *specs, PGSQL *pgsql)
 	{
 		SourceSequence *seq = &(sequenceArray->array[seqIndex]);
 
-		char qname[BUFSIZE] = { 0 };
+		/* add the current sequence to the sequence Hash-by-OID */
+		HASH_ADD(hh, sourceSeqHashByOid, oid, sizeof(uint32_t), seq);
 
-		sformat(qname, sizeof(qname), "\"%s\".\"%s\"",
-				seq->nspname,
-				seq->relname);
+		/*
+		 * In case of "permission denied" for SELECT on the sequence object, we
+		 * would then have a broken transaction and all the rest of the loop
+		 * would get the following:
+		 *
+		 * ERROR: current transaction is aborted, commands ignored
+		 * until end of transaction block
+		 *
+		 * To avoid that, for each sequence we first see if we're granted the
+		 * SELECT privilege.
+		 */
+		bool granted = false;
+
+		if (!pgsql_has_sequence_privilege(pgsql, seq->qname, "select", &granted))
+		{
+			/* errors have been logged */
+			++errors;
+			break;
+		}
+
+		if (!granted)
+		{
+			log_error("Failed to SELECT values for sequence %s: "
+					  "permission denied",
+					  seq->qname);
+			++errors;
+			continue;
+		}
 
 		if (!schema_get_sequence_value(pgsql, seq))
 		{
 			/* just skip this one */
-			log_warn("Failed to get sequence values for %s", qname);
+			log_warn("Failed to get sequence values for %s", seq->qname);
 			++errors;
 			continue;
 		}
 	}
+
+	/* now attach the final hash table head to the specs */
+	specs->catalog.sourceSeqHashByOid = sourceSeqHashByOid;
 
 	return errors == 0;
 }
@@ -92,6 +123,8 @@ copydb_start_seq_process(CopyDataSpec *specs)
 		case 0:
 		{
 			/* child process runs the command */
+			(void) set_ps_title("pgcopydb: copy sequences");
+
 			if (!copydb_copy_all_sequences(specs))
 			{
 				/* errors have already been logged */
@@ -140,7 +173,7 @@ copydb_copy_all_sequences(CopyDataSpec *specs)
 
 	PGSQL dst = { 0 };
 
-	if (!pgsql_init(&dst, specs->target_pguri, PGSQL_CONN_TARGET))
+	if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
 		return false;
@@ -154,7 +187,7 @@ copydb_copy_all_sequences(CopyDataSpec *specs)
 
 	int errors = 0;
 
-	SourceSequenceArray *sequenceArray = &(specs->sequenceArray);
+	SourceSequenceArray *sequenceArray = &(specs->catalog.sequenceArray);
 
 	for (int seqIndex = 0; seqIndex < sequenceArray->count; seqIndex++)
 	{
@@ -162,16 +195,40 @@ copydb_copy_all_sequences(CopyDataSpec *specs)
 
 		char qname[BUFSIZE] = { 0 };
 
-		sformat(qname, sizeof(qname), "\"%s\".\"%s\"",
+		sformat(qname, sizeof(qname), "%s.%s",
 				seq->nspname,
 				seq->relname);
 
+		if (!pgsql_savepoint(&dst, "sequences"))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		if (!schema_set_sequence_value(&dst, seq))
 		{
-			/* just skip this one */
-			log_warn("Failed to set sequence values for %s", qname);
+			log_error("Failed to set sequence values for %s", qname);
+
+			if (specs->failFast)
+			{
+				(void) pgsql_commit(&dst);
+				return false;
+			}
+
+			if (!pgsql_rollback_to_savepoint(&dst, "sequences"))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
 			++errors;
 			continue;
+		}
+
+		if (!pgsql_release_savepoint(&dst, "sequences"))
+		{
+			/* errors have already been logged */
+			return false;
 		}
 	}
 

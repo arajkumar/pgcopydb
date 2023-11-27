@@ -12,7 +12,6 @@
 
 extern char pgcopydb_argv0[];
 extern char pgcopydb_program[];
-extern int pgconnect_timeout;
 extern int logLevel;
 
 extern Semaphore log_semaphore;
@@ -43,24 +42,28 @@ extern CommandLine fork_command;
 extern CommandLine follow_command;
 extern CommandLine copy_commands;
 
-/* cli_create.c */
+/* cli_snapshot.c */
 extern CommandLine create_snapshot_command;
-extern CommandLine create_commands;
-extern CommandLine drop_commands;
 
-/* cli_dump.h */
+/* cli_dump.c */
 extern CommandLine dump_commands;
 
-/* cli_restore.h */
+/* cli_ping.c */
+extern CommandLine ping_command;
+
+/* cli_restore.c */
 extern CommandLine restore_commands;
 
-/* cli_list.h */
+/* cli_list.c */
 extern CommandLine list_commands;
 
-/* cli_stream.h */
+/* cli_stream.c */
 extern CommandLine stream_commands;
 
-/* cli_sentinel.h */
+/* cli_sentinel.c */
 extern CommandLine sentinel_commands;
+
+/* cli_compare.c */
+extern CommandLine compare_commands;
 
 #endif  /* CLI_ROOT_H */

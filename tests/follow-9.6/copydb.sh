@@ -10,13 +10,8 @@ set -e
 #  - PGCOPYDB_TABLE_JOBS
 #  - PGCOPYDB_INDEX_JOBS
 
-
-#
-# pgcopydb list tables include a retry loop, so we use that as a proxy to
-# depend on the source/target Postgres images to be ready
-#
-pgcopydb list tables --source ${PGCOPYDB_SOURCE_PGURI}
-pgcopydb list tables --source ${PGCOPYDB_TARGET_PGURI}
+# make sure source and target databases are ready
+pgcopydb ping
 
 #
 # Hack the pagila schema to make it compatible with Postgres 9.6. Remove:

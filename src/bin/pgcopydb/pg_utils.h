@@ -26,15 +26,36 @@
 
 
 /*
+ * We use format('%I') to grab identifier names, so we need to account for the
+ * quotes around the names (2 more bytes) and also the quotes within the names
+ * are going to be doubled, in the worst case that's twice the size + 2.
+ */
+#define PG_NAMEDATALEN (NAMEDATALEN * 2 + 2)
+
+/* the pg_restore -l output uses "schema name owner" */
+#define RESTORE_LIST_NAMEDATALEN (3 * PG_NAMEDATALEN + 3)
+
+/* Fully Qualified Postgres name: "nspname"."relname" */
+#define PG_NAMEDATALEN_FQ (PG_NAMEDATALEN * 2 + 1)
+
+
+/*
  * OID values from PostgreSQL src/include/catalog/pg_type.h
  */
 #define BOOLOID 16
+#define BYTEAOID 17
 #define NAMEOID 19
 #define INT4OID 23
 #define INT8OID 20
 #define TEXTOID 25
+#define OIDOID 26
 #define LSNOID 3220
 #define TIMESTAMPTZOID 1184
+
+/*
+ * Catalog OID values from PostgreSQL src/include/catalog/pg_namespace.h
+ */
+#define PG_NAMESPACE_OID 2615
 
 /*
  * Error codes that we use internally.
@@ -55,6 +76,12 @@
 #endif
 #define LSN_FORMAT_ARGS(lsn) ((uint32) ((lsn) >> 32)), ((uint32) (lsn))
 
+/*
+ *  PQ_QUERY_PARAM_MAX_LIMIT is not available in PostgreSQL < 14.
+ */
+#ifndef PQ_QUERY_PARAM_MAX_LIMIT
+#define PQ_QUERY_PARAM_MAX_LIMIT 65535
+#endif
 
 /*
  * pg_stat_replication.sync_state is one if:

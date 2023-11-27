@@ -32,7 +32,8 @@ typedef struct CopyTableSummary
 	uint64_t durationMs;        /* instr_time duration in milliseconds */
 	instr_time startTimeInstr;  /* internal instr_time tracker */
 	instr_time durationInstr;   /* internal instr_time tracker */
-	char command[BUFSIZE];      /* SQL command */
+	uint64_t bytesTransmitted;  /* total number of bytes copied */
+	char *command;              /* malloc'ed area */
 } CopyTableSummary;
 
 
@@ -47,7 +48,7 @@ typedef struct CopyIndexSummary
 	uint64_t durationMs;        /* instr_time duration in milliseconds */
 	instr_time startTimeInstr;  /* internal instr_time tracker */
 	instr_time durationInstr;   /* internal instr_time tracker */
-	char command[BUFSIZE];      /* SQL command */
+	char *command;              /* malloc'ed area */
 } CopyIndexSummary;
 
 
@@ -56,8 +57,10 @@ typedef struct CopyIndexSummary
 typedef struct CopyBlobsSummary
 {
 	pid_t pid;
-	uint32_t count;
+	uint64_t count;
 	uint64_t durationMs;
+	uint64_t startTime;
+	uint64_t doneTime;
 } CopyBlobsSummary;
 
 
@@ -72,6 +75,7 @@ typedef struct SummaryTableHeaders
 	int maxNspnameSize;
 	int maxRelnameSize;
 	int maxTableMsSize;
+	int maxBytesSize;
 	int maxIndexCountSize;
 	int maxIndexMsSize;
 
@@ -79,6 +83,7 @@ typedef struct SummaryTableHeaders
 	char nspnameSeparator[NAMEDATALEN];
 	char relnameSeparator[NAMEDATALEN];
 	char tableMsSeparator[NAMEDATALEN];
+	char bytesSeparator[NAMEDATALEN];
 	char indexCountSeparator[NAMEDATALEN];
 	char indexMsSeparator[NAMEDATALEN];
 } SummaryTableHeaders;
@@ -86,21 +91,48 @@ typedef struct SummaryTableHeaders
 /* Durations are printed as "%2dd%02dh" and the like */
 #define INTERVAL_MAXLEN 9
 
+typedef struct SummaryIndexEntry
+{
+	uint32_t oid;
+	char oidStr[INTSTRING_MAX_DIGITS];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+	char *sql;                  /* malloc'ed area */
+	char indexMs[INTERVAL_MAXLEN];
+	uint64_t durationMs;
+} SummaryIndexEntry;
+
+typedef struct SummaryIndexArray
+{
+	int count;
+	SummaryIndexEntry *array;   /* malloc'ed area */
+} SummaryIndexArray;
+
 typedef struct SummaryTableEntry
 {
-	char oid[INTSTRING_MAX_DIGITS];
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	uint32_t oid;
+	char oidStr[INTSTRING_MAX_DIGITS];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	char tableMs[INTERVAL_MAXLEN];
+	uint64_t bytes;
+	char bytesStr[INTSTRING_MAX_DIGITS];
+	char transmitRate[INTSTRING_MAX_DIGITS];
 	char indexCount[INTSTRING_MAX_DIGITS];
 	char indexMs[INTERVAL_MAXLEN];
+	uint64_t durationTableMs;
+	uint64_t durationIndexMs;
+	SummaryIndexArray indexArray;
+	SummaryIndexArray constraintArray;
 } SummaryTableEntry;
 
 typedef struct SummaryTable
 {
 	int count;
 	SummaryTableHeaders headers;
-	SummaryTableEntry *array;   /* malloc'ed area */
+	uint64_t totalBytes;
+	char totalBytesStr[INTSTRING_MAX_DIGITS];
+	SummaryTableEntry *array;   /* calloc'ed area */
 } SummaryTable;
 
 
@@ -140,7 +172,11 @@ typedef struct TopLevelTimings
 	/* allow computing the overhead */
 	uint64_t totalDurationMs;   /* wall clock total duration */
 	uint64_t schemaDurationMs;  /* dump + prepare + finalize duration */
+	uint64_t dumpSchemaDurationMs;
+	uint64_t fetchSchemaDurationMs;
+	uint64_t prepareSchemaDurationMs;
 	uint64_t dataAndIndexesDurationMs;
+	uint64_t finalizeSchemaDurationMs;
 	uint64_t tableDurationMs;   /* sum of COPY (TABLE DATA) durations */
 	uint64_t indexDurationMs;   /* sum of CREATE INDEX durations */
 	uint64_t blobDurationMs;
@@ -154,8 +190,10 @@ typedef struct Summary
 {
 	TopLevelTimings timings;
 	SummaryTable table;
+	int tableJobs;
+	int indexJobs;
+	int lObjectJobs;
 } Summary;
-
 
 bool write_table_summary(CopyTableSummary *summary, char *filename);
 bool read_table_summary(CopyTableSummary *summary, const char *filename);
@@ -189,8 +227,15 @@ bool prepare_index_summary_as_json(CopyIndexSummary *summary,
 								   const char *key);
 
 void summary_prepare_toplevel_durations(Summary *summary);
-void print_toplevel_summary(Summary *summary, int tableJobs, int indexJobs);
+void print_toplevel_summary(Summary *summary);
 void print_summary_table(SummaryTable *summary);
 void prepare_summary_table_headers(SummaryTable *summary);
+
+void print_summary_as_json(Summary *summary, const char *filename);
+
+bool summary_read_index_donefile(SourceIndex *index,
+								 const char *filename,
+								 bool constraint,
+								 SummaryIndexEntry *indexEntry);
 
 #endif /* SUMMARY_H */

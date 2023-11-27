@@ -22,9 +22,6 @@ typedef struct DirectoryState
 	bool schemaPreDataHasBeenRestored;
 	bool schemaPostDataHasBeenRestored;
 
-	bool hookPreCopyIsDone;
-	bool hookPostCopyIsDone;
-
 	bool tableCopyIsDone;
 	bool indexCopyIsDone;
 	bool sequenceCopyIsDone;
@@ -52,25 +49,41 @@ typedef struct CDCPaths
 {
 	char dir[MAXPGPATH];              /* /tmp/pgcopydb/cdc */
 	char originfile[MAXPGPATH];       /* /tmp/pgcopydb/cdc/origin */
+	char slotfile[MAXPGPATH];         /* /tmp/pgcopydb/cdc/slot */
 	char walsegsizefile[MAXPGPATH];   /* /tmp/pgcopydb/cdc/wal_segment_size */
 	char tlifile[MAXPGPATH];          /* /tmp/pgcopydb/cdc/tli */
 	char tlihistfile[MAXPGPATH];      /* /tmp/pgcopydb/cdc/tli.history */
+	char lsntrackingfile[MAXPGPATH];  /* /tmp/pgcopydb/cdc/lsn.json */
 } CDCPaths;
+
+
+/* Compare Paths */
+typedef struct ComparePaths
+{
+	char dir[MAXPGPATH];          /* /tmp/pgcopydb/compare */
+	char sschemafile[MAXPGPATH]; /* /tmp/pgcopydb/compare/source-schema.json */
+	char tschemafile[MAXPGPATH];  /* /tmp/pgcopydb/compare/target-schema.json */
+	char sdatafile[MAXPGPATH];    /* /tmp/pgcopydb/compare/source-data.json */
+	char tdatafile[MAXPGPATH];    /* /tmp/pgcopydb/compare/target-data.json */
+} ComparePaths;
 
 /* maintain all the internal paths we need in one place */
 typedef struct CopyFilePaths
 {
 	char topdir[MAXPGPATH];           /* /tmp/pgcopydb */
 	char pidfile[MAXPGPATH];          /* /tmp/pgcopydb/pgcopydb.pid */
+	char spidfile[MAXPGPATH];         /* /tmp/pgcopydb/pgcopydb.service.pid */
 	char snfile[MAXPGPATH];           /* /tmp/pgcopydb/snapshot */
 	char schemadir[MAXPGPATH];        /* /tmp/pgcopydb/schema */
 	char schemafile[MAXPGPATH];       /* /tmp/pgcopydb/schema.json */
+	char summaryfile[MAXPGPATH];      /* /tmp/pgcopydb/summary.json */
 	char rundir[MAXPGPATH];           /* /tmp/pgcopydb/run */
 	char tbldir[MAXPGPATH];           /* /tmp/pgcopydb/run/tables */
 	char idxdir[MAXPGPATH];           /* /tmp/pgcopydb/run/indexes */
 
 	CDCPaths cdc;
 	CopyDoneFilePaths done;
+	ComparePaths compare;
 } CopyFilePaths;
 
 
@@ -81,10 +94,12 @@ typedef struct DumpPaths
 	char extnspFilename[MAXPGPATH];  /* pg_dump --schema-only -n ... */
 
 	char preFilename[MAXPGPATH];     /* pg_dump --section=pre-data */
-	char preListFilename[MAXPGPATH]; /* pg_restore --list */
+	char preListOutFilename[MAXPGPATH]; /* pg_restore --list */
+	char preListFilename[MAXPGPATH]; /* pg_restore --use-list */
 
 	char postFilename[MAXPGPATH];     /* pg_dump --section=post-data */
-	char postListFilename[MAXPGPATH]; /* pg_restore --list */
+	char postListOutFilename[MAXPGPATH]; /* pg_restore --list */
+	char postListFilename[MAXPGPATH];    /* pg_restore --use-list */
 } DumpPaths;
 
 
@@ -95,11 +110,9 @@ typedef struct TableFilePaths
 	char doneFile[MAXPGPATH];    /* table done file (summary) */
 	char idxListFile[MAXPGPATH]; /* index oids list file */
 
-	char truncateDoneFile[MAXPGPATH];     /* table truncate done file */
+	char chksumFile[MAXPGPATH]; /* table checksum file */
 
-	/* TS hooks */
-	char hookPreCopyDoneFile[MAXPGPATH];  /* pre-copy hook done file */
-	char hookPostCopyDoneFile[MAXPGPATH]; /* post-copy hook done file */
+	char truncateDoneFile[MAXPGPATH];    /* table truncate done file */
 } TableFilePaths;
 
 

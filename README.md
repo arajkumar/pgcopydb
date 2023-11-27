@@ -2,20 +2,6 @@
 
 [![Documentation Status](https://readthedocs.org/projects/pgcopydb/badge/?version=latest)](https://pgcopydb.readthedocs.io/en/latest/?badge=latest)
 
-# Timescale notes
-
-This is a Timescale-private fork of https://github.com/dimitri/pgcopydb
-
-### Testing database imports into Timescale Cloud, and so far the changes are:
-
-- Added pre-and-post table copy hooks for the 'clone' command, with the --hook-pre-copy and --hook-post-copy
-  flags to the clone command to enable the hooks. Hooks will be executed with the arguments:
-
-  ```hook-script [pre-copy|post-copy] [source URI] [target URI] [schema.table_name] [snapshot]```
-
-Current limitations to work on:
-- splitting tables for COPY: does not have a unique column of type integer (int2/int4/int8)
-
 ## Introduction
 
 pgcopydb is a tool that automates running `pg_dump | pg_restore` between two
@@ -63,15 +49,21 @@ $ pgcopydb help
     clone     Clone an entire database from source to target
     fork      Clone an entire database from source to target
     follow    Replay changes from the source database to the target database
-    copy-db   Copy an entire database from source to target
-    snapshot  Create and exports a snapshot on the source database
+    copy-db   Clone an entire database from source to target
+    snapshot  Create and export a snapshot on the source database
+  + compare   Compare source and target databases
   + copy      Implement the data section of the database copy
   + dump      Dump database objects from a Postgres instance
   + restore   Restore database objects into a Postgres instance
   + list      List database objects from a Postgres instance
   + stream    Stream changes from the source database
-    help      print help message
-    version   print pgcopydb version
+    ping      Attempt to connect to the source and target instances
+    help      Print help message
+    version   Print pgcopydb version
+
+  pgcopydb compare
+    schema  Compare source and target schema
+    data    Compare source and target data
 
   pgcopydb copy
     db           Copy an entire database from source to target
@@ -80,7 +72,7 @@ $ pgcopydb help
     schema       Copy the database schema from source to target
     data         Copy the data section from source to target
     table-data   Copy the data from all tables in database from source to target
-    blobs        Copy the blob data from ther source database to the target
+    blobs        Copy the blob data from the source database to the target
     sequences    Copy the current value from all sequences in database from source to target
     indexes      Create all the indexes found in the source database in the target
     constraints  Create all the constraints found in the source database in the target
@@ -89,7 +81,7 @@ $ pgcopydb help
     schema     Dump source database schema as custom files in work directory
     pre-data   Dump source database pre-data schema as custom files in work directory
     post-data  Dump source database post-data schema as custom files in work directory
-    roles      Dump source database roles as custome file in work directory
+    roles      Dump source database roles as custom file in work directory
 
   pgcopydb restore
     schema      Restore a database schema from custom files to target database
@@ -99,7 +91,9 @@ $ pgcopydb help
     parse-list  Parse pg_restore --list output from custom file
 
   pgcopydb list
+    databases    List databases
     extensions   List all the source extensions to copy
+    collations   List all the source collations to copy
     tables       List all the source tables to copy data from
     table-parts  List a source table copy partitions
     sequences    List all the source sequences to copy data from
@@ -110,23 +104,14 @@ $ pgcopydb help
 
   pgcopydb stream
     setup      Setup source and target systems for logical decoding
-    cleanup    cleanup source and target systems for logical decoding
+    cleanup    Cleanup source and target systems for logical decoding
     prefetch   Stream JSON changes from the source database and transform them to SQL
     catchup    Apply prefetched changes from SQL files to the target database
-  + create     Create resources needed for pgcopydb
-  + drop       Drop resources needed for pgcopydb
+    replay     Replay changes from the source to the target database, live
   + sentinel   Maintain a sentinel table on the source database
     receive    Stream changes from the source database
     transform  Transform changes from the source database into SQL commands
     apply      Apply changes from the source database into the target database
-
-  pgcopydb stream create
-    slot    Create a replication slot in the source database
-    origin  Create a replication origin in the target database
-
-  pgcopydb stream drop
-    slot    Drop a replication slot in the source database
-    origin  Drop a replication origin in the target database
 
   pgcopydb stream sentinel
     create  Create the sentinel table on the source database
@@ -218,7 +203,7 @@ Several distributions are available for pgcopydb:
      version currently in debian stable.
 
 	 ```
-	 $ docker run --rm -it dimitri/pgcopydb:v0.10 pgcopydb --version
+	 $ docker run --rm -it dimitri/pgcopydb:v0.14 pgcopydb --version
 	 ```
 
 	 Or you can use the CI/CD integration that publishes packages from the

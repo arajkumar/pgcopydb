@@ -71,9 +71,10 @@ static CommandLine dump_roles_command =
 		"roles",
 		"Dump source database roles as custome file in work directory",
 		" --source <URI>",
-		"  --source          Postgres URI to the source database\n"
-		"  --target          Directory where to save the dump files\n"
-		"  --dir             Work directory to use\n",
+		"  --source            Postgres URI to the source database\n"
+		"  --target            Directory where to save the dump files\n"
+		"  --dir               Work directory to use\n"
+		"  --no-role-passwords Do not dump passwords for roles\n",
 		cli_dump_schema_getopts,
 		cli_dump_roles);
 
@@ -105,12 +106,14 @@ cli_dump_schema_getopts(int argc, char **argv)
 		{ "source", required_argument, NULL, 'S' },
 		{ "target", required_argument, NULL, 'T' },
 		{ "dir", required_argument, NULL, 'D' },
+		{ "no-role-passwords", no_argument, NULL, 'P' },
 		{ "restart", no_argument, NULL, 'r' },
 		{ "resume", no_argument, NULL, 'R' },
 		{ "not-consistent", no_argument, NULL, 'C' },
 		{ "snapshot", required_argument, NULL, 'N' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
@@ -127,7 +130,7 @@ cli_dump_schema_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:Vvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:D:PrRCNVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -140,8 +143,8 @@ cli_dump_schema_getopts(int argc, char **argv)
 							  "see above for details.");
 					exit(EXIT_CODE_BAD_ARGS);
 				}
-				strlcpy(options.source_pguri, optarg, MAXCONNINFO);
-				log_trace("--source %s", options.source_pguri);
+				options.connStrings.source_pguri = pg_strdup(optarg);
+				log_trace("--source %s", options.connStrings.source_pguri);
 				break;
 			}
 
@@ -153,8 +156,8 @@ cli_dump_schema_getopts(int argc, char **argv)
 							  "see above for details.");
 					exit(EXIT_CODE_BAD_ARGS);
 				}
-				strlcpy(options.target_pguri, optarg, MAXCONNINFO);
-				log_trace("--target %s", options.target_pguri);
+				options.connStrings.target_pguri = pg_strdup(optarg);
+				log_trace("--target %s", options.connStrings.target_pguri);
 				break;
 			}
 
@@ -162,6 +165,13 @@ cli_dump_schema_getopts(int argc, char **argv)
 			{
 				strlcpy(options.dir, optarg, MAXPGPATH);
 				log_trace("--dir %s", options.dir);
+				break;
+			}
+
+			case 'P':
+			{
+				options.noRolesPasswords = true;
+				log_trace("--no-role-passwords");
 				break;
 			}
 
@@ -213,6 +223,12 @@ cli_dump_schema_getopts(int argc, char **argv)
 
 					case 2:
 					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
 					}
@@ -228,14 +244,14 @@ cli_dump_schema_getopts(int argc, char **argv)
 
 			case 'd':
 			{
-				verboseCount = 2;
+				verboseCount = 3;
 				log_set_level(LOG_DEBUG);
 				break;
 			}
 
 			case 'z':
 			{
-				verboseCount = 3;
+				verboseCount = 4;
 				log_set_level(LOG_TRACE);
 				break;
 			}
@@ -247,6 +263,7 @@ cli_dump_schema_getopts(int argc, char **argv)
 			}
 
 			case 'h':
+			case '?':
 			{
 				commandline_help(stderr);
 				exit(EXIT_CODE_QUIT);
@@ -255,7 +272,7 @@ cli_dump_schema_getopts(int argc, char **argv)
 		}
 	}
 
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri))
+	if (options.connStrings.source_pguri == NULL)
 	{
 		log_fatal("Option --source is mandatory");
 		++errors;
@@ -339,47 +356,35 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 		? NULL
 		: dumpDBoptions->dir;
 
+	bool createWorkDir = true;
+
 	if (!copydb_init_workdir(&copySpecs,
 							 dir,
+							 false, /* service */
+							 NULL,  /* serviceName */
 							 dumpDBoptions->restart,
 							 dumpDBoptions->resume,
-							 false))
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	RestoreOptions restoreOptions = { 0 };
-
-	if (!copydb_init_specs(&copySpecs,
-						   dumpDBoptions->source_pguri,
-						   NULL, /* target_pguri */
-						   1,    /* table jobs */
-						   1,    /* index jobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_NONE,
-						   dumpDBoptions->snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   dumpDBoptions->restart,
-						   dumpDBoptions->resume,
-						   !dumpDBoptions->notConsistent))
+	if (!copydb_init_specs(&copySpecs, dumpDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	char scrubbedSourceURI[MAXCONNINFO] = { 0 };
+	ConnStrings *dsn = &(copySpecs.connStrings);
 
-	(void) parse_and_scrub_connection_string(copySpecs.source_pguri,
-											 scrubbedSourceURI);
+	if (!cli_prepare_pguris(dsn))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 
-	log_info("Dumping database from \"%s\"", scrubbedSourceURI);
+	log_info("Dumping database from \"%s\"", dsn->safeSourcePGURI.pguri);
 	log_info("Dumping database into directory \"%s\"", cfPaths->topdir);
 
 	if (section == PG_DUMP_SECTION_ROLES)
@@ -409,8 +414,9 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 	if (section == PG_DUMP_SECTION_ROLES)
 	{
 		if (!pg_dumpall_roles(&(copySpecs.pgPaths),
-							  copySpecs.source_pguri,
-							  copySpecs.dumpPaths.rolesFilename))
+							  &(copySpecs.connStrings),
+							  copySpecs.dumpPaths.rolesFilename,
+							  copySpecs.noRolesPasswords))
 		{
 			/* errors have already been logged */
 			exit(EXIT_CODE_INTERNAL_ERROR);

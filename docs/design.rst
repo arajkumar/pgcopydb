@@ -53,7 +53,7 @@ sub-processes that each handle a part of the work.
 
 The process tree then looks like the following:
 
- * pgcopydb clone --follow --table-jobs 4 --index-jobs 4
+ * pgcopydb clone --follow --table-jobs 4 --index-jobs 4 --large-objects-jobs 4
 
    * pgcopydb clone worker
 
@@ -67,7 +67,15 @@ The process tree then looks like the following:
 
        #. pgcopydb copy worker
 
-     * pgcopydb blob worker
+     * pgcopydb blob metadata worker (``--large-objects-jobs 4``)
+
+       #. pgcopydb blob data worker
+
+       #. pgcopydb blob data worker
+
+       #. pgcopydb blob data worker
+
+       #. pgcopydb blob data worker
 
      1. pgcopydb index/constraints worker (``--index-jobs 4``)
 
@@ -96,22 +104,23 @@ The process tree then looks like the following:
      * pgcopydb stream catchup
 
 We see that when using ``pgcopydb clone --follow --table-jobs 4 --index-jobs
-4`` then pgcopydb creates 20 sub-processes, including one transient
-sub-process each time a JSON file is to be converted to a SQL file for
-replay.
+4 --large-objects-jobs 4`` then pgcopydb creates 24 sub-processes, including
+one transient sub-process each time a JSON file is to be converted to a SQL
+file for replay.
 
-The 20 total is counted from:
+The 24 total is counted from:
 
- - 1 clone worker + 1 copy supervisor + 4 copy workers + 1 blob worker + 4
-   index workers + 4 vacuum workers + 1 sequence reset worker
+ - 1 clone worker + 1 copy supervisor + 4 copy workers + 1 blob metadata worker
+   + 4 blob data workers + 4 index workers + 4 vacuum workers + 1 sequence reset
+   worker
 
-   that's 1 + 1 + 4 + 1 + 4 + 4 + 1 = 16
+   that's 1 + 1 + 4 + 1 + 4 + 4 + 4 + 1 = 20
 
  - 1 follow worker + 1 stream receive + 1 stream transform + 1 stream catchup
 
    that's 1 + 1 + 1 + 1 = 4
 
- - that's 16 + 4 = 20 total
+ - that's 20 + 4 = 24 total
 
 Here is a description of the process tree:
 
@@ -120,7 +129,9 @@ Here is a description of the process tree:
    option (or the environment variable ``PGCOPYDB_TABLE_JOBS``).
 
  * A single sub-process is created by pgcopydb to copy the Postgres Large
-   Objects (BLOBs) found on the source database to the target database.
+   Objects (BLOBs) metadata found on the source database to the target
+   database, and as many as ``--large-objects-jobs`` processes are started
+   to copy the large object data.
 
  * To drive the index and constraint build on the target database, pgcopydb
    creates as many sub-processes as specified by the ``--index-jobs``
@@ -251,6 +262,25 @@ partitionned (on the fly) and split between processes:
     with a UNIQUE or PRIMARY KEY constraint. We must make sure that any
     given row is selected only once overall to avoid introducing duplicates
     on the target database.
+
+    When a table is missing such a primary key column of an integer data
+    type, pgcopydb then automatically resorts to using CTID based
+    comparisons. See `Postgres documentation section about System Columns`__
+    for more information about Postgres CTIDs.
+
+    __ https://www.postgresql.org/docs/current/ddl-system-columns.html
+
+    The COPY processes then use the SELECT queries like in the following
+    example:
+
+    ::
+
+       COPY (SELECT * FROM source.table WHERE ctid >= '(0,0)'::tid and ctid < '(5925,0)'::tid)
+       COPY (SELECT * FROM source.table WHERE ctid >= '(5925,0)'::tid and ctid < '(11850,0)'::tid)
+       COPY (SELECT * FROM source.table WHERE ctid >= '(11850,0)'::tid and ctid < '(17775,0)'::tid)
+       COPY (SELECT * FROM source.table WHERE ctid >= '(17775,0)'::tid and ctid < '(23698,0)'::tid)
+       COPY (SELECT * FROM source.table WHERE ctid >= '(23698,0)'::tid)
+
 
   - To decide if a table COPY processing should be split, the command line
     option ``split-tables-larger-than`` is used, or the environment variable

@@ -46,7 +46,7 @@
 /*
  * Chunk size for reading and writting large objects
  */
-#define LOBBUFSIZE 16384
+#define LOBBUFSIZE 16 * 1024 * 1024 /* 16 MB */
 
 
 /*
@@ -155,8 +155,9 @@ typedef enum
 /*
  * That's "x.yy.zz" or "xx.zz" or maybe a debian style version string such as:
  *  "13.8 (Debian 13.8-1.pgdg110+1)"
+ *  "16beta1 (Debian 16~beta1-2.pgdg+~20230605.2256.g3f1aaaa)"
  */
-#define PG_VERSION_STRING_MAX_LENGTH 45
+#define PG_VERSION_STRING_MAX_LENGTH 128
 
 /* notification processing */
 typedef bool (*ProcessNotificationFunction)(int notificationGroupId,
@@ -167,7 +168,10 @@ typedef struct PGSQL
 {
 	ConnectionType connectionType;
 	ConnectionStatementType connectionStatementType;
-	char connectionString[MAXCONNINFO];
+
+	char *connectionString;
+	SafeURI safeURI;
+
 	PGconn *connection;
 	ConnectionRetryPolicy retryPolicy;
 	PGConnStatus status;
@@ -180,6 +184,8 @@ typedef struct PGSQL
 	int notificationGroupId;
 	int64_t notificationNodeId;
 	bool notificationReceived;
+
+	bool logSQL;
 } PGSQL;
 
 
@@ -229,7 +235,6 @@ typedef struct GUC
 	char *value;
 } GUC;
 
-
 bool pgsql_init(PGSQL *pgsql, char *url, ConnectionType connectionType);
 
 void pgsql_set_retry_policy(ConnectionRetryPolicy *retryPolicy,
@@ -237,7 +242,6 @@ void pgsql_set_retry_policy(ConnectionRetryPolicy *retryPolicy,
 							int maxR,
 							int maxSleepTime,
 							int baseSleepTime);
-void pgsql_set_main_loop_retry_policy(ConnectionRetryPolicy *retryPolicy);
 void pgsql_set_interactive_retry_policy(ConnectionRetryPolicy *retryPolicy);
 int pgsql_compute_connection_retry_sleep_time(ConnectionRetryPolicy *retryPolicy);
 bool pgsql_retry_policy_expired(ConnectionRetryPolicy *retryPolicy);
@@ -251,26 +255,64 @@ void fetchedRows(void *ctx, PGresult *result);
 bool pgsql_begin(PGSQL *pgsql);
 bool pgsql_commit(PGSQL *pgsql);
 bool pgsql_rollback(PGSQL *pgsql);
+bool pgsql_savepoint(PGSQL *pgsql, char *name);
+bool pgsql_release_savepoint(PGSQL *pgsql, char *name);
+bool pgsql_rollback_to_savepoint(PGSQL *pgsql, char *name);
+
 bool pgsql_server_version(PGSQL *pgsql);
+
 bool pgsql_set_transaction(PGSQL *pgsql,
-						   IsolationLevel level, bool readOnly, bool deferrable);
+						   IsolationLevel level,
+						   bool readOnly,
+						   bool deferrable);
+
+bool pgsql_is_in_recovery(PGSQL *pgsql, bool *is_in_recovery);
+
+bool pgsql_has_database_privilege(PGSQL *pgsql, const char *privilege,
+								  bool *granted);
+
+bool pgsql_has_sequence_privilege(PGSQL *pgsql,
+								  const char *seqname,
+								  const char *privilege,
+								  bool *granted);
+
+bool pgsql_get_search_path(PGSQL *pgsql, char *search_path, size_t size);
+bool pgsql_set_search_path(PGSQL *pgsql, char *search_path, bool local);
+bool pgsql_prepend_search_path(PGSQL *pgsql, const char *namespace);
+
 bool pgsql_export_snapshot(PGSQL *pgsql, char *snapshot, size_t size);
 bool pgsql_set_snapshot(PGSQL *pgsql, char *snapshot);
+
 bool pgsql_execute(PGSQL *pgsql, const char *sql);
 bool pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 							   const Oid *paramTypes, const char **paramValues,
 							   void *parseContext, ParsePostgresResultCB *parseFun);
 
+bool pgsql_send_with_params(PGSQL *pgsql, const char *sql, int paramCount,
+							const Oid *paramTypes, const char **paramValues);
+
+bool pgsql_fetch_results(PGSQL *pgsql, bool *done,
+						 void *context, ParsePostgresResultCB *parseFun);
+
+bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
+				   int paramCount, const Oid *paramTypes);
+
+bool pgsql_enter_pipeline_mode(PGSQL *pgsql);
+bool pgsql_exit_pipeline_mode(PGSQL *pgsql);
+
+bool pgsql_execute_prepared(PGSQL *pgsql, const char *name,
+							int paramCount, const char **paramValues,
+							void *context, ParsePostgresResultCB *parseFun);
+
 void pgAutoCtlDebugNoticeProcessor(void *arg, const char *message);
 
-bool hostname_from_uri(const char *pguri,
-					   char *hostname, int maxHostLength, int *port);
 bool validate_connection_string(const char *connectionString);
 
 bool pgsql_truncate(PGSQL *pgsql, const char *qname);
 
 bool pg_copy(PGSQL *src, PGSQL *dst,
-			 const char *srcQname, const char *dstQname, bool truncate);
+			 const char *srcQname, const char *dstQname,
+			 bool truncate, uint64_t *bytesTransmitted);
 
 bool pg_copy_from_stdin(PGSQL *pgsql, const char *qname);
 bool pg_copy_row_from_stdin(PGSQL *pgsql, char *fmt, ...);
@@ -282,8 +324,10 @@ bool pgsql_get_sequence(PGSQL *pgsql, const char *nspname, const char *relname,
 
 bool pgsql_set_gucs(PGSQL *pgsql, GUC *settings);
 
-bool pg_copy_large_objects(PGSQL *src, PGSQL *dst,
-						   bool dropIfExists, uint32_t *count);
+bool pg_copy_large_object(PGSQL *src,
+						  PGSQL *dst,
+						  bool dropIfExists,
+						  uint32_t oid);
 
 /*
  * Maximum length of serialized pg_lsn value
@@ -347,6 +391,13 @@ bool parseTimeLineHistory(const char *filename, const char *content,
 /*
  * Logical Decoding support.
  */
+typedef enum
+{
+	STREAM_PLUGIN_UNKNOWN = 0,
+	STREAM_PLUGIN_TEST_DECODING,
+	STREAM_PLUGIN_WAL2JSON
+} StreamOutputPlugin;
+
 typedef struct LogicalTrackLSN
 {
 	XLogRecPtr written_lsn;
@@ -362,13 +413,18 @@ typedef struct LogicalStreamContext
 	XLogRecPtr cur_record_lsn;
 	int timeline;
 	uint32_t WalSegSz;
-	const char *buffer;
+
+	const char *buffer;         /* expose internal buffer */
+	StreamOutputPlugin plugin;
+
+	bool forceFeedback;
 
 	TimestampTz now;
 	TimestampTz lastFeedbackSync;
+	TimestampTz sendTime;
 	XLogRecPtr endpos;          /* might be update at runtime */
 
-	LogicalTrackLSN *tracking;
+	LogicalTrackLSN *tracking;  /* expose LogicalStreamClient.current */
 } LogicalStreamContext;
 
 
@@ -380,7 +436,10 @@ typedef struct LogicalStreamClient
 	IdentifySystem system;
 
 	char slotName[NAMEDATALEN];
+
+	StreamOutputPlugin plugin;
 	KeyVal pluginOptions;
+
 	uint32_t WalSegSz;
 
 	XLogRecPtr startpos;
@@ -397,6 +456,7 @@ typedef struct LogicalStreamClient
 	LogicalStreamReceiver flushFunction;
 	LogicalStreamReceiver closeFunction;
 	LogicalStreamReceiver feedbackFunction;
+	LogicalStreamReceiver keepaliveFunction;
 
 	int fsync_interval;
 	int standby_message_timeout;
@@ -405,14 +465,27 @@ typedef struct LogicalStreamClient
 
 bool pgsql_init_stream(LogicalStreamClient *client,
 					   const char *pguri,
+					   StreamOutputPlugin plugin,
 					   const char *slotName,
 					   XLogRecPtr startpos,
 					   XLogRecPtr endpos);
 
+StreamOutputPlugin OutputPluginFromString(char *plugin);
+char * OutputPluginToString(StreamOutputPlugin plugin);
+
+typedef struct ReplicationSlot
+{
+	char slotName[BUFSIZE];
+	uint64_t lsn;
+	char snapshot[BUFSIZE];
+	StreamOutputPlugin plugin;
+} ReplicationSlot;
+
 bool pgsql_create_logical_replication_slot(LogicalStreamClient *client,
-										   uint64_t *lsn,
-										   char *snapshot,
-										   size_t size);
+										   ReplicationSlot *slot);
+
+bool pgsql_timestamptz_to_string(TimestampTz ts, char *str, size_t size);
+
 bool pgsql_start_replication(LogicalStreamClient *client);
 bool pgsql_stream_logical(LogicalStreamClient *client,
 						  LogicalStreamContext *context);
@@ -445,13 +518,20 @@ bool pgsql_replication_slot_exists(PGSQL *pgsql,
 
 bool pgsql_create_replication_slot(PGSQL *pgsql,
 								   const char *slotName,
-								   const char *plugin,
+								   StreamOutputPlugin plugin,
 								   uint64_t *lsn);
 
 bool pgsql_drop_replication_slot(PGSQL *pgsql, const char *slotName);
 
 bool pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists);
 
+bool pgsql_table_exists(PGSQL *pgsql,
+						const char *relname,
+						const char *nspname,
+						bool *exists);
+
+bool pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn);
+bool pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn);
 
 /*
  * pgcopydb sentinel is a table that's created on the source database and
@@ -482,5 +562,11 @@ bool pgsql_sync_sentinel_recv(PGSQL *pgsql,
 bool pgsql_sync_sentinel_apply(PGSQL *pgsql,
 							   uint64_t replay_lsn,
 							   CopyDBSentinel *sentinel);
+
+bool pgsql_send_sync_sentinel_apply(PGSQL *pgsql, uint64_t replay_lsn);
+bool pgsql_fetch_sync_sentinel_apply(PGSQL *pgsql,
+									 bool *retry,
+									 CopyDBSentinel *sentinel);
+
 
 #endif /* PGSQL_H */

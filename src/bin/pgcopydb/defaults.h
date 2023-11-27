@@ -9,7 +9,7 @@
 #include "git-version.h"
 
 /* additional version information for printing version on CLI */
-#define PGCOPYDB_VERSION "0.10"
+#define PGCOPYDB_VERSION "0.14"
 
 #ifdef GIT_VERSION
 #define VERSION_STRING GIT_VERSION
@@ -28,35 +28,42 @@
 #define PGCOPYDB_TARGET_PGURI "PGCOPYDB_TARGET_PGURI"
 #define PGCOPYDB_TABLE_JOBS "PGCOPYDB_TABLE_JOBS"
 #define PGCOPYDB_INDEX_JOBS "PGCOPYDB_INDEX_JOBS"
+#define PGCOPYDB_LARGE_OBJECTS_JOBS "PGCOPYDB_LARGE_OBJECTS_JOBS"
 #define PGCOPYDB_SPLIT_TABLES_LARGER_THAN "PGCOPYDB_SPLIT_TABLES_LARGER_THAN"
 #define PGCOPYDB_DROP_IF_EXISTS "PGCOPYDB_DROP_IF_EXISTS"
 #define PGCOPYDB_SNAPSHOT "PGCOPYDB_SNAPSHOT"
+#define PGCOPYDB_OUTPUT_PLUGIN "PGCOPYDB_OUTPUT_PLUGIN"
+#define PGCOPYDB_LOG_TIME_FORMAT "PGCOPYDB_LOG_TIME_FORMAT"
+#define PGCOPYDB_LOG_JSON "PGCOPYDB_LOG_JSON"
+#define PGCOPYDB_LOG_JSON_FILE "PGCOPYDB_LOG_JSON_FILE"
+#define PGCOPYDB_LOG_FILENAME "PGCOPYDB_LOG_FILENAME"
+#define PGCOPYDB_FAIL_FAST "PGCOPYDB_FAIL_FAST"
+#define PGCOPYDB_SKIP_VACUUM "PGCOPYDB_SKIP_VACUUM"
+
 #define PGCOPYDB_PGAPPNAME "pgcopydb"
 
 /* default values for the command line options */
 #define DEFAULT_TABLE_JOBS 4
 #define DEFAULT_INDEX_JOBS 4
+#define DEFAULT_LARGE_OBJECTS_JOBS 4
 #define DEFAULT_SPLIT_TABLES_LARGER_THAN 0 /* no COPY partitioning by default */
 
 #define POSTGRES_CONNECT_TIMEOUT "10"
 
-
-/* retry PQping for a maximum of 15 mins, up to 2 secs between attemps */
-#define POSTGRES_PING_RETRY_TIMEOUT 900               /* seconds */
+/* retry PQping for a maximum of 1 min, up to 2 secs between attemps */
+#define POSTGRES_PING_RETRY_TIMEOUT 60               /* seconds */
 #define POSTGRES_PING_RETRY_CAP_SLEEP_TIME (2 * 1000) /* milliseconds */
 #define POSTGRES_PING_RETRY_BASE_SLEEP_TIME 5         /* milliseconds */
 
 #define POSTGRES_PORT 5432
 
-/* masqurade  passwords with that value in logs */
-#define PASSWORD_MASK "****"
-
 /* default replication slot and origin for logical replication */
 #define REPLICATION_ORIGIN "pgcopydb"
-#define REPLICATION_PLUGIN "wal2json"
+#define REPLICATION_PLUGIN "test_decoding"
 #define REPLICATION_SLOT_NAME "pgcopydb"
 
-#define CATCHINGUP_SLEEP_MS 10 * 1000 /* 10s */
+#define CATCHINGUP_SLEEP_MS 1 * 1000 /* 1s */
+#define STREAM_EMPTY_TX_TIMEOUT 10   /* seconds */
 
 /* internal default for allocating strings  */
 #define BUFSIZE 1024

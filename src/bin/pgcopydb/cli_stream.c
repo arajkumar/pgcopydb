@@ -21,21 +21,26 @@
 #include "log.h"
 #include "pgcmd.h"
 #include "pgsql.h"
+#include "progress.h"
 #include "schema.h"
 #include "signals.h"
 #include "string_utils.h"
+#include "timescale.h"
 
 CopyDBOptions streamDBoptions = { 0 };
 
 static int cli_stream_getopts(int argc, char **argv);
+
 static void cli_stream_receive(int argc, char **argv);
 static void cli_stream_transform(int argc, char **argv);
 static void cli_stream_apply(int argc, char **argv);
 
 static void cli_stream_setup(int argc, char **argv);
 static void cli_stream_cleanup(int argc, char **argv);
+
 static void cli_stream_prefetch(int argc, char **argv);
 static void cli_stream_catchup(int argc, char **argv);
+static void cli_stream_replay(int argc, char **argv);
 
 static void stream_start_in_mode(LogicalStreamMode mode);
 
@@ -51,6 +56,7 @@ static CommandLine stream_setup_command =
 		"  --resume         Allow resuming operations after a failure\n"
 		"  --not-consistent Allow taking a new snapshot on the source database\n"
 		"  --snapshot       Use snapshot obtained with pg_export_snapshot\n"
+		"  --plugin         Output plugin to use (test_decoding, wal2json)\n" \
 		"  --slot-name      Stream changes recorded by this slot\n"
 		"  --origin         Name of the Postgres replication origin\n",
 		cli_stream_getopts,
@@ -63,7 +69,6 @@ static CommandLine stream_cleanup_command =
 		"",
 		"  --source         Postgres URI to the source database\n"
 		"  --target         Postgres URI to the target database\n"
-		"  --dir            Work directory to use\n"
 		"  --restart        Allow restarting when temp files exist already\n"
 		"  --resume         Allow resuming operations after a failure\n"
 		"  --not-consistent Allow taking a new snapshot on the source database\n"
@@ -100,10 +105,27 @@ static CommandLine stream_catchup_command =
 		"  --resume         Allow resuming operations after a failure\n"
 		"  --not-consistent Allow taking a new snapshot on the source database\n"
 		"  --slot-name      Stream changes recorded by this slot\n"
-		"  --endpos         LSN position where to stop receiving changes"
+		"  --endpos         LSN position where to stop receiving changes\n"
 		"  --origin         Name of the Postgres replication origin\n",
 		cli_stream_getopts,
 		cli_stream_catchup);
+
+static CommandLine stream_replay_command =
+	make_command(
+		"replay",
+		"Replay changes from the source to the target database, live",
+		"",
+		"  --source         Postgres URI to the source database\n"
+		"  --target         Postgres URI to the target database\n"
+		"  --dir            Work directory to use\n"
+		"  --restart        Allow restarting when temp files exist already\n"
+		"  --resume         Allow resuming operations after a failure\n"
+		"  --not-consistent Allow taking a new snapshot on the source database\n"
+		"  --slot-name      Stream changes recorded by this slot\n"
+		"  --endpos         LSN position where to stop receiving changes\n"
+		"  --origin         Name of the Postgres replication origin\n",
+		cli_stream_getopts,
+		cli_stream_replay);
 
 static CommandLine stream_receive_command =
 	make_command(
@@ -112,6 +134,7 @@ static CommandLine stream_receive_command =
 		"",
 		"  --source         Postgres URI to the source database\n"
 		"  --dir            Work directory to use\n"
+		"  --to-stdout      Stream logical decoding messages to stdout\n"
 		"  --restart        Allow restarting when temp files exist already\n"
 		"  --resume         Allow resuming operations after a failure\n"
 		"  --not-consistent Allow taking a new snapshot on the source database\n"
@@ -153,8 +176,7 @@ static CommandLine *stream_subcommands[] = {
 	&stream_cleanup_command,
 	&stream_prefetch_command,
 	&stream_catchup_command,
-	&create_commands,
-	&drop_commands,
+	&stream_replay_command,
 	&sentinel_commands,
 	&stream_receive_command,
 	&stream_transform_command,
@@ -175,13 +197,14 @@ static int
 cli_stream_getopts(int argc, char **argv)
 {
 	CopyDBOptions options = { 0 };
-	int c, option_index = 0;
-	int errors = 0, verboseCount = 0;
+	int c, option_index = 0, errors = 0;
+	int verboseCount = 0;
 
 	static struct option long_options[] = {
 		{ "source", required_argument, NULL, 'S' },
 		{ "target", required_argument, NULL, 'T' },
 		{ "dir", required_argument, NULL, 'D' },
+		{ "plugin", required_argument, NULL, 'p' },
 		{ "slot-name", required_argument, NULL, 's' },
 		{ "snapshot", required_argument, NULL, 'N' },
 		{ "origin", required_argument, NULL, 'o' },
@@ -189,8 +212,11 @@ cli_stream_getopts(int argc, char **argv)
 		{ "restart", no_argument, NULL, 'r' },
 		{ "resume", no_argument, NULL, 'R' },
 		{ "not-consistent", no_argument, NULL, 'C' },
+		{ "to-stdout", no_argument, NULL, 'O' },
+		{ "from-stdin", no_argument, NULL, 'I' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
@@ -207,7 +233,7 @@ cli_stream_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:j:s:o:t:PVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:j:p:s:o:t:PVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -218,10 +244,10 @@ cli_stream_getopts(int argc, char **argv)
 				{
 					log_fatal("Failed to parse --source connection string, "
 							  "see above for details.");
-					exit(EXIT_CODE_BAD_ARGS);
+					++errors;
 				}
-				strlcpy(options.source_pguri, optarg, MAXCONNINFO);
-				log_trace("--source %s", options.source_pguri);
+				options.connStrings.source_pguri = pg_strdup(optarg);
+				log_trace("--source %s", options.connStrings.source_pguri);
 				break;
 			}
 
@@ -233,8 +259,8 @@ cli_stream_getopts(int argc, char **argv)
 							  "see above for details.");
 					++errors;
 				}
-				strlcpy(options.target_pguri, optarg, MAXCONNINFO);
-				log_trace("--target %s", options.target_pguri);
+				options.connStrings.target_pguri = pg_strdup(optarg);
+				log_trace("--target %s", options.connStrings.target_pguri);
 				break;
 			}
 
@@ -247,8 +273,16 @@ cli_stream_getopts(int argc, char **argv)
 
 			case 's':
 			{
-				strlcpy(options.slotName, optarg, NAMEDATALEN);
-				log_trace("--slot-name %s", options.slotName);
+				strlcpy(options.slot.slotName, optarg, NAMEDATALEN);
+				log_trace("--slot-name %s", options.slot.slotName);
+				break;
+			}
+
+			case 'p':
+			{
+				options.slot.plugin = OutputPluginFromString(optarg);
+				log_trace("--plugin %s",
+						  OutputPluginToString(options.slot.plugin));
 				break;
 			}
 
@@ -271,7 +305,7 @@ cli_stream_getopts(int argc, char **argv)
 				if (!parseLSN(optarg, &(options.endpos)))
 				{
 					log_fatal("Failed to parse endpos LSN: \"%s\"", optarg);
-					exit(EXIT_CODE_BAD_ARGS);
+					++errors;
 				}
 
 				log_trace("--endpos %X/%X",
@@ -304,6 +338,20 @@ cli_stream_getopts(int argc, char **argv)
 				break;
 			}
 
+			case 'O':
+			{
+				options.stdOut = true;
+				log_trace("--to-stdout");
+				break;
+			}
+
+			case 'I':
+			{
+				options.stdIn = true;
+				log_trace("--from-stdin");
+				break;
+			}
+
 			case 'C':
 			{
 				options.notConsistent = true;
@@ -331,6 +379,12 @@ cli_stream_getopts(int argc, char **argv)
 
 					case 2:
 					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
 					}
@@ -346,14 +400,14 @@ cli_stream_getopts(int argc, char **argv)
 
 			case 'd':
 			{
-				verboseCount = 2;
+				verboseCount = 3;
 				log_set_level(LOG_DEBUG);
 				break;
 			}
 
 			case 'z':
 			{
-				verboseCount = 3;
+				verboseCount = 4;
 				log_set_level(LOG_TRACE);
 				break;
 			}
@@ -370,47 +424,39 @@ cli_stream_getopts(int argc, char **argv)
 				exit(EXIT_CODE_QUIT);
 				break;
 			}
-		}
-	}
 
-	/* stream commands support the source URI environment variable */
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri))
-	{
-		if (env_exists(PGCOPYDB_SOURCE_PGURI))
-		{
-			if (!get_env_copy(PGCOPYDB_SOURCE_PGURI,
-							  options.source_pguri,
-							  sizeof(options.source_pguri)))
+			case '?':
 			{
-				/* errors have already been logged */
-				++errors;
+				commandline_help(stderr);
+				exit(EXIT_CODE_BAD_ARGS);
+				break;
 			}
 		}
 	}
 
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri) ||
-		IS_EMPTY_STRING_BUFFER(options.target_pguri))
+	if (options.connStrings.source_pguri == NULL ||
+		options.connStrings.target_pguri == NULL)
 	{
 		log_fatal("Options --source and --target are mandatory");
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	/* when --slot-name is not used, use the default slot name "pgcopydb" */
-	if (IS_EMPTY_STRING_BUFFER(options.slotName))
+	/* prepare safe versions of the connection strings (without password) */
+	if (!cli_prepare_pguris(&(options.connStrings)))
 	{
-		strlcpy(options.slotName,
-				REPLICATION_SLOT_NAME,
-				sizeof(options.slotName));
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (IS_EMPTY_STRING_BUFFER(options.origin))
+	if (!cli_copydb_is_consistent(&options))
 	{
-		strlcpy(options.origin, REPLICATION_ORIGIN, sizeof(options.origin));
-		log_info("Using default origin node name \"%s\"", options.origin);
+		log_fatal("Option --resume requires option --not-consistent");
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
 	if (errors > 0)
 	{
+		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
@@ -481,46 +527,52 @@ cli_stream_setup(int argc, char **argv)
 
 	(void) find_pg_commands(&(copySpecs.pgPaths));
 
-	bool auxilliary = false;
+	bool createWorkDir = true;
 
 	if (!copydb_init_workdir(&copySpecs,
-							 NULL,
+							 streamDBoptions.dir,
+							 false, /* service */
+							 NULL,  /* serviceName */
 							 streamDBoptions.restart,
 							 streamDBoptions.resume,
-							 auxilliary))
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	RestoreOptions restoreOptions = { 0 };
-
-	if (!copydb_init_specs(&copySpecs,
-						   streamDBoptions.source_pguri,
-						   streamDBoptions.target_pguri,
-						   1,   /* tableJobs */
-						   1,   /* indexJobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_ALL,
-						   streamDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   streamDBoptions.restart,
-						   streamDBoptions.resume,
-						   !streamDBoptions.notConsistent))
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!stream_setup_databases(&copySpecs,
-								streamDBoptions.slotName,
-								streamDBoptions.origin))
+	/*
+	 * Refrain from logging SQL statements in the apply module, because they
+	 * contain user data. That said, when --trace has been used, bypass that
+	 * privacy feature.
+	 */
+	bool logSQL = log_get_level() <= LOG_TRACE;
+
+	StreamSpecs specs = { 0 };
+
+	if (!stream_init_specs(&specs,
+						   &(copySpecs.cfPaths.cdc),
+						   &(copySpecs.connStrings),
+						   &(streamDBoptions.slot),
+						   streamDBoptions.origin,
+						   streamDBoptions.endpos,
+						   STREAM_MODE_CATCHUP,
+						   &(copySpecs.catalog),
+						   streamDBoptions.stdIn,
+						   streamDBoptions.stdOut,
+						   logSQL))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!stream_setup_databases(&copySpecs, &specs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -545,47 +597,32 @@ cli_stream_cleanup(int argc, char **argv)
 
 	(void) find_pg_commands(&(copySpecs.pgPaths));
 
-	bool resume = true;         /* pretend --resume has been used */
-	bool restart = false;       /* pretend --restart has NOT been used */
-	bool auxilliary = false;
-
-	if (!copydb_init_workdir(&copySpecs,
-							 NULL,
-							 restart,
-							 resume,
-							 auxilliary))
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	RestoreOptions restoreOptions = { 0 };
+	bool resume = true;    /* pretend --resume has been used */
+	bool restart = false;  /* pretend --restart has NOT been used */
 
-	if (!copydb_init_specs(&copySpecs,
-						   streamDBoptions.source_pguri,
-						   streamDBoptions.target_pguri,
-						   1,   /* tableJobs */
-						   1,   /* indexJobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_ALL,
-						   streamDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   restart,
-						   resume,
-						   !streamDBoptions.notConsistent))
+	bool createWorkDir = false;
+	bool service = false;
+
+	if (!copydb_init_workdir(&copySpecs,
+							 streamDBoptions.dir,
+							 service,
+							 NULL,
+							 restart,
+							 resume,
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
 	if (!stream_cleanup_databases(&copySpecs,
-								  streamDBoptions.slotName,
+								  streamDBoptions.slot.slotName,
 								  streamDBoptions.origin))
 	{
 		/* errors have already been logged */
@@ -611,53 +648,52 @@ cli_stream_catchup(int argc, char **argv)
 
 	(void) find_pg_commands(&(copySpecs.pgPaths));
 
-	bool auxilliary = false;
+	/*
+	 * Both the catchup and the replay command starts the "apply" service, so
+	 * that they conflict with each other.
+	 */
+	bool createWorkDir = false;
+	bool service = true;
+	char *serviceName = "apply";
 
 	if (!copydb_init_workdir(&copySpecs,
-							 NULL,
+							 streamDBoptions.dir,
+							 service,
+							 serviceName,
 							 streamDBoptions.restart,
 							 streamDBoptions.resume,
-							 auxilliary))
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	RestoreOptions restoreOptions = { 0 };
-
-	if (!copydb_init_specs(&copySpecs,
-						   streamDBoptions.source_pguri,
-						   streamDBoptions.target_pguri,
-						   1,   /* tableJobs */
-						   1,   /* indexJobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_ALL,
-						   streamDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   streamDBoptions.restart,
-						   streamDBoptions.resume,
-						   !streamDBoptions.notConsistent))
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	/*
+	 * Refrain from logging SQL statements in the apply module, because they
+	 * contain user data. That said, when --trace has been used, bypass that
+	 * privacy feature.
+	 */
+	bool logSQL = log_get_level() <= LOG_TRACE;
 
 	StreamSpecs specs = { 0 };
 
 	if (!stream_init_specs(&specs,
 						   &(copySpecs.cfPaths.cdc),
-						   copySpecs.source_pguri,
-						   copySpecs.target_pguri,
-						   streamDBoptions.slotName,
+						   &(copySpecs.connStrings),
+						   &(streamDBoptions.slot),
 						   streamDBoptions.origin,
 						   streamDBoptions.endpos,
-						   STREAM_MODE_APPLY))
+						   STREAM_MODE_CATCHUP,
+						   &(copySpecs.catalog),
+						   streamDBoptions.stdIn,
+						   streamDBoptions.stdOut,
+						   logSQL))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -677,6 +713,122 @@ cli_stream_catchup(int argc, char **argv)
 
 
 /*
+ * cli_stream_replay streams the DML changes from logical decoding on the
+ * source database, stores them in JSON files locally, transforms them in SQL
+ * statements to disk, and replays the SQL statements on the target database,
+ * keeping track and updating the replication origin.
+ */
+static void
+cli_stream_replay(int argc, char **argv)
+{
+	CopyDataSpec copySpecs = { 0 };
+
+	if (argc > 0)
+	{
+		commandline_help(stderr);
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
+	(void) find_pg_commands(&(copySpecs.pgPaths));
+
+	/*
+	 * Both the receive and the prefetch command starts the "receive" service,
+	 * so that they conflict with each other.
+	 */
+	bool createWorkDir = false;
+	bool service = true;
+	char *serviceName = "receive";
+
+	if (!copydb_init_workdir(&copySpecs,
+							 NULL,
+							 service,
+							 serviceName,
+							 streamDBoptions.restart,
+							 streamDBoptions.resume,
+							 createWorkDir))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Refrain from logging SQL statements in the apply module, because they
+	 * contain user data. That said, when --trace has been used, bypass that
+	 * privacy feature.
+	 */
+	bool logSQL = log_get_level() <= LOG_TRACE;
+
+	StreamSpecs specs = { 0 };
+
+	if (!stream_init_specs(&specs,
+						   &(copySpecs.cfPaths.cdc),
+						   &(copySpecs.connStrings),
+						   &(streamDBoptions.slot),
+						   streamDBoptions.origin,
+						   streamDBoptions.endpos,
+						   STREAM_MODE_REPLAY,
+						   &(copySpecs.catalog),
+						   true,  /* stdin */
+						   true, /* stdout */
+						   logSQL))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Remove the possibly still existing stream context files from
+	 * previous round of operations (--resume, etc). We want to make sure
+	 * that the catchup process reads the files created on this connection.
+	 */
+	if (!stream_cleanup_context(&specs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Before starting the receive, transform, and apply sub-processes, we need
+	 * to set the sentinel endpos to the command line --endpos option, when
+	 * given.
+	 *
+	 * Also fetch the current values from the pgcopydb.sentinel. It might have
+	 * been updated from a previous run of the command, and we might have
+	 * nothing to catch-up to when e.g. the endpos was reached already.
+	 */
+	CopyDBSentinel sentinel = { 0 };
+
+	if (!follow_init_sentinel(&specs, &sentinel))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (sentinel.endpos != InvalidXLogRecPtr &&
+		sentinel.endpos <= sentinel.replay_lsn)
+	{
+		log_info("Current endpos %X/%X was previously reached at %X/%X",
+				 LSN_FORMAT_ARGS(sentinel.endpos),
+				 LSN_FORMAT_ARGS(sentinel.replay_lsn));
+
+		exit(EXIT_CODE_QUIT);
+	}
+
+	if (!followDB(&copySpecs, &specs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+}
+
+
+/*
  * cli_stream_transform takes a logical decoding JSON file as obtained by the
  * previous command `pgcopydb stream receive` and transforms it into an SQL
  * file.
@@ -684,6 +836,8 @@ cli_stream_catchup(int argc, char **argv)
 static void
 cli_stream_transform(int argc, char **argv)
 {
+	CopyDataSpec copySpecs = { 0 };
+
 	if (argc != 2)
 	{
 		log_fatal("Please provide a filename argument");
@@ -695,7 +849,124 @@ cli_stream_transform(int argc, char **argv)
 	char *jsonfilename = argv[0];
 	char *sqlfilename = argv[1];
 
-	if (!stream_transform_file(jsonfilename, sqlfilename))
+	(void) find_pg_commands(&(copySpecs.pgPaths));
+
+	/*
+	 * The command `pgcopydb stream transform` can be used with filenames, in
+	 * which case it is not a service, or with the JSON file connected to the
+	 * stdin stream (using '-' as the jsonfilename), in which case the command
+	 * is a service.
+	 *
+	 * Finally, always assume --resume has been used so that we can re-use an
+	 * existing work directory when it exists.
+	 */
+	bool createWorkDir = false;
+	bool service = streq(jsonfilename, "-");
+	char *serviceName = "transform";
+
+	if (!copydb_init_workdir(&copySpecs,
+							 streamDBoptions.dir,
+							 service,
+							 serviceName,
+							 streamDBoptions.restart,
+							 true, /* streamDBoptions.resume */
+							 createWorkDir))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Read the catalogs from the source table from on-file disk.
+	 */
+	if (!copydb_parse_schema_json_file(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Refrain from logging SQL statements in the apply module, because they
+	 * contain user data. That said, when --trace has been used, bypass that
+	 * privacy feature.
+	 */
+	bool logSQL = log_get_level() <= LOG_TRACE;
+
+	StreamSpecs specs = { 0 };
+
+	if (!stream_init_specs(&specs,
+						   &(copySpecs.cfPaths.cdc),
+						   &(copySpecs.connStrings),
+						   &(streamDBoptions.slot),
+						   streamDBoptions.origin,
+						   streamDBoptions.endpos,
+						   STREAM_MODE_CATCHUP,
+						   &(copySpecs.catalog),
+						   streamDBoptions.stdIn,
+						   streamDBoptions.stdOut,
+						   logSQL))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!stream_init_context(&specs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs.connStrings.source_pguri))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Do we use the file API, or the stream API?
+	 *
+	 * The filename arguments can be set to - to mean stdin and stdout
+	 * respectively, and in that case we use the streaming API so that we're
+	 * compatible with Unix pipes.
+	 *
+	 * When the input is a stream, even if the output is a file, we still use
+	 * the streaming API, we just open the output stream here before calling
+	 * into the stream API.
+	 */
+	if (streq(jsonfilename, "-"))
+	{
+		specs.in = stdin;
+		specs.out = stdout;
+
+		if (!streq(sqlfilename, "-"))
+		{
+			log_fatal("JSON filename is - (stdin), "
+					  "SQL filename should be - (stdout)");
+			log_fatal("When streaming from stdin, out filename is computed "
+					  "automatically from the current LSN.");
+			exit(EXIT_CODE_BAD_ARGS);
+		}
+
+		if (!stream_transform_stream(&specs))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		if (fclose(specs.out) != 0)
+		{
+			log_error("Failed to close file \"%s\": %m", sqlfilename);
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+	}
+	else if (!stream_transform_file(&specs, jsonfilename, sqlfilename))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -722,73 +993,115 @@ cli_stream_apply(int argc, char **argv)
 
 	(void) find_pg_commands(&(copySpecs.pgPaths));
 
+	char *sqlfilename = argv[0];
+
+	/*
+	 * The command `pgcopydb stream apply` can be used with a filename, in
+	 * which case it is not a service, or with the SQL file connected to the
+	 * stdin stream (using '-' as the filename), in which case the command is a
+	 * service.
+	 *
+	 * Then, both the catchup and the replay command starts the "apply"
+	 * service, so that they conflict with each other.
+	 *
+	 * Finally, always assume --resume has been used so that we can re-use an
+	 * existing work directory when it exists.
+	 */
+	bool createWorkDir = false;
+	bool service = streq(sqlfilename, "-");
+	char *serviceName = "apply";
+
 	if (!copydb_init_workdir(&copySpecs,
-							 NULL,
+							 streamDBoptions.dir,
+							 service,
+							 serviceName,
 							 streamDBoptions.restart,
-							 streamDBoptions.resume,
-							 false))
+							 true, /* streamDBoptions.resume */
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	RestoreOptions restoreOptions = { 0 };
-
-	if (!copydb_init_specs(&copySpecs,
-						   streamDBoptions.source_pguri,
-						   streamDBoptions.target_pguri,
-						   1,   /* tableJobs */
-						   1,   /* indexJobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_ALL,
-						   streamDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   streamDBoptions.restart,
-						   streamDBoptions.resume,
-						   !streamDBoptions.notConsistent))
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	/* prepare the replication origin tracking */
-	StreamApplyContext context = { 0 };
-
-	if (!setupReplicationOrigin(&context,
-								&(copySpecs.cfPaths.cdc),
-								streamDBoptions.source_pguri,
-								streamDBoptions.target_pguri,
-								streamDBoptions.origin,
-								streamDBoptions.endpos,
-								true))
-	{
-		log_error("Failed to setup replication origin on the target database");
-		exit(EXIT_CODE_TARGET);
-	}
+	/*
+	 * Refrain from logging SQL statements in the apply module, because they
+	 * contain user data. That said, when --trace has been used, bypass that
+	 * privacy feature.
+	 */
+	bool logSQL = log_get_level() <= LOG_TRACE;
 
 	/*
 	 * Force the SQL filename to the given argument, bypassing filename
 	 * computations based on origin tracking. Already known-applied
 	 * transactions are still skipped.
+	 *
+	 * The filename arguments can be set to - to mean stdin, and in that case
+	 * we use the streaming API so that we're compatible with Unix pipes.
 	 */
-	char *sqlfilename = argv[0];
-
-	strlcpy(context.sqlFileName, sqlfilename, sizeof(context.sqlFileName));
-
-	if (!stream_apply_file(&context))
+	if (streq(sqlfilename, "-"))
 	{
-		/* errors have already been logged */
-		pgsql_finish(&(context.pgsql));
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
+		StreamSpecs specs = { 0 };
 
-	pgsql_finish(&(context.pgsql));
+		if (!stream_init_specs(&specs,
+							   &(copySpecs.cfPaths.cdc),
+							   &(copySpecs.connStrings),
+							   &(streamDBoptions.slot),
+							   streamDBoptions.origin,
+							   streamDBoptions.endpos,
+							   STREAM_MODE_CATCHUP,
+							   &(copySpecs.catalog),
+							   true, /* streamDBoptions.stdIn */
+							   false, /* streamDBoptions.stdOut */
+							   logSQL))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		specs.in = stdin;
+
+		if (!stream_apply_replay(&specs))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+	}
+	else
+	{
+		/* prepare the replication origin tracking */
+		StreamApplyContext context = { 0 };
+
+		if (!stream_apply_init_context(&context,
+									   &(copySpecs.cfPaths.cdc),
+									   &(streamDBoptions.connStrings),
+									   streamDBoptions.origin,
+									   streamDBoptions.endpos))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_TARGET);
+		}
+
+		context.apply = true;
+		strlcpy(context.sqlFileName, sqlfilename, sizeof(context.sqlFileName));
+
+		if (!setupReplicationOrigin(&context, logSQL))
+		{
+			log_error("Failed to setup replication origin on the target database");
+			exit(EXIT_CODE_TARGET);
+		}
+
+		if (!stream_apply_file(&context))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+	}
 }
 
 
@@ -803,59 +1116,114 @@ stream_start_in_mode(LogicalStreamMode mode)
 
 	(void) find_pg_commands(&(copySpecs.pgPaths));
 
+	/*
+	 * Both the receive and the prefetch command starts the "receive" service,
+	 * so that they conflict with each other.
+	 */
+	bool createWorkDir = false;
+	bool service = true;
+	char *serviceName = "receive";
+
 	if (!copydb_init_workdir(&copySpecs,
-							 NULL,
+							 streamDBoptions.dir,
+							 service,
+							 serviceName,
 							 streamDBoptions.restart,
 							 streamDBoptions.resume,
-							 false))
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	RestoreOptions restoreOptions = { 0 };
-
-	if (!copydb_init_specs(&copySpecs,
-						   streamDBoptions.source_pguri,
-						   streamDBoptions.target_pguri,
-						   1,   /* tableJobs */
-						   1,   /* indexJobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_ALL,
-						   streamDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   streamDBoptions.restart,
-						   streamDBoptions.resume,
-						   !streamDBoptions.notConsistent))
+	if (!copydb_init_specs(&copySpecs, &streamDBoptions, DATA_SECTION_NONE))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs.connStrings.source_pguri))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Read the catalogs from the source table from on-file disk.
+	 */
+	if (!copydb_parse_schema_json_file(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Refrain from logging SQL statements in the apply module, because they
+	 * contain user data. That said, when --trace has been used, bypass that
+	 * privacy feature.
+	 */
+	bool logSQL = log_get_level() <= LOG_TRACE;
 
 	StreamSpecs specs = { 0 };
 
 	if (!stream_init_specs(&specs,
 						   &(copySpecs.cfPaths.cdc),
-						   copySpecs.source_pguri,
-						   copySpecs.target_pguri,
-						   streamDBoptions.slotName,
+						   &(copySpecs.connStrings),
+						   &(streamDBoptions.slot),
 						   streamDBoptions.origin,
 						   streamDBoptions.endpos,
-						   mode))
+						   mode,
+						   &(copySpecs.catalog),
+						   streamDBoptions.stdIn,
+						   streamDBoptions.stdOut,
+						   logSQL))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!startLogicalStreaming(&specs))
+	switch (specs.mode)
 	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		case STREAM_MODE_RECEIVE:
+		{
+			specs.out = stdout;
+
+			if (!startLogicalStreaming(&specs))
+			{
+				/* errors have already been logged */
+				exit(EXIT_CODE_SOURCE);
+			}
+			break;
+		}
+
+		case STREAM_MODE_PREFETCH:
+		{
+			/*
+			 * Remove the possibly still existing stream context files from
+			 * previous round of operations (--resume, etc). We want to make
+			 * sure that the catchup process reads the files created on this
+			 * connection.
+			 */
+			if (!stream_cleanup_context(&specs))
+			{
+				/* errors have already been logged */
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+
+			if (!followDB(&copySpecs, &specs))
+			{
+				/* errors have already been logged */
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+			break;
+		}
+
+		default:
+		{
+			log_fatal("BUG: stream_start_in_mode called in mode %d", mode);
+			exit(EXIT_CODE_INTERNAL_ERROR);
+			break;
+		}
 	}
 }

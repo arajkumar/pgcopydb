@@ -59,6 +59,7 @@ cli_print_version_getopts(int argc, char **argv)
 		{ "json", no_argument, NULL, 'J' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
@@ -134,7 +135,7 @@ cli_print_version(int argc, char **argv)
 	{
 		fformat(stdout, "pgcopydb version %s\n", VERSION_STRING);
 		fformat(stdout, "compiled with %s\n", PG_VERSION_STR);
-		fformat(stdout, "compatible with Postgres 10, 11, 12, 13, 14, and 15\n");
+		fformat(stdout, "compatible with Postgres 11, 12, 13, 14, 15, and 16\n");
 	}
 
 	exit(0);
@@ -159,40 +160,58 @@ cli_pprint_json(JSON_Value *js)
 
 
 /*
- * logLevelToString returns the string to use to enable the same logLevel in a
- * sub-process.
- *
- * enum { LOG_TRACE, LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_FATAL };
+ * cli_copydb_getenv_source_pguri reads the PGCOPYDB_SOURCE_PGURI environment
+ * variable and duplicates its value at the given place.
  */
-char *
-logLevelToString(int logLevel)
+bool
+cli_copydb_getenv_source_pguri(char **pguri)
 {
-	switch (logLevel)
+	if (env_exists(PGCOPYDB_SOURCE_PGURI))
 	{
-		case LOG_TRACE:
+		if (!get_env_dup(PGCOPYDB_SOURCE_PGURI, pguri))
 		{
-			return "-vvv";
-		}
-
-		case LOG_DEBUG:
-		{
-			return "-vv";
-		}
-
-		case LOG_WARN:
-		case LOG_INFO:
-		{
-			return "-v";
-		}
-
-		case LOG_ERROR:
-		case LOG_FATAL:
-		{
-			return "-q";
+			/* errors have already been logged */
+			return false;
 		}
 	}
 
-	return "";
+	return true;
+}
+
+
+/*
+ * cli_copydb_getenv_split reads the PGCOPYDB_SPLIT_TABLES_LARGER_THAN
+ * environment variable and fills in the given SplitTableLargerThan instance.
+ */
+bool
+cli_copydb_getenv_split(SplitTableLargerThan *splitTablesLargerThan)
+{
+	if (env_exists(PGCOPYDB_SPLIT_TABLES_LARGER_THAN))
+	{
+		char bytes[BUFSIZE] = { 0 };
+
+		if (get_env_copy(PGCOPYDB_SPLIT_TABLES_LARGER_THAN, bytes, sizeof(bytes)))
+		{
+			if (!cli_parse_bytes_pretty(
+					bytes,
+					&(splitTablesLargerThan->bytes),
+					(char *) &(splitTablesLargerThan->bytesPretty),
+					sizeof(splitTablesLargerThan->bytesPretty)))
+			{
+				log_fatal("Failed to parse PGCOPYDB_SPLIT_TABLES_LARGER_THAN: "
+						  " \"%s\"",
+						  bytes);
+				return false;
+			}
+		}
+		else
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
@@ -205,23 +224,16 @@ cli_copydb_getenv(CopyDBOptions *options)
 {
 	int errors = 0;
 
-	/* now some of the options can be also set from the environment */
-	if (env_exists(PGCOPYDB_SOURCE_PGURI))
+	if (!cli_copydb_getenv_source_pguri(&(options->connStrings.source_pguri)))
 	{
-		if (!get_env_copy(PGCOPYDB_SOURCE_PGURI,
-						  options->source_pguri,
-						  sizeof(options->source_pguri)))
-		{
-			/* errors have already been logged */
-			++errors;
-		}
+		/* errors have already been logged */
+		++errors;
 	}
 
 	if (env_exists(PGCOPYDB_TARGET_PGURI))
 	{
-		if (!get_env_copy(PGCOPYDB_TARGET_PGURI,
-						  options->target_pguri,
-						  sizeof(options->target_pguri)))
+		if (!get_env_dup(PGCOPYDB_TARGET_PGURI,
+						 &(options->connStrings.target_pguri)))
 		{
 			/* errors have already been logged */
 			++errors;
@@ -272,21 +284,18 @@ cli_copydb_getenv(CopyDBOptions *options)
 		}
 	}
 
-	if (env_exists(PGCOPYDB_SPLIT_TABLES_LARGER_THAN))
+	if (env_exists(PGCOPYDB_LARGE_OBJECTS_JOBS))
 	{
-		char bytes[BUFSIZE] = { 0 };
+		char jobs[BUFSIZE] = { 0 };
 
-		if (get_env_copy(PGCOPYDB_SPLIT_TABLES_LARGER_THAN, bytes, sizeof(bytes)))
+		if (get_env_copy(PGCOPYDB_LARGE_OBJECTS_JOBS, jobs, sizeof(jobs)))
 		{
-			if (!cli_parse_bytes_pretty(
-					bytes,
-					&options->splitTablesLargerThan,
-					(char *) &options->splitTablesLargerThanPretty,
-					sizeof(options->splitTablesLargerThanPretty)))
+			if (!stringToInt(jobs, &options->lObjectJobs) ||
+				options->lObjectJobs < 1 ||
+				options->lObjectJobs > 128)
 			{
-				log_fatal("Failed to parse PGCOPYDB_SPLIT_TABLES_LARGER_THAN: "
-						  " \"%s\"",
-						  bytes);
+				log_fatal("Failed to parse PGCOPYDB_LARGE_OBJECTS_JOBS: \"%s\"",
+						  jobs);
 				++errors;
 			}
 		}
@@ -297,6 +306,12 @@ cli_copydb_getenv(CopyDBOptions *options)
 		}
 	}
 
+	if (!cli_copydb_getenv_split(&(options->splitTablesLargerThan)))
+	{
+		/* errors have already been logged */
+		++errors;
+	}
+
 	/* when --snapshot has not been used, check PGCOPYDB_SNAPSHOT */
 	if (env_exists(PGCOPYDB_SNAPSHOT))
 	{
@@ -305,6 +320,28 @@ cli_copydb_getenv(CopyDBOptions *options)
 						  sizeof(options->snapshot)))
 		{
 			/* errors have already been logged */
+			++errors;
+		}
+	}
+
+	/* check --plugin environment variable */
+	if (env_exists(PGCOPYDB_OUTPUT_PLUGIN))
+	{
+		char plugin[BUFSIZE] = { 0 };
+
+		if (!get_env_copy(PGCOPYDB_OUTPUT_PLUGIN, plugin, BUFSIZE))
+		{
+			/* errors have already been logged */
+			++errors;
+		}
+
+		options->slot.plugin = OutputPluginFromString(plugin);
+
+		if (options->slot.plugin == STREAM_PLUGIN_UNKNOWN)
+		{
+			log_fatal("Unknown replication plugin \"%s\", please use either "
+					  "test_decoding (the default) or wal2json",
+					  OutputPluginToString(options->slot.plugin));
 			++errors;
 		}
 	}
@@ -335,6 +372,54 @@ cli_copydb_getenv(CopyDBOptions *options)
 		}
 	}
 
+	/* when --fail-fast has not been used, check PGCOPYDB_FAIL_FAST */
+	if (!options->failFast)
+	{
+		if (env_exists(PGCOPYDB_FAIL_FAST))
+		{
+			char FAIL_FAST[BUFSIZE] = { 0 };
+
+			if (!get_env_copy(PGCOPYDB_FAIL_FAST, FAIL_FAST, sizeof(FAIL_FAST)))
+			{
+				/* errors have already been logged */
+				++errors;
+			}
+			else if (!parse_bool(FAIL_FAST, &(options->failFast)))
+			{
+				log_error("Failed to parse environment variable \"%s\" "
+						  "value \"%s\", expected a boolean (on/off)",
+						  PGCOPYDB_FAIL_FAST,
+						  FAIL_FAST);
+				++errors;
+			}
+		}
+	}
+
+	/* when --fail-fast has not been used, check PGCOPYDB_FAIL_FAST */
+	if (!options->skipVacuum)
+	{
+		if (env_exists(PGCOPYDB_SKIP_VACUUM))
+		{
+			char SKIP_VACUUM[BUFSIZE] = { 0 };
+
+			if (!get_env_copy(PGCOPYDB_SKIP_VACUUM,
+							  SKIP_VACUUM,
+							  sizeof(SKIP_VACUUM)))
+			{
+				/* errors have already been logged */
+				++errors;
+			}
+			else if (!parse_bool(SKIP_VACUUM, &(options->skipVacuum)))
+			{
+				log_error("Failed to parse environment variable \"%s\" "
+						  "value \"%s\", expected a boolean (on/off)",
+						  PGCOPYDB_SKIP_VACUUM,
+						  SKIP_VACUUM);
+				++errors;
+			}
+		}
+	}
+
 	return errors == 0;
 }
 
@@ -346,6 +431,24 @@ cli_copydb_getenv(CopyDBOptions *options)
 bool
 cli_copydb_is_consistent(CopyDBOptions *options)
 {
+	CopyFilePaths cfPaths = { 0 };
+	char *dir = IS_EMPTY_STRING_BUFFER(options->dir) ? NULL : options->dir;
+
+	if (!copydb_prepare_filepaths(&cfPaths, dir, false))
+	{
+		return false;
+	}
+
+	/*
+	 * Read the snapshot, origin, plugin, and slot-name files from the previous
+	 * command or run, unless --restart is explicitely provided.
+	 */
+	if (!cli_read_previous_options(options, &cfPaths))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	/* when --resume is not used, we're good */
 	if (!options->resume)
 	{
@@ -358,108 +461,228 @@ cli_copydb_is_consistent(CopyDBOptions *options)
 		return true;
 	}
 
-	/* okay, a --snapshot is required, is it the same as the previous run? */
-	CopyFilePaths cfPaths = { 0 };
-
-	char *dir =
-		IS_EMPTY_STRING_BUFFER(options->dir) ? NULL : options->dir;
-
-	if (!copydb_prepare_filepaths(&cfPaths, dir, false))
-	{
-		return false;
-	}
-
 	/*
-	 * If the snapshot file does not exists, then it might be that a snapshot
-	 * has been created by another script/tool, and pgcopydb is now asked to
-	 * re-use that external snapshot. Just get along with it, and let Postgres
-	 * check for the snapshot at SET TRANSACTION SNAPSHOT time.
+	 * Here --resume is used and we're expected to be consisten with the
+	 * previous pgcopydb run/attempt/command. That requires re-using a
+	 * snapshot.
 	 */
-	if (!file_exists(cfPaths.snfile))
-	{
-		if (IS_EMPTY_STRING_BUFFER(options->snapshot))
-		{
-			/* --resume without --snapshot requires --not-consistent */
-			return false;
-		}
-		return true;
-	}
-
-	char *previous_snapshot = NULL;
-	long size = 0L;
-
-	if (!read_file(cfPaths.snfile, &previous_snapshot, &size))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* make sure to use only the first line of the file, without \n */
-	char *snLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(previous_snapshot, snLines, BUFSIZE);
-
-	if (lineCount != 1 && IS_EMPTY_STRING_BUFFER(options->snapshot))
-	{
-		/* --resume without snapshot requires --not-consistent */
-		return false;
-	}
-
 	if (IS_EMPTY_STRING_BUFFER(options->snapshot))
 	{
-		strlcpy(options->snapshot, snLines[0], sizeof(options->snapshot));
-	}
-	else if (strcmp(snLines[0], options->snapshot) != 0)
-	{
-		log_error("Failed to ensure a consistent snapshot to resume operations");
-		log_error("Previous run was done with snapshot \"%s\" and current run "
-				  "is using --resume --snapshot \"%s\"",
-				  snLines[0],
-				  options->snapshot);
-
-		free(previous_snapshot);
+		/* --resume without --snapshot requires --not-consistent */
+		log_error("Options --snapshot is mandatory unless using --not-consistent");
 		return false;
 	}
 
-	free(previous_snapshot);
+	return true;
+}
 
-	/*
-	 * Check that the --origin option is still the same as in the previous run
-	 * when we're using --resume, otherwise error out. If --not-consistent is
-	 * used, then we allow using a new origin node name.
-	 *
-	 * If the origin file does not exists, then we don't have to check about
-	 * re-using the same origin node name as in the previous run.
-	 */
-	if (!file_exists(cfPaths.cdc.originfile))
+
+/*
+ * cli_read_previous_options reads the options that have been set on a previous
+ * command such as pgcopydb snapshot or pgcopydb stream setup.
+ */
+bool
+cli_read_previous_options(CopyDBOptions *options, CopyFilePaths *cfPaths)
+{
+	struct optFromFile
 	{
-		return true;
+		char *filename;
+		char *optname;
+		char *varname;
+		char *def;
+		char *target;
+		size_t size;
+	}
+	opts[] =
+	{
+		{
+			cfPaths->snfile,
+			"--snapshot",
+			"snapshot",
+			NULL,
+			options->snapshot,
+			sizeof(options->snapshot)
+		},
+		{
+			cfPaths->cdc.originfile,
+			"--origin",
+			"origin",
+			REPLICATION_ORIGIN,
+			options->origin,
+			sizeof(options->origin)
+		}
+	};
+
+	int count = sizeof(opts) / sizeof(opts[0]);
+
+	for (int i = 0; i < count; i++)
+	{
+		/* bypass non-existing files, just use the command line options then */
+		if (options->restart || !file_exists(opts[i].filename))
+		{
+			/* install default value if needed */
+			if (opts[i].def != NULL && IS_EMPTY_STRING_BUFFER(opts[i].target))
+			{
+				strlcpy(opts[i].target, opts[i].def, opts[i].size);
+			}
+
+			continue;
+		}
+
+		/* allocate an intermediate value to read from file */
+		char *val = (char *) calloc(opts[i].size, sizeof(char));
+
+		if (!cli_read_one_line(opts[i].filename,
+							   opts[i].varname,
+							   val,
+							   opts[i].size))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		/* if the command line --option has not been used, use val */
+		if (IS_EMPTY_STRING_BUFFER(opts[i].target))
+		{
+			strlcpy(opts[i].target, val, opts[i].size);
+
+			log_notice("Re-using %s '%s' found at \"%s\"",
+					   opts[i].optname,
+					   opts[i].target,
+					   opts[i].filename);
+		}
+
+		/*
+		 * Otherwise make sure on-file and command line use the same value,
+		 * unless --not-consistent is used, which allows for using new ones.
+		 */
+		else if (!options->notConsistent && !streq(opts[i].target, val))
+		{
+			log_error("Failed to ensure consistency of %s", opts[i].optname);
+			log_error("Previous run was done with %s \"%s\" and current run "
+					  "is using %s \"%s\"",
+					  opts[i].varname,
+					  val,
+					  opts[i].optname,
+					  opts[i].target);
+			return false;
+		}
 	}
 
-	char *previous_origin = NULL;
+	/*
+	 * Now read the replication slot file, which includes information for both
+	 * --slot-name and --plugin option, and more.
+	 */
+	if (options->restart || !file_exists(cfPaths->cdc.slotfile))
+	{
+		/*
+		 * Only install a default value for the --plugin option when it wasn't
+		 * previously set from an environment variable or another way.
+		 */
+		if (IS_EMPTY_STRING_BUFFER(options->slot.slotName))
+		{
+			strlcpy(options->slot.slotName, REPLICATION_SLOT_NAME,
+					sizeof(options->slot.slotName));
+		}
 
-	if (!read_file(cfPaths.cdc.originfile, &previous_origin, &size))
+		if (options->slot.plugin == STREAM_PLUGIN_UNKNOWN)
+		{
+			options->slot.plugin = OutputPluginFromString(REPLICATION_PLUGIN);
+		}
+	}
+	else
+	{
+		ReplicationSlot onFileSlot = { 0 };
+
+		if (!snapshot_read_slot(cfPaths->cdc.slotfile, &onFileSlot))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!IS_EMPTY_STRING_BUFFER(options->slot.slotName) &&
+			!streq(options->slot.slotName, onFileSlot.slotName))
+		{
+			log_error("Failed to ensure consistency of --slot-name");
+			log_error("Previous run was done with slot-name \"%s\" and "
+					  "current run is using --slot-name \"%s\"",
+					  onFileSlot.slotName,
+					  options->slot.slotName);
+			return false;
+		}
+
+		if (options->slot.plugin != STREAM_PLUGIN_UNKNOWN &&
+			options->slot.plugin != onFileSlot.plugin)
+		{
+			log_error("Failed to ensure consistency of --plugin");
+			log_error("Previous run was done with plugin \"%s\" and "
+					  "current run is using --plugin \"%s\"",
+					  OutputPluginToString(onFileSlot.plugin),
+					  OutputPluginToString(options->slot.plugin));
+			return false;
+		}
+
+		/* copy the onFileSlot over to our options, wholesale */
+		options->slot = onFileSlot;
+	}
+
+	if (options->slot.plugin == STREAM_PLUGIN_UNKNOWN)
+	{
+		log_fatal("Unknown replication plugin \"%s\", please use either "
+				  "test_decoding (the default) or wal2json",
+				  OutputPluginToString(options->slot.plugin));
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * cli_read_one_line reads a file with a single line and place the contents of
+ * that line into the given string buffer.
+ */
+bool
+cli_read_one_line(const char *filename,
+				  const char *name,
+				  char *target,
+				  size_t size)
+{
+	char *contents = NULL;
+	long fileSize = 0L;
+
+	if (!read_file(filename, &contents, &fileSize))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
 	/* make sure to use only the first line of the file, without \n */
-	char *originLines[BUFSIZE] = { 0 };
-	lineCount = splitLines(previous_origin, originLines, BUFSIZE);
+	char *lines[BUFSIZE] = { 0 };
+	int lineCount = splitLines(contents, lines, BUFSIZE);
 
-	if (lineCount != 1 || strcmp(originLines[0], options->origin) != 0)
+	if (lineCount != 1)
 	{
-		log_error("Failed to ensure a consistent origin to resume operations");
-		log_error("Previous run was done with origin \"%s\" and current run "
-				  "is using --resume --origin \"%s\"",
-				  originLines[0],
-				  options->origin);
-
-		free(previous_origin);
+		log_error("Failed to parse %s file \"%s\"", name, filename);
+		free(contents);
 		return false;
 	}
 
-	free(previous_origin);
+	if (size < (strlen(lines[0]) + 1))
+	{
+		log_error("Failed to parse %s \"%s\" with %lld bytes, "
+				  "pgcopydb supports only snapshot references up to %lld bytes",
+				  name,
+				  lines[0],
+				  (long long) strlen(lines[0]) + 1,
+				  (long long) size);
+		free(contents);
+		return false;
+	}
+
+	/* publish the one line to the snapshot variable */
+	strlcpy(target, lines[0], size);
+	free(contents);
 
 	return true;
 }
@@ -482,34 +705,42 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "jobs", required_argument, NULL, 'J' },
 		{ "table-jobs", required_argument, NULL, 'J' },
 		{ "index-jobs", required_argument, NULL, 'I' },
+		{ "large-objects-jobs", required_argument, NULL, 'b' },
 		{ "split-tables-larger-than", required_argument, NULL, 'L' },
 		{ "split-at", required_argument, NULL, 'L' },
 		{ "drop-if-exists", no_argument, NULL, 'c' }, /* pg_restore -c */
 		{ "roles", no_argument, NULL, 'A' },          /* pg_dumpall --roles-only */
+		{ "no-role-passwords", no_argument, NULL, 'P' },
 		{ "no-owner", no_argument, NULL, 'O' },       /* pg_restore -O */
 		{ "no-comments", no_argument, NULL, 'X' },
 		{ "no-acl", no_argument, NULL, 'x' }, /* pg_restore -x */
 		{ "skip-blobs", no_argument, NULL, 'B' },
 		{ "skip-large-objects", no_argument, NULL, 'B' },
 		{ "skip-extensions", no_argument, NULL, 'e' },
+		{ "skip-ext-comment", no_argument, NULL, 'M' },
+		{ "skip-ext-comments", no_argument, NULL, 'M' },
+		{ "skip-collations", no_argument, NULL, 'l' },
+		{ "skip-vacuum", no_argument, NULL, 'U' },
 		{ "filter", required_argument, NULL, 'F' },
 		{ "filters", required_argument, NULL, 'F' },
+		{ "requirements", required_argument, NULL, 'Q' },
+		{ "fail-fast", no_argument, NULL, 'i' },
 		{ "restart", no_argument, NULL, 'r' },
 		{ "resume", no_argument, NULL, 'R' },
 		{ "not-consistent", no_argument, NULL, 'C' },
 		{ "snapshot", required_argument, NULL, 'N' },
 		{ "follow", no_argument, NULL, 'f' },
+		{ "plugin", required_argument, NULL, 'p' },
 		{ "slot-name", required_argument, NULL, 's' },
 		{ "origin", required_argument, NULL, 'o' },
 		{ "create-slot", no_argument, NULL, 't' },
 		{ "endpos", required_argument, NULL, 'E' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
-		{ "hook-pre-copy", required_argument, NULL, 'p' },
-		{ "hook-post-copy", required_argument, NULL, 'P' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -519,7 +750,8 @@ cli_copy_db_getopts(int argc, char **argv)
 	/* install default values */
 	options.tableJobs = DEFAULT_TABLE_JOBS;
 	options.indexJobs = DEFAULT_INDEX_JOBS;
-	options.splitTablesLargerThan = DEFAULT_SPLIT_TABLES_LARGER_THAN;
+	options.lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
+	options.splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
 
 	/* read values from the environment */
 	if (!cli_copydb_getenv(&options))
@@ -528,12 +760,8 @@ cli_copy_db_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	/* install default slotname and origin */
-	strlcpy(options.slotName, REPLICATION_SLOT_NAME, sizeof(options.slotName));
-	strlcpy(options.origin, REPLICATION_ORIGIN, sizeof(options.origin));
-
 	while ((c = getopt_long(argc, argv,
-							"S:T:D:J:I:L:cOBrRCN:xXCtfo:s:E:F:Vvdzqh",
+							"S:T:D:J:I:b:L:cOBemlirRCN:xXCtfo:p:s:E:F:Q:iVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -546,8 +774,8 @@ cli_copy_db_getopts(int argc, char **argv)
 							  "see above for details.");
 					++errors;
 				}
-				strlcpy(options.source_pguri, optarg, MAXCONNINFO);
-				log_trace("--source %s", options.source_pguri);
+				options.connStrings.source_pguri = pg_strdup(optarg);
+				log_trace("--source %s", options.connStrings.source_pguri);
 				break;
 			}
 
@@ -559,8 +787,8 @@ cli_copy_db_getopts(int argc, char **argv)
 							  "see above for details.");
 					++errors;
 				}
-				strlcpy(options.target_pguri, optarg, MAXCONNINFO);
-				log_trace("--target %s", options.target_pguri);
+				options.connStrings.target_pguri = pg_strdup(optarg);
+				log_trace("--target %s", options.connStrings.target_pguri);
 				break;
 			}
 
@@ -568,28 +796,6 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				strlcpy(options.dir, optarg, MAXPGPATH);
 				log_trace("--dir %s", options.dir);
-				break;
-			}
-
-			case 'p': /* TS pre-copy hook script */
-			{
-				if (!file_exists(optarg)) {
-					log_fatal("hook-pre-copy not found: \"%s\"", optarg);
-					++errors;
-				}
-				strlcpy(options.hookPreCopy, optarg, MAXPGPATH);
-				log_trace("--hook-pre-copy %s", options.hookPreCopy);
-				break;
-			}
-
-			case 'P': /* TS post-copy hook script */
-			{
-				if (!file_exists(optarg)) {
-					log_fatal("hook-post-copy not found: \"%s\"", optarg);
-					++errors;
-				}
-				strlcpy(options.hookPostCopy, optarg, MAXPGPATH);
-				log_trace("--hook-post-copy %s", options.hookPostCopy);
 				break;
 			}
 
@@ -619,13 +825,27 @@ cli_copy_db_getopts(int argc, char **argv)
 				break;
 			}
 
+			case 'b':
+			{
+				if (!stringToInt(optarg, &options.lObjectJobs) ||
+					options.lObjectJobs < 1 ||
+					options.lObjectJobs > 128)
+				{
+					log_fatal("Failed to parse --large-objects-jobs count: \"%s\"",
+							  optarg);
+					++errors;
+				}
+				log_trace("--large-objects-jobs %d", options.lObjectJobs);
+				break;
+			}
+
 			case 'L':
 			{
 				if (!cli_parse_bytes_pretty(
 						optarg,
-						&options.splitTablesLargerThan,
-						(char *) &options.splitTablesLargerThanPretty,
-						sizeof(options.splitTablesLargerThanPretty)))
+						&(options.splitTablesLargerThan.bytes),
+						(char *) &(options.splitTablesLargerThan.bytesPretty),
+						sizeof(options.splitTablesLargerThan.bytesPretty)))
 				{
 					log_fatal("Failed to parse --split-tables-larger-than: \"%s\"",
 							  optarg);
@@ -633,8 +853,8 @@ cli_copy_db_getopts(int argc, char **argv)
 				}
 
 				log_trace("--split-tables-larger-than %s (%lld)",
-						  options.splitTablesLargerThanPretty,
-						  (long long) options.splitTablesLargerThan);
+						  options.splitTablesLargerThan.bytesPretty,
+						  (long long) options.splitTablesLargerThan.bytes);
 				break;
 			}
 
@@ -649,6 +869,13 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.roles = true;
 				log_trace("--roles");
+				break;
+			}
+
+			case 'P':
+			{
+				options.noRolesPasswords = true;
+				log_trace("--no-role-passwords");
 				break;
 			}
 
@@ -684,6 +911,48 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.skipExtensions = true;
 				log_trace("--skip-extensions");
+				break;
+			}
+
+			case 'M':
+			{
+				options.skipCommentOnExtension = true;
+				log_trace("--skip-extensions");
+				break;
+			}
+
+			case 'Q':
+			{
+				strlcpy(options.requirementsFileName, optarg, MAXPGPATH);
+				log_trace("--requirements \"%s\"", options.requirementsFileName);
+
+				if (!file_exists(options.requirementsFileName))
+				{
+					log_error("Extensions requirements file \"%s\" does not exists",
+							  options.requirementsFileName);
+					++errors;
+				}
+				break;
+			}
+
+			case 'l':
+			{
+				options.skipCollations = true;
+				log_trace("--skip-collations");
+				break;
+			}
+
+			case 'U':
+			{
+				options.skipVacuum = true;
+				log_trace("--skip-vacuum");
+				break;
+			}
+
+			case 'i':
+			{
+				options.failFast = true;
+				log_trace("--fail-fast");
 				break;
 			}
 
@@ -727,8 +996,16 @@ cli_copy_db_getopts(int argc, char **argv)
 
 			case 's':
 			{
-				strlcpy(options.slotName, optarg, NAMEDATALEN);
-				log_trace("--slot-name %s", options.slotName);
+				strlcpy(options.slot.slotName, optarg, NAMEDATALEN);
+				log_trace("--slot-name %s", options.slot.slotName);
+				break;
+			}
+
+			case 'p':
+			{
+				options.slot.plugin = OutputPluginFromString(optarg);
+				log_trace("--plugin %s",
+						  OutputPluginToString(options.slot.plugin));
 				break;
 			}
 
@@ -758,7 +1035,7 @@ cli_copy_db_getopts(int argc, char **argv)
 				if (!parseLSN(optarg, &(options.endpos)))
 				{
 					log_fatal("Failed to parse endpos LSN: \"%s\"", optarg);
-					exit(EXIT_CODE_BAD_ARGS);
+					++errors;
 				}
 
 				log_trace("--endpos %X/%X",
@@ -801,6 +1078,12 @@ cli_copy_db_getopts(int argc, char **argv)
 
 					case 2:
 					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
 					}
@@ -816,14 +1099,14 @@ cli_copy_db_getopts(int argc, char **argv)
 
 			case 'd':
 			{
-				verboseCount = 2;
+				verboseCount = 3;
 				log_set_level(LOG_DEBUG);
 				break;
 			}
 
 			case 'z':
 			{
-				verboseCount = 3;
+				verboseCount = 4;
 				log_set_level(LOG_TRACE);
 				break;
 			}
@@ -840,14 +1123,27 @@ cli_copy_db_getopts(int argc, char **argv)
 				exit(EXIT_CODE_QUIT);
 				break;
 			}
+
+			case '?':
+			{
+				commandline_help(stderr);
+				exit(EXIT_CODE_BAD_ARGS);
+				break;
+			}
 		}
 	}
 
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri) ||
-		IS_EMPTY_STRING_BUFFER(options.target_pguri))
+	if (options.connStrings.source_pguri == NULL ||
+		options.connStrings.target_pguri == NULL)
 	{
 		log_fatal("Options --source and --target are mandatory");
 		exit(EXIT_CODE_BAD_ARGS);
+	}
+
+	if (!cli_prepare_pguris(&(options.connStrings)))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
 	if (!cli_copydb_is_consistent(&options))
@@ -897,6 +1193,38 @@ cli_parse_bytes_pretty(const char *byteString,
 
 
 /*
+ * copydb_prepare_pguris prepares version of Postgres connections strings to
+ * source and target without security sensible information (password is
+ * removed).
+ */
+bool
+cli_prepare_pguris(ConnStrings *connStrings)
+{
+	int errors = 0;
+
+	char *spguri = connStrings->source_pguri;
+	char *tpguri = connStrings->target_pguri;
+
+	SafeURI *safeSourcePGURI = &(connStrings->safeSourcePGURI);
+	SafeURI *safeTargetPGURI = &(connStrings->safeTargetPGURI);
+
+	if (!parse_and_scrub_connection_string(spguri, safeSourcePGURI))
+	{
+		log_error("Failed to parse source connection string: \"%s\"", spguri);
+		++errors;
+	}
+
+	if (!parse_and_scrub_connection_string(tpguri, safeTargetPGURI))
+	{
+		log_error("Failed to parse target connection string: \"%s\"", tpguri);
+		++errors;
+	}
+
+	return errors == 0;
+}
+
+
+/*
  * cli_copy_prepare_specs initializes our internal data structure that are used
  * to drive the operations.
  */
@@ -905,17 +1233,11 @@ cli_copy_prepare_specs(CopyDataSpec *copySpecs, CopyDataSection section)
 {
 	PostgresPaths *pgPaths = &(copySpecs->pgPaths);
 
-	char scrubbedSourceURI[MAXCONNINFO] = { 0 };
-	char scrubbedTargetURI[MAXCONNINFO] = { 0 };
+	char *safeSourceURI = copyDBoptions.connStrings.safeSourcePGURI.pguri;
+	char *safeTargetURI = copyDBoptions.connStrings.safeTargetPGURI.pguri;
 
-	(void) parse_and_scrub_connection_string(copyDBoptions.source_pguri,
-											 scrubbedSourceURI);
-
-	(void) parse_and_scrub_connection_string(copyDBoptions.target_pguri,
-											 scrubbedTargetURI);
-
-	log_info("[SOURCE] Copying database from \"%s\"", scrubbedSourceURI);
-	log_info("[TARGET] Copying database into \"%s\"", scrubbedTargetURI);
+	log_info("[SOURCE] Copying database from \"%s\"", safeSourceURI);
+	log_info("[TARGET] Copying database into \"%s\"", safeTargetURI);
 
 	(void) find_pg_commands(pgPaths);
 
@@ -932,36 +1254,32 @@ cli_copy_prepare_specs(CopyDataSpec *copySpecs, CopyDataSection section)
 		? NULL
 		: copyDBoptions.dir;
 
-	bool auxilliary = false;
+	bool createWorkDir = true;
+	bool service = true;
+	char *serviceName = NULL;   /* this is the "main" service */
+
+	/*
+	 * Commands that won't set a work directory certainly are not running a
+	 * service, they won't even have a pidfile.
+	 */
+	if (dir == NULL)
+	{
+		service = false;
+	}
 
 	if (!copydb_init_workdir(copySpecs,
 							 dir,
+							 service,
+							 serviceName,
 							 copyDBoptions.restart,
 							 copyDBoptions.resume,
-							 auxilliary))
+							 createWorkDir))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!copydb_init_specs(copySpecs,
-						   copyDBoptions.source_pguri,
-						   copyDBoptions.target_pguri,
-						   copyDBoptions.tableJobs,
-						   copyDBoptions.indexJobs,
-						   copyDBoptions.splitTablesLargerThan,
-						   copyDBoptions.splitTablesLargerThanPretty,
-						   section,
-						   copyDBoptions.snapshot,
-						   copyDBoptions.hookPreCopy,
-						   copyDBoptions.hookPostCopy,
-						   copyDBoptions.restoreOptions,
-						   copyDBoptions.roles,
-						   copyDBoptions.skipLargeObjects,
-						   copyDBoptions.skipExtensions,
-						   copyDBoptions.restart,
-						   copyDBoptions.resume,
-						   !copyDBoptions.notConsistent))
+	if (!copydb_init_specs(copySpecs, &copyDBoptions, section))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -975,6 +1293,18 @@ cli_copy_prepare_specs(CopyDataSpec *copySpecs, CopyDataSection section)
 		{
 			log_error("Failed to parse filters in file \"%s\"",
 					  copyDBoptions.filterFileName);
+			exit(EXIT_CODE_BAD_ARGS);
+		}
+	}
+
+	if (!IS_EMPTY_STRING_BUFFER(copyDBoptions.requirementsFileName))
+	{
+		char *filename = copyDBoptions.requirementsFileName;
+
+		if (!copydb_parse_extensions_requirements(copySpecs, filename))
+		{
+			log_error("Failed to parse extension requirements JSON file \"%s\"",
+					  filename);
 			exit(EXIT_CODE_BAD_ARGS);
 		}
 	}

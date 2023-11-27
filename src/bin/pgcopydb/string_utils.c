@@ -17,6 +17,7 @@
 #include "defaults.h"
 #include "file_utils.h"
 #include "log.h"
+#include "parsing_utils.h"
 #include "string_utils.h"
 
 /*
@@ -446,6 +447,51 @@ stringToDouble(const char *str, double *number)
 
 
 /*
+ * converts given hexadecimal string to 32 bit unsigned int value.
+ * returns 0 upon failure and sets error flag
+ */
+bool
+hexStringToUInt32(const char *str, uint32_t *number)
+{
+	char *endptr;
+
+	if (str == NULL)
+	{
+		return false;
+	}
+
+	if (number == NULL)
+	{
+		return false;
+	}
+
+	errno = 0;
+	unsigned long long n = strtoull(str, &endptr, 16);
+
+	if (str == endptr)
+	{
+		return false;
+	}
+	else if (errno != 0)
+	{
+		return false;
+	}
+	else if (*endptr != '\0')
+	{
+		return false;
+	}
+	else if (n > UINT32_MAX)
+	{
+		return false;
+	}
+
+	*number = n;
+
+	return true;
+}
+
+
+/*
  * IntervalToString prepares a string buffer to represent a given interval
  * value given as a double precision float number.
  */
@@ -518,7 +564,8 @@ countLines(char *buffer)
 
 		if (newLinePtr == NULL)
 		{
-			if (strlen(currentLine) > 0)
+			/* strlen(currentLine) > 0 */
+			if (*currentLine != '\0')
 			{
 				++lineNumber;
 			}
@@ -561,7 +608,8 @@ splitLines(char *buffer, char **linesArray, int size)
 
 		if (newLinePtr == NULL)
 		{
-			if (strlen(currentLine) > 0)
+			/* strlen(currentLine) > 0 */
+			if (*currentLine != '\0')
 			{
 				linesArray[lineNumber++] = currentLine;
 			}
@@ -581,7 +629,6 @@ splitLines(char *buffer, char **linesArray, int size)
 	return lineNumber;
 }
 
-
 /*
  * processBufferCallback is a function callback to use with the subcommands.c
  * library when we want to output a command's output as it's running, such as
@@ -593,18 +640,18 @@ processBufferCallback(const char *buffer, bool error)
 	char *outLines[BUFSIZE] = { 0 };
 	int lineCount = splitLines((char *) buffer, outLines, BUFSIZE);
 	int lineNumber = 0;
-
-	int logLevel = error ? LOG_ERROR : LOG_INFO;
+	const char *warningPattern = "^(pg_dump: warning:|pg_restore: warning:)";
 
 	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
 	{
 		if (strneq(outLines[lineNumber], ""))
 		{
+			char *match = regexp_first_match(outLines[lineNumber], warningPattern);
+			int logLevel = match != NULL ? LOG_WARN : (error ? LOG_ERROR : LOG_INFO);
 			log_level(logLevel, "%s", outLines[lineNumber]);
 		}
 	}
 }
-
 
 /*
  * pretty_print_bytes pretty prints bytes in a human readable form. Given
@@ -636,10 +683,52 @@ pretty_print_bytes(char *buffer, size_t size, uint64_t bytes)
 	sformat(buffer, size, "%d %s", (int) count, suffixes[sIndex]);
 }
 
+/*
+ * pretty_print_bytes_per_second pretty prints bytes transmitted per second in
+ * a human readable form. Given 17179869184 it places the string
+ * "17 GB/s" in the given buffer.
+ *
+ * Unlike pretty_print_bytes function that uses powers of 2, this function uses
+ * powers of 10. So 1 GBit/s is 1,000,000,000 bits per second.
+ */
+void
+pretty_print_bytes_per_second(char *buffer, size_t size, uint64_t bytes,
+							  uint64_t durationMs)
+{
+	/* avoid division by zero */
+	if (durationMs == 0)
+	{
+		sformat(buffer, size, "0 B/s");
+		return;
+	}
+
+	const char *suffixes[7] = {
+		"Bit/s",                    /* Bits per second */
+		"kBit/s",                   /* Kilobits per second */
+		"MBit/s",                   /* Megabits per second */
+		"GBit/s",                   /* Gigabits per second */
+		"TBit/s",                   /* Terabits per second */
+		"PBit/s",                   /* Petabits per second */
+		"EBit/s"                    /* Exabits per second */
+	};
+
+	uint sIndex = 0;
+	long double count = ((long double) bytes) * 1000 * 8 / durationMs ;
+
+	while (count >= 10000 && sIndex < 7)
+	{
+		sIndex++;
+		count /= 1000;
+	}
+
+	/* forget about having more precision, Postgres wants integers here */
+	sformat(buffer, size, "%d %s", (int) count, suffixes[sIndex]);
+}
+
 
 /*
  * pretty_print_bytes pretty prints bytes in a human readable form. Given
- * 17179869184 it places the string "16 GB" in the given buffer.
+ * 17179869184 it places the string "17 billion" in the given buffer.
  */
 void
 pretty_print_count(char *buffer, size_t size, uint64_t number)

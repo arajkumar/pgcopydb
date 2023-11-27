@@ -10,12 +10,8 @@ set -e
 #  - PGCOPYDB_TABLE_JOBS
 #  - PGCOPYDB_INDEX_JOBS
 
-#
-# pgcopydb list tables include a retry loop, so we use that as a proxy to
-# depend on the source/target Postgres images to be ready
-#
-pgcopydb list tables --source ${POSTGRES_SOURCE}
-pgcopydb list tables --source ${POSTGRES_TARGET}
+# make sure source and target databases are ready
+pgcopydb ping --source ${POSTGRES_SOURCE} --target ${POSTGRES_TARGET}
 
 psql -a ${POSTGRES_SOURCE} <<EOF
 create role pagila NOSUPERUSER CREATEDB NOCREATEROLE LOGIN PASSWORD '0wn3d';
@@ -33,14 +29,21 @@ EOF
 
 # create extensions on the source pagila database (needs superuser)
 psql -a -1 ${PGCOPYDB_SOURCE_PGURI_SU} <<EOF
+create extension intarray cascade;
 create extension postgis cascade;
-create extension postgis_topology cascade;
 EOF
 
-# the partman extension needs to be installed as the pagila role
-# psql -a -1 ${PGCOPYDB_SOURCE_PGURI} <<EOF
+#
 # create extension pg_partman cascade;
-# EOF
+# create extension postgis_tiger_geocoder cascade;
+#
+# At the moment we don't have full support for pg_partman or
+# postgis_tiger_geocoder without being superuser, because of a pg_dump
+# limitation when it comes to extensions.
+#
+# pg_dump: error: query failed: ERROR:  permission denied for schema tiger
+# pg_dump: error: query was: LOCK TABLE tiger.geocode_settings IN ACCESS SHARE MODE
+#
 
 # create the application schema and data in the pagila database, role pagila
 grep -v "OWNER TO postgres" /usr/src/pagila/pagila-schema.sql > /tmp/pagila-schema.sql
@@ -55,9 +58,23 @@ coproc ( pgcopydb snapshot --debug )
 sleep 1
 
 # copy the extensions separately, needs superuser (both on source and target)
+pgcopydb list extensions
+
+# now get the extension versions requirements from the target server
+e=/tmp/extensions.json
+r=/tmp/requirements.json
+
+pgcopydb list extensions --source ${PGCOPYDB_TARGET_PGURI} --requirements --json > ${e}
+
+jq 'map(select(.name == "postgis" or .name == "address_standardizer" or .name == "address_standardizer_data_us" or .name == "postgis_tiger_geocoder" or .name == "postgis_topology"))' < ${e} > ${r}
+
+cat ${r}
+
 pgcopydb copy extensions \
          --source ${PGCOPYDB_SOURCE_PGURI_SU} \
-         --target ${PGCOPYDB_TARGET_PGURI_SU}
+         --target ${PGCOPYDB_TARGET_PGURI_SU} \
+         --requirements ${r} \
+         --notice
 
 # now clone without superuser privileges (using role pagila on source and target)
 pgcopydb clone --skip-extensions

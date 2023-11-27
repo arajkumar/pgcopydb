@@ -23,29 +23,27 @@
 #include "string_utils.h"
 #include "summary.h"
 
-#define COMMON_GUC_SETTINGS \
-	{ "client_encoding", "'UTF-8'" }, \
-	{ "tcp_keepalives_idle", "'60s'" },
-
 
 /* Postgres 9.5 does not have idle_in_transaction_session_timeout */
 GUC srcSettings95[] = {
-	COMMON_GUC_SETTINGS
+	COMMON_GUC_SETTINGS,
 	{ NULL, NULL },
 };
 
 
 GUC srcSettings[] = {
-	COMMON_GUC_SETTINGS
+	COMMON_GUC_SETTINGS,
 	{ "idle_in_transaction_session_timeout", "0" },
 	{ NULL, NULL },
 };
 
 
 GUC dstSettings[] = {
-	COMMON_GUC_SETTINGS
+	COMMON_GUC_SETTINGS,
 	{ "maintenance_work_mem", "'1 GB'" },
 	{ "synchronous_commit", "'off'" },
+	{ "statement_timeout", "0" },
+	{ "lock_timeout", "0" },
 	{ NULL, NULL },
 };
 
@@ -63,22 +61,43 @@ GUC serverSetttings[] = {
 
 
 /*
+ * These parameters are added to the connection strings, unless the user has
+ * added them, allowing user-defined values to be taken into account.
+ */
+KeyVal connStringDefaults = {
+	.count = 4,
+	.keywords = {
+		"keepalives",
+		"keepalives_idle",
+		"keepalives_interval",
+		"keepalives_count"
+	},
+	.values = {
+		"1",
+		"10",
+		"10",
+		"60"
+	}
+};
+
+
+/*
  * copydb_init_tempdir initialises the file paths that are going to be used to
  * store temporary information while the pgcopydb process is running.
  */
 bool
 copydb_init_workdir(CopyDataSpec *copySpecs,
 					char *dir,
+					bool service,
+					char *serviceName,
 					bool restart,
 					bool resume,
-					bool auxilliary)
+					bool createWorkDir)
 {
 	CopyFilePaths *cfPaths = &(copySpecs->cfPaths);
 	DirectoryState *dirState = &(copySpecs->dirState);
 
-	pid_t pid = getpid();
-
-	if (!copydb_prepare_filepaths(cfPaths, dir, auxilliary))
+	if (!copydb_prepare_filepaths(cfPaths, dir, serviceName))
 	{
 		/* errors have already been logged */
 		return false;
@@ -86,28 +105,15 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 
 	log_notice("Using work dir \"%s\"", cfPaths->topdir);
 
-	/* check to see if there is already another pgcopydb running */
-	if (directory_exists(cfPaths->topdir))
+	/*
+	 * Some inspection commands piggy-back on the work directory that has been
+	 * created by the main pgcopydb command, so it expects the work directory
+	 * to have been created already.
+	 */
+	if (!createWorkDir && !directory_exists(cfPaths->topdir))
 	{
-		pid_t onFilePid = 0;
-
-		if (file_exists(cfPaths->pidfile))
-		{
-			/*
-			 * Only implement the "happy path": read_pidfile removes the file
-			 * when if fails to read it, or when the pid contained in there in
-			 * a stale pid (doesn't belong to any currently running process).
-			 */
-			if (read_pidfile(cfPaths->pidfile, &onFilePid))
-			{
-				log_fatal("Working directory \"%s\" already exists and "
-						  "contains a pidfile for process %d, "
-						  "which is currently running",
-						  cfPaths->topdir,
-						  onFilePid);
-				return false;
-			}
-		}
+		log_fatal("Work directory \"%s\" does not exists", cfPaths->topdir);
+		return false;
 	}
 
 	bool removeDir = false;
@@ -179,10 +185,14 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 		return false;
 	}
 
-	/* now populate our pidfile */
-	if (!create_pidfile(cfPaths->pidfile, pid))
+	/* protect against running multiple "service" commands concurrently */
+	if (service)
 	{
-		return false;
+		if (!copydb_acquire_pidfile(cfPaths, serviceName))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
 
 	/* and now for the other sub-directories */
@@ -192,6 +202,7 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 		cfPaths->tbldir,
 		cfPaths->idxdir,
 		cfPaths->cdc.dir,
+		cfPaths->compare.dir,
 		NULL
 	};
 
@@ -200,6 +211,99 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 		if (!copydb_rmdir_or_mkdir(dirs[i], removeDir))
 		{
 			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_acquire_pidfile deals with creating the pidfile for the current
+ * service, which is the "main" pgcopydb service unless serviceName is not
+ * NULL.
+ */
+bool
+copydb_acquire_pidfile(CopyFilePaths *cfPaths, char *serviceName)
+{
+	if (!directory_exists(cfPaths->topdir))
+	{
+		log_fatal("Work directory \"%s\" does not exists", cfPaths->topdir);
+		return false;
+	}
+
+	pid_t pid = getpid();
+
+	/*
+	 * Only create the main pidfile when we're not running an auxilliary
+	 * service.
+	 */
+	if (serviceName == NULL)
+	{
+		if (!copydb_create_pidfile(cfPaths->pidfile, pid, true))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		return true;
+	}
+
+	/*
+	 * The "snapshot" service is special, it's an auxilliary service that's
+	 * allowed to run concurrently to the "main" pgcopydb service.
+	 */
+	if (!streq("snapshot", serviceName))
+	{
+		if (!copydb_create_pidfile(cfPaths->pidfile, pid, false))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	/*
+	 * When running an auxilliary service, we create its own pidfile and also
+	 * check that the same service isn't already running.
+	 */
+	if (!copydb_create_pidfile(cfPaths->spidfile, pid, true))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_create_pidfile creates a pidfile of the given name and updates the
+ * given pid. It fails if the pidfile already exists and belongs to a currently
+ * running process, acting like a lockfile then.
+ */
+bool
+copydb_create_pidfile(const char *pidfile, pid_t pid, bool createPidFile)
+{
+	if (file_exists(pidfile))
+	{
+		pid_t onFilePid = 0;
+
+		if (read_pidfile(pidfile, &onFilePid))
+		{
+			log_fatal("Pidfile \"%s\" already exists with process %d, "
+					  "which is currently running",
+					  pidfile,
+					  onFilePid);
+			return false;
+		}
+	}
+
+	/* now populate our pidfile */
+	if (createPidFile)
+	{
+		if (!create_pidfile(pidfile, pid))
+		{
 			return false;
 		}
 	}
@@ -324,7 +428,9 @@ copydb_inspect_workdir(CopyFilePaths *cfPaths, DirectoryState *dirState)
  * for top-level operations.
  */
 bool
-copydb_prepare_filepaths(CopyFilePaths *cfPaths, const char *dir, bool auxilliary)
+copydb_prepare_filepaths(CopyFilePaths *cfPaths,
+						 const char *dir,
+						 const char *serviceName)
 {
 	char topdir[MAXPGPATH] = { 0 };
 
@@ -351,15 +457,14 @@ copydb_prepare_filepaths(CopyFilePaths *cfPaths, const char *dir, bool auxilliar
 	/* first copy the top directory */
 	strlcpy(cfPaths->topdir, topdir, sizeof(cfPaths->topdir));
 
-	/* auxilliary processes use a different pidfile */
-	if (auxilliary)
+	/* some processes use an additional per-service pidfile */
+	if (serviceName != NULL)
 	{
-		sformat(cfPaths->pidfile, MAXPGPATH, "%s/pgcopydb.aux.pid", cfPaths->topdir);
+		sformat(cfPaths->spidfile, MAXPGPATH, "%s/pgcopydb.%s.pid",
+				cfPaths->topdir,
+				serviceName);
 	}
-	else
-	{
-		sformat(cfPaths->pidfile, MAXPGPATH, "%s/pgcopydb.pid", cfPaths->topdir);
-	}
+	sformat(cfPaths->pidfile, MAXPGPATH, "%s/pgcopydb.pid", cfPaths->topdir);
 
 	/* now that we have our topdir, prepare all the others from there */
 	sformat(cfPaths->snfile, MAXPGPATH, "%s/snapshot", cfPaths->topdir);
@@ -370,6 +475,9 @@ copydb_prepare_filepaths(CopyFilePaths *cfPaths, const char *dir, bool auxilliar
 
 	/* prepare also the name of the schema file (JSON) */
 	sformat(cfPaths->schemafile, MAXPGPATH, "%s/schema.json", cfPaths->topdir);
+
+	/* prepare also the name of the summary file (JSON) */
+	sformat(cfPaths->summaryfile, MAXPGPATH, "%s/summary.json", cfPaths->topdir);
 
 	/* now prepare the done files */
 	struct pair
@@ -444,6 +552,10 @@ copydb_prepare_filepaths(CopyFilePaths *cfPaths, const char *dir, bool auxilliar
 			"%s/origin",
 			cfPaths->cdc.dir);
 
+	sformat(cfPaths->cdc.slotfile, MAXPGPATH,
+			"%s/slot",
+			cfPaths->cdc.dir);
+
 	sformat(cfPaths->cdc.tlihistfile, MAXPGPATH,
 			"%s/tli.history",
 			cfPaths->cdc.dir);
@@ -455,6 +567,32 @@ copydb_prepare_filepaths(CopyFilePaths *cfPaths, const char *dir, bool auxilliar
 	sformat(cfPaths->cdc.walsegsizefile, MAXPGPATH,
 			"%s/wal_segment_size",
 			cfPaths->cdc.dir);
+
+	sformat(cfPaths->cdc.lsntrackingfile, MAXPGPATH,
+			"%s/lsn.json",
+			cfPaths->cdc.dir);
+
+	/*
+	 * Now prepare the "compare" files we need to compare schema and data
+	 * between the source and target instance.
+	 */
+	sformat(cfPaths->compare.dir, MAXPGPATH, "%s/compare", cfPaths->topdir);
+
+	sformat(cfPaths->compare.sschemafile, MAXPGPATH,
+			"%s/source-schema.json",
+			cfPaths->compare.dir);
+
+	sformat(cfPaths->compare.tschemafile, MAXPGPATH,
+			"%s/target-schema.json",
+			cfPaths->compare.dir);
+
+	sformat(cfPaths->compare.sdatafile, MAXPGPATH,
+			"%s/source-data.json",
+			cfPaths->compare.dir);
+
+	sformat(cfPaths->compare.tdatafile, MAXPGPATH,
+			"%s/target-data.json",
+			cfPaths->compare.dir);
 
 	return true;
 }
@@ -476,14 +614,20 @@ copydb_prepare_dump_paths(CopyFilePaths *cfPaths, DumpPaths *dumpPaths)
 	sformat(dumpPaths->preFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "pre.dump");
 
+	sformat(dumpPaths->preListOutFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "pre-out.list");
+
+	sformat(dumpPaths->preListFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "pre-filtered.list");
+
 	sformat(dumpPaths->postFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "post.dump");
 
-	sformat(dumpPaths->preListFilename, MAXPGPATH, "%s/%s",
-			cfPaths->schemadir, "pre.list");
+	sformat(dumpPaths->postListOutFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "post-out.list");
 
 	sformat(dumpPaths->postListFilename, MAXPGPATH, "%s/%s",
-			cfPaths->schemadir, "post.list");
+			cfPaths->schemadir, "post-filtered.list");
 
 	return true;
 }
@@ -515,7 +659,7 @@ copydb_rmdir_or_mkdir(const char *dir, bool removeDir)
 
 		if (pg_mkdir_p((char *) dir, 0700) == -1)
 		{
-			log_fatal("Failed to create directory \"%s\"", dir);
+			log_fatal("Failed to create directory \"%s\": %m", dir);
 			return false;
 		}
 	}
@@ -532,56 +676,47 @@ copydb_rmdir_or_mkdir(const char *dir, bool removeDir)
  */
 bool
 copydb_init_specs(CopyDataSpec *specs,
-				  char *source_pguri,
-				  char *target_pguri,
-				  int tableJobs,
-				  int indexJobs,
-				  uint64_t splitTablesLargerThan,
-				  char *splitTablesLargerThanPretty,
-				  CopyDataSection section,
-				  char *snapshot,
-				  char *hookPreCopy,
-				  char *hookPostCopy,
-				  RestoreOptions restoreOptions,
-				  bool roles,
-				  bool skipLargeObjects,
-				  bool skipExtensions,
-				  bool restart,
-				  bool resume,
-				  bool consistent)
+				  CopyDBOptions *options,
+				  CopyDataSection section)
 {
 	/* fill-in a structure with the help of the C compiler */
 	CopyDataSpec tmpCopySpecs = {
 		.cfPaths = specs->cfPaths,
 		.pgPaths = specs->pgPaths,
 
-		.source_pguri = { 0 },
-		.target_pguri = { 0 },
+		.connStrings = options->connStrings,
 
 		.sourceSnapshot = {
 			.pgsql = { 0 },
-			.pguri = { 0 },
+			.pguri = options->connStrings.source_pguri,
+			.safeURI = options->connStrings.safeSourcePGURI,
 			.connectionType = PGSQL_CONN_SOURCE,
 			.snapshot = { 0 }
 		},
 
 		.section = section,
-		.restoreOptions = restoreOptions,
-		.roles = roles,
-		.skipLargeObjects = skipLargeObjects,
-		.skipExtensions = skipExtensions,
+		.restoreOptions = options->restoreOptions,
+		.roles = options->roles,
+		.skipLargeObjects = options->skipLargeObjects,
+		.skipExtensions = options->skipExtensions,
+		.skipCommentOnExtension = options->skipCommentOnExtension,
+		.skipCollations = options->skipCollations,
+		.skipVacuum = options->skipVacuum,
+		.noRolesPasswords = options->noRolesPasswords,
+		.failFast = options->failFast,
 
-		.restart = restart,
-		.resume = resume,
-		.consistent = consistent,
+		.restart = options->restart,
+		.resume = options->resume,
+		.consistent = !options->notConsistent,
 
-		.tableJobs = tableJobs,
-		.indexJobs = indexJobs,
+		.tableJobs = options->tableJobs,
+		.indexJobs = options->indexJobs,
+		.lObjectJobs = options->lObjectJobs,
 
 		/* at the moment we don't have --vacuumJobs separately */
-		.vacuumJobs = tableJobs,
+		.vacuumJobs = options->tableJobs,
 
-		.splitTablesLargerThan = splitTablesLargerThan,
+		.splitTablesLargerThan = options->splitTablesLargerThan,
 
 		.tableSemaphore = { 0 },
 		.indexSemaphore = { 0 },
@@ -589,52 +724,16 @@ copydb_init_specs(CopyDataSpec *specs,
 		.vacuumQueue = { 0 },
 		.indexQueue = { 0 },
 
-		.extensionArray = { 0, NULL },
-		.sourceTableArray = { 0, NULL },
-		.sourceIndexArray = { 0, NULL },
-		.sequenceArray = { 0, NULL },
-		.tableSpecsArray = { 0, NULL },
-
-		.sourceTableHashByOid = NULL
+		.catalog = { 0 },
+		.tableSpecsArray = { 0, NULL }
 	};
 
-	/* initialize the connection strings */
-	if (source_pguri != NULL)
-	{
-		strlcpy(tmpCopySpecs.source_pguri, source_pguri, MAXCONNINFO);
-		strlcpy(tmpCopySpecs.sourceSnapshot.pguri, source_pguri, MAXCONNINFO);
-	}
-
-	if (target_pguri != NULL)
-	{
-		strlcpy(tmpCopySpecs.target_pguri, target_pguri, MAXCONNINFO);
-	}
-
-	if (snapshot != NULL && !IS_EMPTY_STRING_BUFFER(snapshot))
+	if (!IS_EMPTY_STRING_BUFFER(options->snapshot))
 	{
 		strlcpy(tmpCopySpecs.sourceSnapshot.snapshot,
-				snapshot,
+				options->snapshot,
 				sizeof(tmpCopySpecs.sourceSnapshot.snapshot));
 	}
-
-	/* TS Hooks */
-	if (hookPreCopy != NULL && !IS_EMPTY_STRING_BUFFER(hookPreCopy))
-	{
-		strlcpy(tmpCopySpecs.hookPreCopy,
-				hookPreCopy,
-				sizeof(tmpCopySpecs.hookPreCopy));
-	}
-	if (hookPostCopy != NULL && !IS_EMPTY_STRING_BUFFER(hookPostCopy))
-	{
-		strlcpy(tmpCopySpecs.hookPostCopy,
-				hookPostCopy,
-				sizeof(tmpCopySpecs.hookPostCopy));
-	}
-
-
-	strlcpy(tmpCopySpecs.splitTablesLargerThanPretty,
-			splitTablesLargerThanPretty,
-			sizeof(tmpCopySpecs.splitTablesLargerThanPretty));
 
 	/* copy the structure as a whole memory area to the target place */
 	*specs = tmpCopySpecs;
@@ -653,7 +752,7 @@ copydb_init_specs(CopyDataSpec *specs,
 	{
 		log_error("Failed to create the table concurrency semaphore "
 				  "to orchestrate %d TABLE DATA COPY jobs",
-				  tableJobs);
+				  options->tableJobs);
 		return false;
 	}
 
@@ -664,7 +763,7 @@ copydb_init_specs(CopyDataSpec *specs,
 	{
 		log_error("Failed to create the index concurrency semaphore "
 				  "to orchestrate %d CREATE INDEX jobs",
-				  indexJobs);
+				  options->indexJobs);
 		return false;
 	}
 
@@ -672,14 +771,17 @@ copydb_init_specs(CopyDataSpec *specs,
 		specs->section == DATA_SECTION_TABLE_DATA)
 	{
 		/* create the VACUUM process queue */
-		if (!queue_create(&(specs->vacuumQueue)))
+		if (!specs->skipVacuum)
 		{
-			log_error("Failed to create the VACUUM process queue");
-			return false;
+			if (!queue_create(&(specs->vacuumQueue), "vacuum"))
+			{
+				log_error("Failed to create the VACUUM process queue");
+				return false;
+			}
 		}
 
 		/* create the CREATE INDEX process queue */
-		if (!queue_create(&(specs->indexQueue)))
+		if (!queue_create(&(specs->indexQueue), "create index"))
 		{
 			log_error("Failed to create the INDEX process queue");
 			return false;
@@ -712,14 +814,7 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 		.cfPaths = &(specs->cfPaths),
 		.pgPaths = &(specs->pgPaths),
 
-		.source_pguri = { 0 },
-		.target_pguri = { 0 },
-		.sourceSnapshot = {
-			.pgsql = { 0 },
-			.pguri = { 0 },
-			.connectionType = specs->sourceSnapshot.connectionType,
-			.snapshot = { 0 }
-		},
+		.connStrings = &(specs->connStrings),
 
 		.section = specs->section,
 		.resume = specs->resume,
@@ -734,25 +829,8 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 		.indexSemaphore = &(specs->indexSemaphore)
 	};
 
-	/* initialize the connection strings */
-	strlcpy(tmpTableSpecs.source_pguri, specs->source_pguri, MAXCONNINFO);
-	strlcpy(tmpTableSpecs.target_pguri, specs->target_pguri, MAXCONNINFO);
-
-	/* initialize the sourceSnapshot buffers */
-	if (!copydb_copy_snapshot(specs, &(tmpTableSpecs.sourceSnapshot)))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	/* copy the structure as a whole memory area to the target place */
 	*tableSpecs = tmpTableSpecs;
-
-	/* compute the table fully qualified name */
-	sformat(tableSpecs->qname, sizeof(tableSpecs->qname),
-			"\"%s\".\"%s\"",
-			tableSpecs->sourceTable->nspname,
-			tableSpecs->sourceTable->relname);
 
 	/* This CopyTableDataSpec might be for a partial COPY */
 	if (source->partsArray.count >= 1)
@@ -768,21 +846,6 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 
 		strlcpy(tableSpecs->part.partKey, source->partKey, NAMEDATALEN);
 
-		/*
-		 * Prepare the COPY command.
-		 *
-		 * The way schema_list_partitions prepares the boundaries is non
-		 * overlapping, so we can use the BETWEEN operator to select our source
-		 * rows in the COPY sub-query.
-		 */
-		sformat(tableSpecs->part.copyQuery, sizeof(tableSpecs->part.copyQuery),
-				"(SELECT * FROM %s"
-				" WHERE \"%s\" BETWEEN %lld AND %lld)",
-				tableSpecs->qname,
-				tableSpecs->part.partKey,
-				(long long) tableSpecs->part.min,
-				(long long) tableSpecs->part.max);
-
 		/* now compute the table-specific paths we are using in copydb */
 		if (!copydb_init_tablepaths_for_part(tableSpecs->cfPaths,
 											 &(tableSpecs->tablePaths),
@@ -791,7 +854,7 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 		{
 			log_error("Failed to prepare pathnames for partition %d of table %s",
 					  partNumber,
-					  tableSpecs->qname);
+					  tableSpecs->sourceTable->qname);
 			return false;
 		}
 
@@ -806,19 +869,6 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 		 */
 		sformat(tableSpecs->tablePaths.truncateDoneFile, MAXPGPATH,
 				"%s/%u.truncate",
-				tableSpecs->cfPaths->tbldir,
-				source->oid);
-
-		/*
-		 * TS: The pre- and post-copy table hook done files, needed as they run in
-		 * a critical section.
-		 */
-		sformat(tableSpecs->tablePaths.hookPreCopyDoneFile, MAXPGPATH,
-				"%s/%u.hook-pre-copy",
-				tableSpecs->cfPaths->tbldir,
-				source->oid);
-		sformat(tableSpecs->tablePaths.hookPostCopyDoneFile, MAXPGPATH,
-				"%s/%u.hook-post-copy",
 				tableSpecs->cfPaths->tbldir,
 				source->oid);
 	}
@@ -862,19 +912,15 @@ copydb_init_tablepaths(CopyFilePaths *cfPaths,
 			cfPaths->rundir,
 			oid);
 
-	/* TS hooks */
-	sformat(tablePaths->hookPreCopyDoneFile, MAXPGPATH, "%s/%d.hook-pre-copy",
-			cfPaths->tbldir,
-			oid);
-	sformat(tablePaths->hookPostCopyDoneFile, MAXPGPATH, "%s/%d.hook-post-copy",
-			cfPaths->tbldir,
-			oid);
-
 	sformat(tablePaths->doneFile, MAXPGPATH, "%s/%d.done",
 			cfPaths->tbldir,
 			oid);
 
 	sformat(tablePaths->idxListFile, MAXPGPATH, "%s/%u.idx",
+			cfPaths->tbldir,
+			oid);
+
+	sformat(tablePaths->chksumFile, MAXPGPATH, "%s/%u.sum.json",
 			cfPaths->tbldir,
 			oid);
 
@@ -922,7 +968,13 @@ copydb_fatal_exit()
 		return false;
 	}
 
-	return copydb_wait_for_subprocesses();
+	/*
+	 * Now wait until all the sub-processes have exited, and refrain from
+	 * calling copydb_fatal_exit() recursively when a process exits with a
+	 * non-zero return code.
+	 */
+	bool failFast = false;
+	return copydb_wait_for_subprocesses(failFast);
 }
 
 
@@ -932,10 +984,9 @@ copydb_fatal_exit()
  * returns true only when all the subprocesses have returned zero (success).
  */
 bool
-copydb_wait_for_subprocesses()
+copydb_wait_for_subprocesses(bool failFast)
 {
 	bool allReturnCodeAreZero = true;
-
 	log_debug("Waiting for sub-processes to finish");
 
 	for (;;)
@@ -964,7 +1015,7 @@ copydb_wait_for_subprocesses()
 			{
 				/*
 				 * We're using WNOHANG, 0 means there are no stopped or exited
-				 * children sleep for awhile and ask again later.
+				 * children. Sleep for awhile and ask again later.
 				 */
 				pg_usleep(100 * 1000); /* 100 ms */
 				break;
@@ -976,15 +1027,22 @@ copydb_wait_for_subprocesses()
 
 				if (returnCode == 0)
 				{
-					log_debug("Sub-processes %d exited with code %d",
+					log_debug("Sub-process %d exited with code %d",
 							  pid, returnCode);
 				}
 				else
 				{
 					allReturnCodeAreZero = false;
 
-					log_error("Sub-processes %d exited with code %d",
+					log_error("Sub-process %d exited with code %d",
 							  pid, returnCode);
+
+					if (failFast)
+					{
+						log_error("Signaling other processes to terminate "
+								  "(see --fail-fast)");
+						(void) copydb_fatal_exit();
+					}
 				}
 
 				break;
@@ -993,4 +1051,182 @@ copydb_wait_for_subprocesses()
 	}
 
 	return allReturnCodeAreZero;
+}
+
+
+/*
+ * copydb_register_sysv_semaphore registers a semaphore to our internal array
+ * of System V resources for cleanup at exit.
+ */
+bool
+copydb_register_sysv_semaphore(SysVResArray *array, Semaphore *semaphore)
+{
+	if (SYSV_RES_MAX_COUNT <= array->count)
+	{
+		log_fatal("Failed to register semaphore %d: "
+				  "resource array counts %d items already",
+				  semaphore->semId,
+				  array->count);
+		return false;
+	}
+
+	log_trace("copydb_register_sysv_semaphore[%d]: %d",
+			  array->count,
+			  semaphore->semId);
+
+	array->array[array->count].kind = SYSV_SEMAPHORE;
+	array->array[array->count].res.semaphore = semaphore;
+
+	++(array->count);
+
+	return true;
+}
+
+
+/*
+ * copydb_unregister_sysv_queue marks the given queue as unlinked already.
+ */
+bool
+copydb_unlink_sysv_semaphore(SysVResArray *array, Semaphore *semaphore)
+{
+	for (int i = 0; i < array->count; i++)
+	{
+		SysVRes *res = &(array->array[i]);
+
+		if (res->kind == SYSV_SEMAPHORE &&
+			res->res.semaphore->semId == semaphore->semId)
+		{
+			res->unlinked = true;
+			return true;
+		}
+	}
+
+	log_error("BUG: copydb_unlink_sysv_semaphore failed to find semaphore %d",
+			  semaphore->semId);
+
+	return false;
+}
+
+
+/*
+ * copydb_register_sysv_queue registers a semaphore to our internal array of
+ * System V resources for cleanup at exit.
+ */
+bool
+copydb_register_sysv_queue(SysVResArray *array, Queue *queue)
+{
+	if (SYSV_RES_MAX_COUNT <= array->count)
+	{
+		log_fatal("Failed to register semaphore %d: "
+				  "resource array counts %d items already",
+				  queue->qId,
+				  array->count);
+		return false;
+	}
+
+	log_trace("copydb_register_sysv_queue[%d]: %d",
+			  array->count,
+			  queue->qId);
+
+	array->array[array->count].kind = SYSV_QUEUE;
+	array->array[array->count].res.queue = queue;
+
+	++(array->count);
+
+	return true;
+}
+
+
+/*
+ * copydb_unregister_sysv_queue marks the given queue as unlinked already.
+ */
+bool
+copydb_unlink_sysv_queue(SysVResArray *array, Queue *queue)
+{
+	for (int i = 0; i < array->count; i++)
+	{
+		SysVRes *res = &(array->array[i]);
+
+		if (res->kind == SYSV_QUEUE && res->res.queue->qId == queue->qId)
+		{
+			res->unlinked = true;
+			return true;
+		}
+	}
+
+	log_error("BUG: copydb_unlink_sysv_queue failed to find queue %d",
+			  queue->qId);
+
+	return false;
+}
+
+
+/*
+ * copydb_cleanup_sysv_resources unlinks semaphores and queues that have been
+ * registered in the given array.
+ */
+bool
+copydb_cleanup_sysv_resources(SysVResArray *array)
+{
+	pid_t pid = getpid();
+
+	/*
+	 * Clean-up resources in the reverse order of their registering.
+	 *
+	 * This is particulary important for the logging semaphore, which is the
+	 * first resource that's registered in that array, and that we need until
+	 * the very end.
+	 */
+	for (int i = array->count - 1; 0 <= i; i--)
+	{
+		SysVRes *res = &(array->array[i]);
+
+		/* skip already unlinked System V resources */
+		if (res->unlinked)
+		{
+			continue;
+		}
+
+		switch (res->kind)
+		{
+			case SYSV_QUEUE:
+			{
+				Queue *queue = res->res.queue;
+
+				if (queue->owner == pid)
+				{
+					if (!queue_unlink(queue))
+					{
+						/* errors have already been logged */
+						return false;
+					}
+				}
+
+				break;
+			}
+
+			case SYSV_SEMAPHORE:
+			{
+				Semaphore *semaphore = res->res.semaphore;
+
+				if (!semaphore_finish(semaphore))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				break;
+			}
+
+			default:
+			{
+				log_error("BUG: Failed to clean-up System V resource "
+						  " of unknown type: %d",
+						  res->kind);
+				return false;
+			}
+		}
+	}
+
+	return true;
 }

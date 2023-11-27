@@ -142,6 +142,7 @@ cli_sentinel_getopts(int argc, char **argv)
 		{ "json", no_argument, NULL, 'J' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "notice", no_argument, NULL, 'v' },
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
@@ -171,8 +172,8 @@ cli_sentinel_getopts(int argc, char **argv)
 							  "see above for details.");
 					exit(EXIT_CODE_BAD_ARGS);
 				}
-				strlcpy(options.source_pguri, optarg, MAXCONNINFO);
-				log_trace("--source %s", options.source_pguri);
+				options.connStrings.source_pguri = pg_strdup(optarg);
+				log_trace("--source %s", options.connStrings.source_pguri);
 				break;
 			}
 
@@ -237,6 +238,12 @@ cli_sentinel_getopts(int argc, char **argv)
 
 					case 2:
 					{
+						log_set_level(LOG_SQL);
+						break;
+					}
+
+					case 3:
+					{
 						log_set_level(LOG_DEBUG);
 						break;
 					}
@@ -252,14 +259,14 @@ cli_sentinel_getopts(int argc, char **argv)
 
 			case 'd':
 			{
-				verboseCount = 2;
+				verboseCount = 3;
 				log_set_level(LOG_DEBUG);
 				break;
 			}
 
 			case 'z':
 			{
-				verboseCount = 3;
+				verboseCount = 4;
 				log_set_level(LOG_TRACE);
 				break;
 			}
@@ -279,25 +286,17 @@ cli_sentinel_getopts(int argc, char **argv)
 		}
 	}
 
-	/* stream commands support the source URI environment variable */
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri))
-	{
-		if (env_exists(PGCOPYDB_SOURCE_PGURI))
-		{
-			if (!get_env_copy(PGCOPYDB_SOURCE_PGURI,
-							  options.source_pguri,
-							  sizeof(options.source_pguri)))
-			{
-				/* errors have already been logged */
-				++errors;
-			}
-		}
-	}
-
-	if (IS_EMPTY_STRING_BUFFER(options.source_pguri))
+	if (options.connStrings.source_pguri == NULL)
 	{
 		log_fatal("Options --source is mandatory");
 		++errors;
+	}
+
+	/* prepare safe versions of the connection strings (without password) */
+	if (!cli_prepare_pguris(&(options.connStrings)))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
 	if (options.currentpos && options.endpos != InvalidXLogRecPtr)
@@ -335,38 +334,7 @@ cli_sentinel_create(int argc, char **argv)
 
 	(void) find_pg_commands(&(copySpecs.pgPaths));
 
-	bool auxilliary = false;
-
-	if (!copydb_init_workdir(&copySpecs,
-							 NULL,
-							 sentinelDBoptions.restart,
-							 sentinelDBoptions.resume,
-							 auxilliary))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	RestoreOptions restoreOptions = { 0 };
-
-	if (!copydb_init_specs(&copySpecs,
-						   sentinelDBoptions.source_pguri,
-						   sentinelDBoptions.target_pguri,
-						   1,   /* tableJobs */
-						   1,   /* indexJobs */
-						   0,   /* skip threshold */
-						   "",  /* skip threshold pretty printed */
-						   DATA_SECTION_ALL,
-						   sentinelDBoptions.snapshot,
-						   "",
-						   "",
-						   restoreOptions,
-						   false, /* roles */
-						   false, /* skipLargeObjects */
-						   false, /* skipExtensions */
-						   sentinelDBoptions.restart,
-						   sentinelDBoptions.resume,
-						   !sentinelDBoptions.notConsistent))
+	if (!copydb_init_specs(&copySpecs, &sentinelDBoptions, DATA_SECTION_ALL))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -388,7 +356,7 @@ cli_sentinel_create(int argc, char **argv)
 static void
 cli_sentinel_drop(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.source_pguri;
+	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 	PGSQL pgsql = { 0 };
 
 	if (argc > 0)
@@ -454,7 +422,7 @@ cli_sentinel_set_startpos(int argc, char **argv)
 		}
 	}
 
-	char *pguri = (char *) sentinelDBoptions.source_pguri;
+	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 	PGSQL pgsql = { 0 };
 
 	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
@@ -523,7 +491,7 @@ cli_sentinel_set_endpos(int argc, char **argv)
 		}
 	}
 
-	char *pguri = (char *) sentinelDBoptions.source_pguri;
+	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 	PGSQL pgsql = { 0 };
 
 	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
@@ -582,7 +550,7 @@ cli_sentinel_set_endpos(int argc, char **argv)
 static void
 cli_sentinel_set_apply(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.source_pguri;
+	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 	PGSQL pgsql = { 0 };
 
 	if (argc > 0)
@@ -613,7 +581,7 @@ cli_sentinel_set_apply(int argc, char **argv)
 static void
 cli_sentinel_set_prefetch(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.source_pguri;
+	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 	PGSQL pgsql = { 0 };
 
 	if (argc > 0)
@@ -642,7 +610,7 @@ cli_sentinel_set_prefetch(int argc, char **argv)
 static void
 cli_sentinel_get(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.source_pguri;
+	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 	PGSQL pgsql = { 0 };
 
 	if (argc > 0)

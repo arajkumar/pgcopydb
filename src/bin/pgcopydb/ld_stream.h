@@ -13,9 +13,22 @@
 #include "copydb.h"
 #include "queue_utils.h"
 #include "pgsql.h"
+#include "schema.h"
 
 #define OUTPUT_BEGIN "BEGIN; -- "
 #define OUTPUT_COMMIT "COMMIT; -- "
+#define OUTPUT_ROLLBACK "ROLLBACK; -- "
+#define OUTPUT_SWITCHWAL "-- SWITCH WAL "
+#define OUTPUT_KEEPALIVE "-- KEEPALIVE "
+#define OUTPUT_ENDPOS "-- ENDPOS "
+
+#define PREPARE "PREPARE "
+#define EXECUTE "EXECUTE "
+#define TRUNCATE "TRUNCATE "
+
+#define INSERT "AS INSERT INTO "
+#define UPDATE "AS UPDATE "
+#define DELETE "AS DELETE "
 
 typedef enum
 {
@@ -25,10 +38,22 @@ typedef enum
 	STREAM_ACTION_INSERT = 'I',
 	STREAM_ACTION_UPDATE = 'U',
 	STREAM_ACTION_DELETE = 'D',
+	STREAM_ACTION_EXECUTE = 'x',
 	STREAM_ACTION_TRUNCATE = 'T',
 	STREAM_ACTION_MESSAGE = 'M',
-	STREAM_ACTION_SWITCH = 'X'
+	STREAM_ACTION_SWITCH = 'X',
+	STREAM_ACTION_KEEPALIVE = 'K',
+	STREAM_ACTION_ENDPOS = 'E',
+	STREAM_ACTION_ROLLBACK = 'R'
 } StreamAction;
+
+typedef struct InternalMessage
+{
+	StreamAction action;
+	uint64_t lsn;
+	uint64_t time;
+	char timeStr[BUFSIZE];
+} InternalMessage;
 
 typedef struct StreamCounters
 {
@@ -46,81 +71,26 @@ typedef struct StreamCounters
 
 typedef struct LogicalMessageMetadata
 {
+	uint64_t recvTime;         /* time(NULL) at message receive time */
+
+	/* from parsing the message itself */
 	StreamAction action;
+	uint32_t hash;              /* PREPARE/EXECUTE statement name is a hash */
 	uint32_t xid;
 	uint64_t lsn;
-	uint64_t nextlsn;
+	uint64_t txnCommitLSN;      /* COMMIT LSN of the transaction */
 	char timestamp[PG_MAX_TIMESTAMP];
+
+	/* our own internal decision making */
+	bool filterOut;
+	bool skipping;
+
+	/* the statement part of a PREPARE dseadbeef AS ... */
+	char *stmt;
+
+	/* the raw message in our internal JSON format */
+	char *jsonBuffer;           /* malloc'ed area */
 } LogicalMessageMetadata;
-
-
-/*
- * The detailed behavior of the LogicalStreamClient is implemented in the
- * callback functions writeFunction, flushFunction, and closeFunction.
- *
- */
-typedef enum
-{
-	STREAM_MODE_UNKNOW = 0,
-	STREAM_MODE_RECEIVE,        /* pgcopydb receive */
-	STREAM_MODE_PREFETCH,       /* pgcopydb fetch */
-	STREAM_MODE_APPLY           /* pgcopydb replay */
-} LogicalStreamMode;
-
-
-typedef struct StreamContext
-{
-	CDCPaths paths;
-	LogicalStreamMode mode;
-
-	char source_pguri[MAXCONNINFO];
-
-	uint64_t startpos;
-	uint64_t endpos;
-	bool apply;
-
-	LogicalMessageMetadata metadata;
-
-	Queue transformQueue;
-	uint32_t WalSegSz;
-	uint32_t timeline;
-
-	uint64_t firstLSN;
-	char walFileName[MAXPGPATH];
-	char sqlFileName[MAXPGPATH];
-	FILE *jsonFile;
-
-	pid_t subprocess;
-
-	StreamCounters counters;
-} StreamContext;
-
-
-typedef struct StreamApplyContext
-{
-	CDCPaths paths;
-
-	PGSQL pgsql;
-	char source_pguri[MAXCONNINFO];
-	char target_pguri[MAXCONNINFO];
-	char origin[BUFSIZE];
-
-	IdentifySystem system;      /* information about source database */
-	uint32_t WalSegSz;          /* information about source database */
-
-	uint64_t lsn;               /* read from SQL file COMMIT comments */
-	uint64_t nextlsn;           /* read from SQL file COMMIT comments */
-	uint64_t previousLSN;       /* target database progress */
-
-	bool apply;                 /* from the pgcopydb sentinel */
-	uint64_t startpos;          /* from the pgcopydb sentinel */
-	uint64_t endpos;            /* finish applying when endpos is reached */
-
-	bool reachedEndPos;
-
-	char wal[MAXPGPATH];
-	char sqlFileName[MAXPGPATH];
-} StreamApplyContext;
 
 
 /* data types to support here are limited to what JSON/wal2json offers */
@@ -128,6 +98,7 @@ typedef struct LogicalMessageValue
 {
 	int oid;                    /* BOOLOID, INT8OID, FLOAT8OID, TEXTOID */
 	bool isNull;
+	bool isQuoted;
 
 	union value
 	{
@@ -147,6 +118,7 @@ typedef struct LogicalMessageValues
 typedef struct LogicalMessageValuesArray
 {
 	int count;
+	int capacity;
 	LogicalMessageValues *array; /* malloc'ed area */
 } LogicalMessageValuesArray;
 
@@ -165,32 +137,47 @@ typedef struct LogicalMessageTupleArray
 
 typedef struct LogicalMessageInsert
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	LogicalMessageTupleArray new;   /* {"columns": ...} */
 } LogicalMessageInsert;
 
 typedef struct LogicalMessageUpdate
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	LogicalMessageTupleArray old;   /* {"identity": ...} */
 	LogicalMessageTupleArray new;   /* {"columns": ...} */
 } LogicalMessageUpdate;
 
 typedef struct LogicalMessageDelete
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	LogicalMessageTupleArray old;   /* {"identity": ...} */
 } LogicalMessageDelete;
 
 typedef struct LogicalMessageTruncate
 {
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 } LogicalMessageTruncate;
 
+typedef struct LogicalMessageSwitchWAL
+{
+	uint64_t lsn;
+} LogicalMessageSwitchWAL;
+
+typedef struct LogicalMessageKeepalive
+{
+	uint64_t lsn;
+	char timestamp[PG_MAX_TIMESTAMP];
+} LogicalMessageKeepalive;
+
+typedef struct LogicalMessageEndpos
+{
+	uint64_t lsn;
+} LogicalMessageEndpos;
 
 /*
  * The JSON-lines logical decoding stream is then parsed into transactions that
@@ -206,6 +193,9 @@ typedef struct LogicalTransactionStatement
 		LogicalMessageUpdate update;
 		LogicalMessageDelete delete;
 		LogicalMessageTruncate truncate;
+		LogicalMessageSwitchWAL switchwal;
+		LogicalMessageKeepalive keepalive;
+		LogicalMessageEndpos endpos;
 	} stmt;
 
 	struct LogicalTransactionStatement *prev; /* double linked-list */
@@ -218,8 +208,11 @@ typedef struct LogicalTransaction
 	uint32_t xid;
 	uint64_t beginLSN;
 	uint64_t commitLSN;
-	uint64_t nextlsn;
+	uint64_t rollbackLSN;
 	char timestamp[PG_MAX_TIMESTAMP];
+	bool continued;
+	bool commit;
+	bool rollback;
 
 	uint32_t count;                     /* number of statements */
 	LogicalTransactionStatement *first;
@@ -233,25 +226,172 @@ typedef struct LogicalTransactionArray
 } LogicalTransactionArray;
 
 
-typedef struct StreamSpecs
+/*
+ * The logical decoding client produces messages that can be either:
+ *
+ *  - part of a transaction (BEGIN/COMMIT, then INSERT/UPDATE/DELETE/TRUNCATE)
+ *  - a keepalive message
+ *  - a pgcopydb constructed SWITCH WAL message
+ *
+ * The keepalive and switch wal messages could also appear within a
+ * transaction.
+ */
+typedef struct LogicalMessage
+{
+	bool isTransaction;
+	StreamAction action;
+
+	union command
+	{
+		LogicalTransaction tx;
+		LogicalMessageSwitchWAL switchwal;
+		LogicalMessageKeepalive keepalive;
+		LogicalMessageEndpos endpos;
+	} command;
+} LogicalMessage;
+
+
+typedef struct LogicalMessageArray
+{
+	int count;
+	LogicalMessage *array; /* malloc'ed area */
+} LogicalMessageArray;
+
+
+/*
+ * The detailed behavior of the LogicalStreamClient is implemented in the
+ * callback functions writeFunction, flushFunction, and closeFunction.
+ */
+typedef enum
+{
+	STREAM_MODE_UNKNOW = 0,
+	STREAM_MODE_RECEIVE,        /* pgcopydb receive */
+	STREAM_MODE_PREFETCH,       /* pgcopydb fetch */
+	STREAM_MODE_CATCHUP,        /* pgcopydb catchup */
+	STREAM_MODE_REPLAY          /* pgcopydb replay */
+} LogicalStreamMode;
+
+
+/*
+ * StreamContext allows tracking the progress of the ld_stream module and is
+ * shared also with the ld_transform module, which has its own instance of a
+ * StreamContext to track its own progress.
+ */
+typedef struct StreamContext
 {
 	CDCPaths paths;
+	LogicalStreamMode mode;
 
-	char source_pguri[MAXCONNINFO];
-	char logrep_pguri[MAXCONNINFO];
-	char target_pguri[MAXCONNINFO];
-
-	char slotName[NAMEDATALEN];
-	char origin[NAMEDATALEN];
+	ConnStrings *connStrings;
 
 	uint64_t startpos;
 	uint64_t endpos;
+	bool apply;
 
-	LogicalStreamMode mode;
+	bool stdIn;
+	bool stdOut;
 
-	bool restart;
-	bool resume;
-} StreamSpecs;
+	FILE *in;
+	FILE *out;
+
+	LogicalMessage currentMsg;
+	LogicalMessageMetadata metadata;
+	LogicalMessageMetadata previous;
+	LogicalTransactionStatement *stmt;
+
+	uint64_t maxWrittenLSN;     /* max LSN written so far to the JSON files */
+
+	uint64_t lastWriteTime;
+
+	/* transform needs some catalog lookups (pkey, type oid) */
+	SourceCatalog *catalog;
+
+	Queue *transformQueue;
+	uint32_t WalSegSz;
+	uint32_t timeline;
+
+	uint64_t firstLSN;
+	char partialFileName[MAXPGPATH];
+	char walFileName[MAXPGPATH];
+	char sqlFileName[MAXPGPATH];
+	FILE *jsonFile;
+	FILE *sqlFile;
+
+	StreamCounters counters;
+
+	bool transactionInProgress;
+} StreamContext;
+
+
+/*
+ * Keep track of the statements that have already been prepared in this
+ * session.
+ */
+typedef struct PreparedStmt
+{
+	uint32_t hash;
+	bool prepared;
+
+	UT_hash_handle hh;          /* makes this structure hashable */
+} PreparedStmt;
+
+/*
+ * As we're using synchronous_commit = off to speed-up things on the apply
+ * side, we need to track durability in the client-side.
+ */
+typedef struct LSNTracking
+{
+	uint64_t sourceLSN;         /* source system: replication origin */
+	uint64_t insertLSN;         /* target pgsql_current_wal_insert_lsn() */
+
+	/* that's a linked list */
+	struct LSNTracking *previous;
+} LSNTracking;
+
+/*
+ * StreamApplyContext allows tracking the apply progress.
+ */
+typedef struct StreamApplyContext
+{
+	CDCPaths paths;
+
+	/* target connection */
+	PGSQL pgsql;
+
+	/* source connection to publish sentinel updates */
+	PGSQL src;
+	bool sentinelQueryInProgress;
+	uint64_t sentinelSyncTime;
+
+	ConnStrings *connStrings;
+	char origin[BUFSIZE];
+
+	IdentifySystem system;      /* information about source database */
+	uint32_t WalSegSz;          /* information about source database */
+
+	uint64_t previousLSN;       /* register COMMIT LSN progress */
+	uint64_t switchLSN;         /* helps to find the next .sql file to apply */
+
+	LSNTracking *lsnTrackingList;
+
+	bool apply;                 /* from the pgcopydb sentinel */
+	uint64_t startpos;          /* from the pgcopydb sentinel */
+	uint64_t endpos;            /* finish applying when endpos is reached */
+	uint64_t replay_lsn;        /* from the pgcopydb sentinel */
+
+	bool reachedStartPos;
+	bool continuedTxn;
+	bool reachedEndPos;
+	bool reachedEOF;
+	bool transactionInProgress;
+	bool logSQL;
+
+	char wal[MAXPGPATH];
+	char sqlFileName[MAXPGPATH];
+
+	PreparedStmt *preparedStmt;
+} StreamApplyContext;
+
 
 typedef struct StreamContent
 {
@@ -262,23 +402,105 @@ typedef struct StreamContent
 	LogicalMessageMetadata *messages; /* malloc'ed area */
 } StreamContent;
 
+
+/*
+ * SubProcess management utils.
+ */
+typedef struct StreamSpecs StreamSpecs;
+
+typedef bool (*FollowSubCommand) (StreamSpecs *specs);
+
+typedef struct FollowSubProcess
+{
+	char *name;
+	FollowSubCommand command;
+	pid_t pid;
+	bool exited;
+	int returnCode;
+	int sig;
+} FollowSubProcess;
+
+
+/*
+ * StreamSpecs is the streaming specifications used by the client-side of the
+ * logical decoding implementation, where we keep track of progress etc.
+ */
+struct StreamSpecs
+{
+	CDCPaths paths;
+
+	ConnStrings *connStrings;
+
+	uint32_t WalSegSz;
+	IdentifySystem system;
+
+	ReplicationSlot slot;
+	KeyVal pluginOptions;
+
+	char origin[NAMEDATALEN];
+
+	uint64_t startpos;
+	uint64_t endpos;
+	CopyDBSentinel sentinel;
+
+	LogicalStreamMode mode;
+
+	bool restart;
+	bool resume;
+	bool logSQL;
+
+	/* subprocess management */
+	FollowSubProcess prefetch;
+	FollowSubProcess transform;
+	FollowSubProcess catchup;
+
+	/* transform needs some catalog lookups (pkey, type oid) */
+	SourceCatalog *catalog;
+
+	/* receive push json filenames to a queue for transform */
+	Queue transformQueue;
+
+	/* ld_stream and ld_transform needs their own StreamContext instance */
+	StreamContext private;
+
+	bool stdIn;                 /* read from stdin? */
+	bool stdOut;                /* (also) write to stdout? */
+
+	/* STREAM_MODE_REPLAY (and other operations) requires two unix pipes */
+	int pipe_rt[2];     /* receive-transform pipe */
+	int pipe_ta[2];     /* transform-apply pipe */
+
+	/* The previous pipe ends are connected to in/out for the sub-processes */
+	FILE *in;
+	FILE *out;
+};
+
+
 bool stream_init_specs(StreamSpecs *specs,
 					   CDCPaths *paths,
-					   char *source_pguri,
-					   char *target_pguri,
-					   char *slotName,
+					   ConnStrings *connStrings,
+					   ReplicationSlot *slot,
 					   char *origin,
 					   uint64_t endpos,
-					   LogicalStreamMode mode);
+					   LogicalStreamMode mode,
+					   SourceCatalog *catalog,
+					   bool stdIn,
+					   bool stdOut,
+					   bool logSQL);
 
-bool stream_init_context(StreamContext *privateContext, StreamSpecs *specs);
-bool stream_close_context(StreamContext *privateContext);
+bool stream_init_for_mode(StreamSpecs *specs, LogicalStreamMode mode);
+
+char * LogicalStreamModeToString(LogicalStreamMode mode);
+
+bool stream_check_in_out(StreamSpecs *specs);
+bool stream_init_context(StreamSpecs *specs);
 
 bool startLogicalStreaming(StreamSpecs *specs);
 bool streamCheckResumePosition(StreamSpecs *specs);
 
 bool streamWrite(LogicalStreamContext *context);
 bool streamFlush(LogicalStreamContext *context);
+bool streamKeepalive(LogicalStreamContext *context);
 bool streamClose(LogicalStreamContext *context);
 bool streamFeedback(LogicalStreamContext *context);
 
@@ -287,26 +509,35 @@ bool streamCloseFile(LogicalStreamContext *context, bool time_to_abort);
 
 bool streamWaitForSubprocess(LogicalStreamContext *context);
 
+bool prepareMessageMetadataFromContext(LogicalStreamContext *context);
+bool prepareMessageJSONbuffer(LogicalStreamContext *context);
+
+bool parseMessageActionAndXid(LogicalStreamContext *context);
+
 bool parseMessageMetadata(LogicalMessageMetadata *metadata,
 						  const char *buffer,
 						  JSON_Value *json,
 						  bool skipAction);
 
+bool LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b);
+
+bool stream_write_json(LogicalStreamContext *context, bool previous);
+
+bool stream_write_internal_message(LogicalStreamContext *context,
+								   InternalMessage *message);
+
 bool stream_read_file(StreamContent *content);
 bool stream_read_latest(StreamSpecs *specs, StreamContent *content);
+bool stream_update_latest_symlink(StreamContext *privateContext,
+								  const char *filename);
 
-bool buildReplicationURI(const char *pguri, char *repl_pguri);
+bool buildReplicationURI(const char *pguri, char **repl_pguri);
 
-bool stream_setup_databases(CopyDataSpec *copySpecs,
-							char *slotName,
-							char *origin);
+bool stream_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 
 bool stream_cleanup_databases(CopyDataSpec *copySpecs,
 							  char *slotName,
 							  char *origin);
-
-bool stream_create_repl_slot(CopyDataSpec *copySpecs,
-							 char *slotName, uint64_t *lsn);
 
 bool stream_create_origin(CopyDataSpec *copySpecs,
 						  char *nodeName, uint64_t startpos);
@@ -322,57 +553,171 @@ bool stream_read_context(CDCPaths *paths,
 						 uint32_t *WalSegSz);
 
 StreamAction StreamActionFromChar(char action);
+char * StreamActionToString(StreamAction action);
 
 /* ld_transform.c */
-bool stream_transform_start_worker(LogicalStreamContext *context);
-bool stream_transform_worker(LogicalStreamContext *context);
+bool stream_transform_worker(StreamSpecs *specs);
+bool stream_transform_from_queue(StreamSpecs *specs);
 bool stream_transform_add_file(Queue *queue, uint64_t firstLSN);
 bool stream_transform_send_stop(Queue *queue);
-bool stream_compute_pathnames(LogicalStreamContext *context, uint64_t lsn);
 
-bool stream_transform_file(char *jsonfilename, char *sqlfilename);
+bool stream_compute_pathnames(uint32_t WalSegSz,
+							  uint32_t timeline,
+							  uint64_t lsn,
+							  char *dir,
+							  char *walFileName,
+							  char *sqlFileName);
+
+bool stream_transform_stream(StreamSpecs *specs);
+bool stream_transform_resume(StreamSpecs *specs);
+bool stream_transform_line(void *ctx, const char *line, bool *stop);
+
+bool stream_transform_write_message(StreamContext *privateContext,
+									uint64_t *currentMsgIndex);
+
+bool stream_transform_message(StreamContext *privateContext,
+							  char *message);
+
+bool stream_transform_rotate(StreamContext *privateContext);
+
+bool stream_transform_file(StreamSpecs *specs,
+						   char *jsonfilename,
+						   char *sqlfilename);
+
+bool stream_transform_file_at_lsn(StreamSpecs *specs, uint64_t lsn);
+
+bool stream_write_message(FILE *out, LogicalMessage *msg);
 bool stream_write_transaction(FILE *out, LogicalTransaction *tx);
+
+bool stream_write_switchwal(FILE *out, LogicalMessageSwitchWAL *switchwal);
+bool stream_write_keepalive(FILE *out, LogicalMessageKeepalive *keepalive);
+bool stream_write_endpos(FILE *out, LogicalMessageEndpos *endpos);
+
+bool stream_write_begin(FILE *out, LogicalTransaction *tx);
+bool stream_write_commit(FILE *out, LogicalTransaction *tx);
+bool stream_write_rollback(FILE *out, LogicalTransaction *tx);
+
 bool stream_write_insert(FILE *out, LogicalMessageInsert *insert);
 bool stream_write_truncate(FILE *out, LogicalMessageTruncate *truncate);
 bool stream_write_update(FILE *out, LogicalMessageUpdate *update);
 bool stream_write_delete(FILE * out, LogicalMessageDelete *delete);
-bool stream_write_value(FILE *out, LogicalMessageValue *value);
+bool stream_write_sql_escape_string_constant(FILE *out, const char *str);
 
+bool stream_add_value_in_json_array(LogicalMessageValue *value,
+									JSON_Array *jsArray);
+
+
+bool parseMessage(StreamContext *privateContext, char *message, JSON_Value *json);
+
+bool streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
+											 LogicalTransactionStatement *stmt);
+
+
+bool GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
+												char **nspname, char **relname);
+
+void FreeLogicalMessage(LogicalMessage *msg);
+void FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt);
 void FreeLogicalTransaction(LogicalTransaction *tx);
 void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
+void FreeLogicalMessageTuple(LogicalMessageTuple *tuple);
+bool AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count);
 
-bool parseMessage(LogicalTransaction *txn,
-				  LogicalMessageMetadata *metadata,
-				  char *message,
-				  JSON_Value *json);
+/* ld_test_decoding.c */
+bool prepareTestDecodingMessage(LogicalStreamContext *context);
+
+bool parseTestDecodingMessageActionAndXid(LogicalStreamContext *context);
+
+bool parseTestDecodingMessage(StreamContext *privateContext,
+							  char *message,
+							  JSON_Value *json);
+
+/* ld_wal2json.c */
+bool prepareWal2jsonMessage(LogicalStreamContext *context);
+
+bool parseWal2jsonMessageActionAndXid(LogicalStreamContext *context);
+
+bool parseWal2jsonMessage(StreamContext *privateContext,
+						  char *message,
+						  JSON_Value *json);
 
 /* ld_apply.c */
 bool stream_apply_catchup(StreamSpecs *specs);
 
+bool stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context);
+
 bool stream_apply_wait_for_sentinel(StreamSpecs *specs,
 									StreamApplyContext *context);
 
-bool stream_apply_sync_sentinel(StreamApplyContext *context);
+bool stream_apply_sync_sentinel(StreamApplyContext *context,
+								bool findDurableLSN);
+
+bool stream_apply_send_sync_sentinel(StreamApplyContext *context);
+bool stream_apply_fetch_sync_sentinel(StreamApplyContext *context);
 
 bool stream_apply_file(StreamApplyContext *context);
 
-bool setupReplicationOrigin(StreamApplyContext *context,
-							CDCPaths *paths,
-							char *source_pguri,
-							char *target_pguri,
-							char *origin,
-							uint64_t endpos,
-							bool apply);
+bool stream_apply_sql(StreamApplyContext *context,
+					  LogicalMessageMetadata *metadata,
+					  const char *sql);
+
+bool stream_apply_init_context(StreamApplyContext *context,
+							   CDCPaths *paths,
+							   ConnStrings *connStrings,
+							   char *origin,
+							   uint64_t endpos);
+
+bool setupReplicationOrigin(StreamApplyContext *context, bool logSQL);
 
 bool computeSQLFileName(StreamApplyContext *context);
 
-StreamAction parseSQLAction(const char *query, LogicalMessageMetadata *metadata);
+bool parseSQLAction(const char *query, LogicalMessageMetadata *metadata);
 
+bool stream_apply_track_insert_lsn(StreamApplyContext *context,
+								   uint64_t sourceLSN);
+
+bool stream_apply_find_durable_lsn(StreamApplyContext *context,
+								   uint64_t *durableLSN);
+
+bool stream_apply_write_lsn_tracking(StreamApplyContext *context);
+bool stream_apply_read_lsn_tracking(StreamApplyContext *context);
+
+/* ld_replay */
+bool stream_replay(StreamSpecs *specs);
+bool stream_apply_replay(StreamSpecs *specs);
+bool stream_replay_line(void *ctx, const char *line, bool *stop);
+bool stream_replay_reached_endpos(StreamSpecs *specs,
+								  StreamApplyContext *context,
+								  bool stop);
 
 /* follow.c */
-bool follow_start_prefetch(StreamSpecs *specs, pid_t *pid);
-bool follow_start_catchup(StreamSpecs *specs, pid_t *pid);
-bool follow_wait_subprocesses(StreamSpecs *specs, pid_t prefetch, pid_t catchup);
-bool follow_wait_pid(pid_t subprocess, bool *exited, int *returnCode);
+bool follow_export_snapshot(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+bool follow_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+bool follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+
+bool follow_init_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel);
+bool follow_get_sentinel(StreamSpecs *specs,
+						 CopyDBSentinel *sentinel,
+						 bool verbose);
+bool follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+
+bool followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+
+bool follow_reached_endpos(StreamSpecs *streamSpecs, bool *done);
+bool follow_prepare_mode_switch(StreamSpecs *streamSpecs,
+								LogicalStreamMode previousMode,
+								LogicalStreamMode currentMode);
+
+bool follow_start_subprocess(StreamSpecs *specs, FollowSubProcess *subprocess);
+
+bool follow_start_prefetch(StreamSpecs *specs);
+bool follow_start_transform(StreamSpecs *specs);
+bool follow_start_catchup(StreamSpecs *specs);
+
+void follow_exit_early(StreamSpecs *specs);
+bool follow_wait_subprocesses(StreamSpecs *specs);
+bool follow_terminate_subprocesses(StreamSpecs *specs);
+
+bool follow_wait_pid(pid_t subprocess, bool *exited, int *returnCode, int *sig);
 
 #endif /* LD_STREAM_H */

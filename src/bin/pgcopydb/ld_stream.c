@@ -43,27 +43,285 @@ static bool updateStreamCounters(StreamContext *context,
 bool
 stream_init_specs(StreamSpecs *specs,
 				  CDCPaths *paths,
-				  char *source_pguri,
-				  char *target_pguri,
-				  char *slotName,
+				  ConnStrings *connStrings,
+				  ReplicationSlot *slot,
 				  char *origin,
 				  uint64_t endpos,
-				  LogicalStreamMode mode)
+				  LogicalStreamMode mode,
+				  SourceCatalog *catalog,
+				  bool stdin,
+				  bool stdout,
+				  bool logSQL)
 {
 	/* just copy into StreamSpecs what's been initialized in copySpecs */
 	specs->mode = mode;
+	specs->stdIn = stdin;
+	specs->stdOut = stdout;
+	specs->logSQL = logSQL;
+
 	specs->paths = *paths;
 	specs->endpos = endpos;
 
-	strlcpy(specs->source_pguri, source_pguri, MAXCONNINFO);
-	strlcpy(specs->target_pguri, target_pguri, MAXCONNINFO);
-	strlcpy(specs->slotName, slotName, sizeof(specs->slotName));
+	specs->catalog = catalog;
+
+	/*
+	 * Copy the given ReplicationSlot: it comes from command line parsing, or
+	 * from a previous command that created it and saved information to file.
+	 * Such a sprevious command could be: pgcopydb snapshot --follow.
+	 */
+	specs->slot = *slot;
+
+	switch (specs->slot.plugin)
+	{
+		case STREAM_PLUGIN_TEST_DECODING:
+		{
+			KeyVal options = {
+				.count = 1,
+				.keywords = {
+					"include-xids"
+				},
+				.values = {
+					"true"
+				}
+			};
+
+			specs->pluginOptions = options;
+			break;
+		}
+
+		case STREAM_PLUGIN_WAL2JSON:
+		{
+			KeyVal options = {
+				.count = 6,
+				.keywords = {
+					"format-version",
+					"include-xids",
+					"include-schemas",
+					"include-transaction",
+					"include-types",
+					"filter-tables"
+				},
+				.values = {
+					"2",
+					"true",
+					"true",
+					"true",
+					"true",
+					"pgcopydb.*"
+				}
+			};
+
+			specs->pluginOptions = options;
+
+			break;
+		}
+
+		default:
+		{
+			log_error("Unknown logical decoding output plugin \"%s\"",
+					  OutputPluginToString(slot->plugin));
+			return false;
+		}
+	}
+
 	strlcpy(specs->origin, origin, sizeof(specs->origin));
 
-	if (!buildReplicationURI(specs->source_pguri, specs->logrep_pguri))
+	specs->connStrings = connStrings;
+
+	if (!buildReplicationURI(specs->connStrings->source_pguri,
+							 &(specs->connStrings->logrep_pguri)))
 	{
 		/* errors have already been logged */
 		return false;
+	}
+
+	log_trace("stream_init_specs: %s(%d)",
+			  OutputPluginToString(slot->plugin),
+			  specs->pluginOptions.count);
+
+	/*
+	 * Now prepare for the follow mode sub-process management.
+	 */
+	bool replayMode = specs->mode == STREAM_MODE_REPLAY;
+
+	FollowSubProcess prefetch = {
+		.name = replayMode ? "receive" : "prefetch",
+		.command = &follow_start_prefetch,
+		.pid = -1
+	};
+
+	FollowSubProcess transform = {
+		.name = "transform",
+		.command = &follow_start_transform,
+		.pid = -1
+	};
+
+	FollowSubProcess catchup = {
+		.name = replayMode ? "replay" : "catchup",
+		.command = &follow_start_catchup,
+		.pid = -1
+	};
+
+	specs->prefetch = prefetch;
+	specs->transform = transform;
+	specs->catchup = catchup;
+
+	switch (specs->mode)
+	{
+		/*
+		 * Create the message queue needed to communicate JSON files to
+		 * transform to SQL files on prefetch/catchup mode. See the supervisor
+		 * process implemented in function followDB() for the clean-up code
+		 * that unlinks the message queue.
+		 */
+		case STREAM_MODE_PREFETCH:
+		case STREAM_MODE_CATCHUP:
+		{
+			if (!queue_create(&(specs->transformQueue), "transform"))
+			{
+				log_error("Failed to create the transform queue");
+				return false;
+			}
+			break;
+		}
+
+		/*
+		 * Create the unix pipes needed for inter-process communication (data
+		 * flow) in replay mode. We override command line arguments for
+		 * --to-stdout and --from-stdin when stream mode is set to
+		 * STREAM_MODE_REPLAY.
+		 */
+		case STREAM_MODE_REPLAY:
+		{
+			specs->stdIn = true;
+			specs->stdOut = true;
+			break;
+		}
+
+		/* other stream modes don't need special treatment here */
+		default:
+		{
+			/* pass */
+			break;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * stream_init_for_mode initializes StreamSpecs bits that relate to the
+ * streaming mode choosen, allowing to switch back and forth between CATCHUP
+ * and REPLAY modes.
+ */
+bool
+stream_init_for_mode(StreamSpecs *specs, LogicalStreamMode mode)
+{
+	if (specs->mode == STREAM_MODE_CATCHUP && mode == STREAM_MODE_REPLAY)
+	{
+		specs->stdIn = true;
+		specs->stdOut = true;
+	}
+	else if (specs->mode == STREAM_MODE_REPLAY && mode == STREAM_MODE_CATCHUP)
+	{
+		specs->stdIn = false;
+		specs->stdOut = false;
+
+		/* we keep the transform queue around */
+	}
+	else
+	{
+		log_error("BUG: stream_init_for_mode(%d, %d)", specs->mode, mode);
+		return false;
+	}
+
+	/* the re-init for the new mode has been done now, register that */
+	specs->mode = mode;
+
+	return true;
+}
+
+
+/*
+ * LogicalStreamModeToString returns a string representation for the mode.
+ */
+char *
+LogicalStreamModeToString(LogicalStreamMode mode)
+{
+	switch (mode)
+	{
+		case STREAM_MODE_UNKNOW:
+		{
+			return "unknown stream mode";
+		}
+
+		case STREAM_MODE_RECEIVE:
+		{
+			return "receive";
+		}
+
+		case STREAM_MODE_PREFETCH:
+		{
+			return "prefetch";
+		}
+
+		case STREAM_MODE_CATCHUP:
+		{
+			return "catchup";
+		}
+
+		case STREAM_MODE_REPLAY:
+		{
+			return "replay";
+		}
+
+		default:
+		{
+			log_error("BUG: LogicalStreamModeToString(%d)", mode);
+			return "unknown stream mode";
+		}
+	}
+
+	/* keep compiler happy */
+	return "unknown stream mode";
+}
+
+
+/*
+ * stream_check_in_out checks that the stdIn and stdOut file descriptors are
+ * still valid: EBADF could happen when a PIPE is Broken for lack of a
+ * reader/writer process.
+ */
+bool
+stream_check_in_out(StreamSpecs *specs)
+{
+	if (specs->stdIn)
+	{
+		char buf[0];
+
+		if (read(fileno(specs->in), buf, 0) != 0)
+		{
+			log_error("Failed to read from input PIPE: %m");
+			return false;
+		}
+	}
+
+	if (specs->stdOut)
+	{
+		char buf[0];
+
+		if (fwrite(buf, sizeof(char), 0, specs->in) != 0)
+		{
+			log_error("Failed to write to output PIPE: %m");
+			return false;
+		}
+
+		if (fflush(specs->out) != 0)
+		{
+			log_error("Failed to flush output PIPE: %m");
+			return false;
+		}
 	}
 
 	return true;
@@ -74,37 +332,72 @@ stream_init_specs(StreamSpecs *specs,
  * stream_init_context initializes a LogicalStreamContext.
  */
 bool
-stream_init_context(StreamContext *privateContext, StreamSpecs *specs)
+stream_init_context(StreamSpecs *specs)
 {
-	privateContext->mode = specs->mode;
-	privateContext->paths = specs->paths;
+	StreamContext *privateContext = &(specs->private);
+
+	privateContext->endpos = specs->endpos;
 	privateContext->startpos = specs->startpos;
 
-	strlcpy(privateContext->source_pguri,
-			specs->source_pguri,
-			sizeof(privateContext->source_pguri));
+	privateContext->mode = specs->mode;
 
-	if (!queue_create(&(privateContext->transformQueue)))
+	privateContext->transformQueue = &(specs->transformQueue);
+
+	privateContext->paths = specs->paths;
+
+	privateContext->connStrings = specs->connStrings;
+
+	/*
+	 * When using PIPEs for inter-process communication, makes sure the PIPEs
+	 * are ready for us to use and not broken, as in EBADF.
+	 */
+	privateContext->stdIn = specs->stdIn;
+	privateContext->stdOut = specs->stdOut;
+
+	privateContext->in = specs->in;
+	privateContext->out = specs->out;
+
+	if (!stream_check_in_out(specs))
 	{
-		log_error("Failed to create the Stream Transform process queue");
+		/* errors have already been logged */
 		return false;
 	}
 
-	return true;
-}
+	/*
+	 * When streaming is resumed, transactions are sent in full even if we wrote
+	 * and flushed a transactions partially in previous command. This implies
+	 * that, if the last message is B/I/U/D/T, the streaming resumes from the
+	 * same transaction and there's a need to skip some messages.
+	 *
+	 * However, note that if the last message is COMMIT, the streaming will
+	 * resume from the next transaction.
+	 */
+	privateContext->metadata.action = STREAM_ACTION_UNKNOWN;
+	privateContext->previous.action = STREAM_ACTION_UNKNOWN;
 
+	privateContext->lastWriteTime = 0;
 
-/*
- * stream_close_specs unlinks the stream context queue.
- */
-bool
-stream_close_context(StreamContext *privateContext)
-{
-	if (!queue_unlink(&(privateContext->transformQueue)))
-	{
-		log_warn("Failed to remove the Transform Queue, see above for details");
-		return false;
-	}
+	/*
+	 * Initializing maxWrittenLSN as startpos at the beginning of migration or
+	 * when resuming from interruption where it will be equal to
+	 * consistent_point or LSN of last message in latest.json respectively.
+	 *
+	 * maxWrittenLSN helps in ensuring that we don't write to a previous JSON
+	 * file during streaming. Even though we haven't written anything before the
+	 * beginning of migration, initializing with startpos serves as sensible
+	 * boundary. This is because apply process starts applying changes from the
+	 * SQL file with name computed from startpos.
+	 *
+	 * This initialization is particularly useful during the beginning of
+	 * migration, where some messages may have LSNs less than the
+	 * consistent_point. These messages may be located in a previous WAL file
+	 * compared to the startpos, and we ensure that we start writing to a file
+	 * of startpos.
+	 */
+	privateContext->maxWrittenLSN = specs->startpos;
+
+	/* transform needs some catalog lookups (pkey, type oid) */
+	privateContext->catalog = specs->catalog;
 
 	return true;
 }
@@ -117,35 +410,15 @@ stream_close_context(StreamContext *privateContext)
 bool
 startLogicalStreaming(StreamSpecs *specs)
 {
-	/* wal2json options we want to use for the plugin */
-	KeyVal options = {
-		.count = 6,
-		.keywords = {
-			"format-version",
-			"include-xids",
-			"include-lsn",
-			"include-transaction",
-			"include-timestamp",
-			"filter-tables"
-		},
-		.values = {
-			"2",
-			"true",
-			"true",
-			"true",
-			"true",
-			"pgcopydb.*"
-		}
-	};
-
 	/* prepare the stream options */
 	LogicalStreamClient stream = { 0 };
 
-	stream.pluginOptions = options;
+	stream.pluginOptions = specs->pluginOptions;
 	stream.writeFunction = &streamWrite;
 	stream.flushFunction = &streamFlush;
 	stream.closeFunction = &streamClose;
 	stream.feedbackFunction = &streamFeedback;
+	stream.keepaliveFunction = &streamKeepalive;
 
 	/*
 	 * Read possibly already existing file to initialize the start LSN from a
@@ -158,45 +431,58 @@ startLogicalStreaming(StreamSpecs *specs)
 	}
 
 	LogicalStreamContext context = { 0 };
-	StreamContext privateContext = { 0 };
 
-	if (!stream_init_context(&privateContext, specs))
+	if (!stream_init_context(specs))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	context.private = (void *) &(privateContext);
+	StreamContext *privateContext = &(specs->private);
+	context.private = (void *) privateContext;
 
-	if (!stream_transform_start_worker(&context))
-	{
-		/* errors have already been logged */
-		return false;
-	}
+	log_notice("Connecting to logical decoding replication stream");
 
 	/*
 	 * In case of being disconnected or other transient errors, reconnect and
 	 * continue streaming.
 	 */
 	bool retry = true;
+	uint64_t retries = 0;
+	uint64_t waterMarkLSN = InvalidXLogRecPtr;
 
 	while (retry)
 	{
+		if (!stream_check_in_out(specs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+		{
+			log_error("Streaming process has been signaled to stop");
+			return false;
+		}
+
 		if (!pgsql_init_stream(&stream,
-							   specs->logrep_pguri,
-							   specs->slotName,
+							   specs->connStrings->logrep_pguri,
+							   specs->slot.plugin,
+							   specs->slot.slotName,
 							   specs->startpos,
 							   specs->endpos))
 		{
 			/* errors have already been logged */
-			(void) stream_close_context(&privateContext);
 			return false;
 		}
+
+		log_debug("startLogicalStreaming: %s (%d)",
+				  OutputPluginToString(specs->slot.plugin),
+				  specs->pluginOptions.count);
 
 		if (!pgsql_start_replication(&stream))
 		{
 			/* errors have already been logged */
-			(void) stream_close_context(&privateContext);
 			return false;
 		}
 
@@ -204,7 +490,6 @@ startLogicalStreaming(StreamSpecs *specs)
 		if (!stream_write_context(specs, &stream))
 		{
 			/* errors have already been logged */
-			(void) stream_close_context(&privateContext);
 			return false;
 		}
 
@@ -218,11 +503,22 @@ startLogicalStreaming(StreamSpecs *specs)
 
 		if (cleanExit)
 		{
-			log_info("Streaming is now finished after processing %lld message%s",
-					 (long long) privateContext.counters.total,
-					 privateContext.counters.total > 0 ? "s" : "");
+			log_info("Streamed up to write_lsn %X/%X, flush_lsn %X/%X, stopping: "
+					 "endpos is %X/%X",
+					 LSN_FORMAT_ARGS(context.tracking->written_lsn),
+					 LSN_FORMAT_ARGS(context.tracking->flushed_lsn),
+					 LSN_FORMAT_ARGS(context.endpos));
 		}
-		else if (!(asked_to_stop || asked_to_stop_fast || asked_to_quit))
+		else if (retries > 0 &&
+				 context.tracking->written_lsn == waterMarkLSN)
+		{
+			log_warn("Streaming got interrupted at %X/%X, and did not make "
+					 "any progress from previous attempt, stopping now",
+					 LSN_FORMAT_ARGS(context.tracking->written_lsn));
+
+			return false;
+		}
+		else if (retry)
 		{
 			log_warn("Streaming got interrupted at %X/%X, reconnecting in 1s",
 					 LSN_FORMAT_ARGS(context.tracking->written_lsn));
@@ -232,18 +528,18 @@ startLogicalStreaming(StreamSpecs *specs)
 			log_warn("Streaming got interrupted at %X/%X "
 					 "after processing %lld message%s",
 					 LSN_FORMAT_ARGS(context.tracking->written_lsn),
-					 (long long) privateContext.counters.total,
-					 privateContext.counters.total > 0 ? "s" : "");
+					 (long long) privateContext->counters.total,
+					 privateContext->counters.total > 0 ? "s" : "");
 		}
 
 		/* sleep for one entire second before retrying */
-		(void) pg_usleep(1 * 1000 * 1000);
-	}
+		if (retry)
+		{
+			++retries;
+			waterMarkLSN = context.tracking->written_lsn;
 
-	if (!stream_close_context(&privateContext))
-	{
-		/* errors have already been logged */
-		return false;
+			(void) pg_usleep(1 * 1000 * 1000); /* 1s */
+		}
 	}
 
 	return true;
@@ -281,7 +577,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 	 */
 	PGSQL src = { 0 };
 
-	if (!pgsql_init(&src, specs->source_pguri, PGSQL_CONN_SOURCE))
+	if (!pgsql_init(&src, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
 	{
 		/* errors have already been logged */
 		return false;
@@ -298,12 +594,29 @@ streamCheckResumePosition(StreamSpecs *specs)
 	if (specs->endpos == InvalidXLogRecPtr)
 	{
 		specs->endpos = sentinel.endpos;
-
-		if (specs->endpos != InvalidXLogRecPtr)
+	}
+	else
+	{
+		if (sentinel.endpos != InvalidXLogRecPtr &&
+			sentinel.endpos != specs->endpos)
 		{
-			log_info("Streaming is setup to end at LSN %X/%X",
+			log_warn("Sentinel endpos was %X/%X and is now updated to "
+					 "--endpos option %X/%X",
+					 LSN_FORMAT_ARGS(sentinel.endpos),
 					 LSN_FORMAT_ARGS(specs->endpos));
 		}
+
+		if (!pgsql_update_sentinel_endpos(&src, false, specs->endpos))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	if (specs->endpos != InvalidXLogRecPtr)
+	{
+		log_info("Streaming is setup to end at LSN %X/%X",
+				 LSN_FORMAT_ARGS(specs->endpos));
 	}
 
 	if (latestStreamedContent.count == 0)
@@ -320,29 +633,35 @@ streamCheckResumePosition(StreamSpecs *specs)
 			log_info("Resuming streaming at LSN %X/%X "
 					 "from replication slot \"%s\"",
 					 LSN_FORMAT_ARGS(specs->startpos),
-					 specs->slotName);
+					 specs->slot.slotName);
 		}
 	}
 	else
 	{
-		LogicalMessageMetadata *latest =
-			&(latestStreamedContent.messages[latestStreamedContent.count - 1]);
+		/* lines are counted starting at zero */
+		int lastLineNb = latestStreamedContent.count - 1;
 
-		specs->startpos = latest->nextlsn;
+		LogicalMessageMetadata *messages = latestStreamedContent.messages;
+		LogicalMessageMetadata *latest = &(messages[lastLineNb]);
+
+		specs->startpos = latest->lsn;
 
 		log_info("Resuming streaming at LSN %X/%X "
-				 "from last message read in JSON file \"%s\", line %d",
+				 "from JSON file \"%s\" ",
 				 LSN_FORMAT_ARGS(specs->startpos),
-				 latestStreamedContent.filename,
-				 latestStreamedContent.count - 1);
+				 latestStreamedContent.filename);
+
+		char *latestMessage = latestStreamedContent.lines[lastLineNb];
+		log_notice("Resume replication from latest message: %s", latestMessage);
 	}
 
 	bool flush = false;
 	uint64_t lsn = 0;
 
-	if (!pgsql_replication_slot_exists(&src, specs->slotName, &flush, &lsn))
+	if (!pgsql_replication_slot_exists(&src, specs->slot.slotName, &flush, &lsn))
 	{
 		/* errors have already been logged */
+		return false;
 	}
 
 	/*
@@ -375,6 +694,66 @@ bool
 streamWrite(LogicalStreamContext *context)
 {
 	StreamContext *privateContext = (StreamContext *) context->private;
+	LogicalMessageMetadata *metadata = &(privateContext->metadata);
+
+	if (!prepareMessageMetadataFromContext(context))
+	{
+		log_error("Failed to prepare Logical Message Metadata from context, "
+				  "see above for details");
+		return false;
+	}
+
+	if (metadata->filterOut)
+	{
+		/* message has already been logged */
+		return true;
+	}
+
+	/* update the LSN tracking that's reported in the feedback */
+	context->tracking->written_lsn = context->cur_record_lsn;
+
+	/* write the actual JSON message to file, unless instructed not to */
+	if (!metadata->skipping)
+	{
+		bool previous = false;
+
+		if (!stream_write_json(context, previous))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		/* update internal transaction counters */
+		(void) updateStreamCounters(privateContext, metadata);
+	}
+
+	if (metadata->xid > 0)
+	{
+		log_debug("Received action %c for XID %u at LSN %X/%X",
+				  metadata->action,
+				  metadata->xid,
+				  LSN_FORMAT_ARGS(metadata->lsn));
+	}
+	else
+	{
+		log_debug("Received action %c at LSN %X/%X",
+				  metadata->action,
+				  LSN_FORMAT_ARGS(metadata->lsn));
+	}
+
+	return true;
+}
+
+
+/*
+ * stream_write_json writes the current (or previous) Logical Message to disk.
+ */
+bool
+stream_write_json(LogicalStreamContext *context, bool previous)
+{
+	StreamContext *privateContext = (StreamContext *) context->private;
+	LogicalMessageMetadata *metadata =
+		previous ? &(privateContext->previous) : &(privateContext->metadata);
 
 	/* we might have to rotate to the next on-disk file */
 	if (!streamRotateFile(context))
@@ -383,94 +762,198 @@ streamWrite(LogicalStreamContext *context)
 		return false;
 	}
 
-	LogicalMessageMetadata *metadata = &(privateContext->metadata);
-	JSON_Value *json = json_parse_string(context->buffer);
-
-	/* ensure we have a new all-zero metadata structure for the new message */
-	(void) memset(metadata, 0, sizeof(LogicalMessageMetadata));
-
-	if (!parseMessageMetadata(metadata, context->buffer, json, false))
-	{
-		/* errors have already been logged */
-		if (privateContext->jsonFile != NULL)
-		{
-			if (fclose(privateContext->jsonFile) != 0)
-			{
-				log_error("Failed to close file \"%s\": %m",
-						  privateContext->walFileName);
-			}
-
-			/* reset the jsonFile FILE * pointer to NULL, it's closed now */
-			privateContext->jsonFile = NULL;
-		}
-
-		json_value_free(json);
-		return false;
-	}
-
-	json_value_free(json);
-
-	(void) updateStreamCounters(privateContext, metadata);
-
 	/*
 	 * Write the logical decoding message to disk, appending to the already
 	 * opened file we track in the privateContext.
 	 */
-	if (privateContext->jsonFile != NULL)
+	if (privateContext->jsonFile == NULL)
 	{
-		long bytes_left = strlen(context->buffer);
-		long bytes_written = 0;
+		log_error("Failed to write Logical Message: jsonFile is NULL");
+		return false;
+	}
 
-		while (bytes_left > 0)
+	/* prepare a in-memory buffer with the whole data formatted in JSON */
+	PQExpBuffer buffer = createPQExpBuffer();
+
+	if (buffer == NULL)
+	{
+		log_fatal("Failed to allocate memory to prepare JSON message");
+		return false;
+	}
+
+	appendPQExpBuffer(buffer,
+					  "{\"action\":\"%c\","
+					  "\"xid\":\"%lld\","
+					  "\"lsn\":\"%X/%X\","
+					  "\"timestamp\":\"%s\","
+					  "\"message\":",
+					  metadata->action,
+					  (long long) metadata->xid,
+					  LSN_FORMAT_ARGS(metadata->lsn),
+					  metadata->timestamp);
+
+	appendPQExpBuffer(buffer, "%s}\n", metadata->jsonBuffer);
+
+	/* memory allocation could have failed while building string */
+	if (PQExpBufferBroken(buffer))
+	{
+		log_error("Failed to prepare JSON message: out of memory");
+		destroyPQExpBuffer(buffer);
+		return false;
+	}
+
+	/* then add the logical output plugin data, inside our own JSON format */
+	if (!write_to_stream(privateContext->jsonFile, buffer->data, buffer->len))
+	{
+		log_error("Failed to write to file \"%s\": see above for details",
+				  privateContext->partialFileName);
+		destroyPQExpBuffer(buffer);
+		return false;
+	}
+
+	/* time to update our lastWriteTime mark */
+	privateContext->lastWriteTime = time(NULL);
+
+	/* update the tracking for maximum LSN of messages written to disk so far */
+	if (privateContext->maxWrittenLSN < metadata->lsn)
+	{
+		privateContext->maxWrittenLSN = metadata->lsn;
+	}
+
+	/*
+	 * Now if specs->stdOut is true we want to also write all the same things
+	 * again to stdout this time. We don't expect buffered IO to stdout, so we
+	 * don't loop and retry short writes there.
+	 */
+	if (privateContext->stdOut)
+	{
+		if (!write_to_stream(privateContext->out, buffer->data, buffer->len))
 		{
-			int ret;
+			log_error("Failed to write JSON message to stdout: "
+					  "see above for details");
+			log_debug("JSON message: %s", buffer->data);
 
-			ret = fwrite(context->buffer + bytes_written,
-						 sizeof(char),
-						 bytes_left,
-						 privateContext->jsonFile);
-
-			if (ret < 0)
-			{
-				log_error("Failed to write %ld bytes to file \"%s\": %m",
-						  bytes_left,
-						  privateContext->walFileName);
-				return false;
-			}
-
-			/* Write was successful, advance our position */
-			bytes_written += ret;
-			bytes_left -= ret;
-		}
-
-		if (fwrite("\n", sizeof(char), 1, privateContext->jsonFile) != 1)
-		{
-			log_error("Failed to write 1 byte to file \"%s\": %m",
-					  privateContext->walFileName);
-
-			if (privateContext->jsonFile != NULL)
-			{
-				if (fclose(privateContext->jsonFile) != 0)
-				{
-					log_error("Failed to close file \"%s\": %m",
-							  privateContext->walFileName);
-				}
-
-				/* reset the jsonFile FILE * pointer to NULL, it's closed now */
-				privateContext->jsonFile = NULL;
-			}
+			destroyPQExpBuffer(buffer);
 			return false;
 		}
 
-		/* update the LSN tracking that's reported in the feedback */
-		context->tracking->written_lsn = context->cur_record_lsn;
+		/* flush stdout at transaction boundaries */
+		if (metadata->action == STREAM_ACTION_COMMIT)
+		{
+			if (fflush(privateContext->out) != 0)
+			{
+				log_error("Failed to flush standard output: %m");
+				destroyPQExpBuffer(buffer);
+				return false;
+			}
+		}
 	}
 
-	log_debug("Received action %c for XID %u in LSN %X/%X, Next LSN %X/%X",
-			  metadata->action,
-			  metadata->xid,
-			  LSN_FORMAT_ARGS(metadata->lsn),
-			  LSN_FORMAT_ARGS(metadata->nextlsn));
+	destroyPQExpBuffer(buffer);
+	free(metadata->jsonBuffer);
+
+	/*
+	 * Maintain the transaction progress based on the BEGIN and COMMIT messages
+	 * received from replication slot. We don't care about the other messages.
+	 */
+	if (metadata->action == STREAM_ACTION_BEGIN)
+	{
+		privateContext->transactionInProgress = true;
+	}
+	else if (metadata->action == STREAM_ACTION_COMMIT)
+	{
+		privateContext->transactionInProgress = false;
+	}
+	/*
+	 * We are not expecting STREAM_ACTION_ROLLBACK here. It's a custom
+	 * message we write directly to the "latest" file using
+	 * stream_write_internal_message to abort the last incomplete transaction.
+	 */
+	else if (metadata->action == STREAM_ACTION_ROLLBACK)
+	{
+		log_error("BUG: STREAM_ACTION_ROLLBACK is not expected here");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * stream_write_internal_message outputs an internal message for pgcopydb
+ * operations into our current stream output(s).
+ */
+bool
+stream_write_internal_message(LogicalStreamContext *context,
+							  InternalMessage *message)
+{
+	StreamContext *privateContext = (StreamContext *) context->private;
+
+	long buflen = 0;
+	char buffer[BUFSIZE] = { 0 };
+
+	/* not all internal message require a timestamp field */
+	if (message->time > 0)
+	{
+		/* add the server sendTime to the LogicalMessageMetadata */
+		if (!pgsql_timestamptz_to_string(message->time,
+										 message->timeStr,
+										 sizeof(message->timeStr)))
+		{
+			log_error("Failed to format server send time %lld to time string",
+					  (long long) message->time);
+			return false;
+		}
+
+		char *fmt =
+			"{\"action\":\"%c\",\"lsn\":\"%X/%X\",\"timestamp\":\"%s\"}\n";
+
+		buflen = sformat(buffer, sizeof(buffer), fmt,
+						 message->action,
+						 LSN_FORMAT_ARGS(message->lsn),
+						 message->timeStr);
+	}
+	else
+	{
+		buflen = sformat(buffer, sizeof(buffer),
+						 "{\"action\":\"%c\",\"lsn\":\"%X/%X\"}\n",
+						 message->action,
+						 LSN_FORMAT_ARGS(message->lsn));
+	}
+
+	if (!write_to_stream(privateContext->jsonFile, buffer, buflen))
+	{
+		log_error("Failed to write internal message: %.1024s%s",
+				  buffer,
+				  buflen > 1024 ? "..." : "");
+		return false;
+	}
+
+	/* skip NOTICE logs for KEEPALIVE messages */
+	if (message->action != STREAM_ACTION_KEEPALIVE)
+	{
+		log_notice("Inserted action %s for lsn %X/%X in \"%s\"",
+				   StreamActionToString(message->action),
+				   LSN_FORMAT_ARGS(message->lsn),
+				   privateContext->partialFileName);
+	}
+
+	/*
+	 * When streaming to a Unix pipe don't forget to also stream the SWITCH
+	 * WAL message there, so that the transform process forwards it.
+	 */
+	if (privateContext->stdOut)
+	{
+		if (!write_to_stream(privateContext->out, buffer, buflen))
+		{
+			log_error("Failed to write JSON message (%ld bytes) to stdout: %m",
+					  buflen);
+			log_debug("JSON message: %.1024s%s",
+					  buffer,
+					  buflen > 1024 ? "..." : "");
+			return false;
+		}
+	}
 
 	return true;
 }
@@ -492,43 +975,121 @@ streamRotateFile(LogicalStreamContext *context)
 	XLogSegNo segno;
 	char wal[MAXPGPATH] = { 0 };
 	char walFileName[MAXPGPATH] = { 0 };
+	char partialFileName[MAXPGPATH] = { 0 };
 
-	/* compute the WAL filename that would host the current LSN */
-	XLByteToSeg(context->cur_record_lsn, segno, context->WalSegSz);
+	/* skip LSN 0/0 at the start of streaming */
+	if (context->cur_record_lsn == InvalidXLogRecPtr)
+	{
+		return true;
+	}
+
+	/*
+	 * Determine the LSN to calculate walFileName in which to write the current
+	 * message.
+	 *
+	 * This walFileName calculation later ensures safe transaction formation in
+	 * the transform/apply process by always appending messages here to the
+	 * latest file and preventing rotation to earlier files.
+	 *
+	 * In most cases, jsonFileLSN should be the same as cur_record_lsn. However,
+	 * occasionally, current messages may have LSNs lower than the previous
+	 * ones. This can occur due to concurrent transactions with interleaved
+	 * LSNs. Since the logical decoding protocol sends the complete transaction
+	 * at commit time, the LSNs for messages within one transaction could be
+	 * lower than those of the previously streamed transactions. In such cases,
+	 * we use maximum LSN of the messages written so far to the disk in order to
+	 * write to the current file.
+	 *
+	 * Here is a oversimplified visualization of three concurrent transactions.
+	 * In this scenario, we receive complete transactions in the order txn-1 ->
+	 * txn-3 -> txn-2, based on their COMMIT order. When we start with
+	 * maxWrittenLSN as LSN AB..00, the first message of txn-1 (A9..01) and the
+	 * remaining messages for this transaction will be written to AB.json file.
+	 * As we continue, the maxWrittenLSN becomes AB..01, so the next transaction
+	 * (txn-3) has its first message with LSN AA..02, which is less than
+	 * maxWrittenLSN, so we continue writing to AB..01. This process continues
+	 * for txn-2 and subsequent txns.
+	 *
+	 *      +----------+----------+----------+
+	 *      |  txn-1   |  txn-2   | txn-3    |
+	 *   |  +--------------------------------+
+	 *   |  | B A9..01 |          |          |
+	 *   |  |          | B A9..02 |          |
+	 *   |  |          |          |          |
+	 *   |  | ---SWITCH WAL from A9 to AA--- |
+	 *   |  |          |          |          |
+	 *   |  | I AA..01 |          |          |
+	 *   |  |          |          | B AA..02 |
+	 *   |  |          |          | I AA..03 |
+	 * TIME |          | I AA..04 |          |
+	 *   |  |          |          +          |
+	 *   |  | ---SWITCH WAL from AA to AB--- |
+	 *   |  |          |          |          |
+	 *   |  | I AB..00 |          |          |
+	 *   |  | C AB..01 |          |          |
+	 *   v  |          |          | C AB..02 |
+	 *      |          | I AB..03 |          |
+	 *      |          | C AB..04 |          |
+	 *      +----------+----------+----------+
+	 */
+	uint64_t jsonFileLSN;
+
+	/*
+	 * jsonFileLSN is greater of the max LSN of messages written so far and the
+	 * current record.
+	 */
+	if (privateContext->maxWrittenLSN != InvalidXLogRecPtr)
+	{
+		/* cur_record_lsn leads to current file, skipping rotation, or to a new file */
+		if (privateContext->maxWrittenLSN <= context->cur_record_lsn)
+		{
+			jsonFileLSN = context->cur_record_lsn;
+		}
+
+		/* maxWrittenLSN always points to the current file and skips rotation */
+		else
+		{
+			jsonFileLSN = privateContext->maxWrittenLSN;
+		}
+	}
+	else
+	{
+		jsonFileLSN = context->cur_record_lsn;
+	}
+
+	/* compute the WAL filename that would host the current message */
+	XLByteToSeg(jsonFileLSN, segno, context->WalSegSz);
 	XLogFileName(wal, context->timeline, segno, context->WalSegSz);
 
 	sformat(walFileName, sizeof(walFileName), "%s/%s.json",
 			privateContext->paths.dir,
 			wal);
 
+	sformat(partialFileName, sizeof(partialFileName), "%s/%s.json.partial",
+			privateContext->paths.dir,
+			wal);
+
 	/* in most cases, the file name is still the same */
-	if (strcmp(privateContext->walFileName, walFileName) == 0)
+	if (streq(privateContext->walFileName, walFileName))
 	{
 		return true;
 	}
 
 	/* if we had a WAL file opened, close it now */
-	if (!IS_EMPTY_STRING_BUFFER(privateContext->walFileName) &&
+	if (!IS_EMPTY_STRING_BUFFER(privateContext->partialFileName) &&
 		privateContext->jsonFile != NULL)
 	{
 		bool time_to_abort = false;
 
-		/*
-		 * Here we might have an early WAL file rotation, either because of
-		 * archive_timeout or a call to pg_switch_wal() for instance. In case
-		 * the current message nextlsn doesn't belong to the new file we're
-		 * about to create, add an extra empty transaction with the expected
-		 * nextlsn.
-		 */
-		if (privateContext->metadata.nextlsn < context->cur_record_lsn)
-		{
-			fformat(privateContext->jsonFile,
-					"{\"action\":\"X\",\"lsn\":\"%X/%X\",\"nextlsn\":\"%X/%X\"}\n",
-					LSN_FORMAT_ARGS(privateContext->metadata.nextlsn),
-					LSN_FORMAT_ARGS(context->cur_record_lsn));
+		InternalMessage switchwal = {
+			.action = STREAM_ACTION_SWITCH,
+			.lsn = jsonFileLSN
+		};
 
-			log_debug("Inserted action SWITCH for nextlsn %X/%X",
-					  LSN_FORMAT_ARGS(context->cur_record_lsn));
+		if (!stream_write_internal_message(context, &switchwal))
+		{
+			/* errors have already been logged */
+			return false;
 		}
 
 		if (!streamCloseFile(context, time_to_abort))
@@ -538,8 +1099,8 @@ streamRotateFile(LogicalStreamContext *context)
 		}
 	}
 
-	log_info("Now streaming changes to \"%s\"", walFileName);
 	strlcpy(privateContext->walFileName, walFileName, MAXPGPATH);
+	strlcpy(privateContext->partialFileName, partialFileName, MAXPGPATH);
 
 	/* when dealing with a new JSON name, also prepare the SQL name */
 	sformat(privateContext->sqlFileName, sizeof(privateContext->sqlFileName),
@@ -547,45 +1108,68 @@ streamRotateFile(LogicalStreamContext *context)
 			privateContext->paths.dir,
 			wal);
 
-	/* the context->cur_record_lsn is the firstLSN for this file */
-	privateContext->firstLSN = context->cur_record_lsn;
+	/* the jsonFileLSN is the firstLSN for this file */
+	privateContext->firstLSN = jsonFileLSN;
 
 	/*
 	 * When the target file already exists, open it in append mode.
 	 */
-	int flags = file_exists(walFileName) ? FOPEN_FLAGS_A : FOPEN_FLAGS_W;
+	if (file_exists(walFileName))
+	{
+		if (!unlink_file(partialFileName))
+		{
+			log_error("Failed to unlink stale partial file \"%s\", "
+					  "see above for details",
+					  partialFileName);
+			return false;
+		}
 
-	privateContext->jsonFile =
-		fopen_with_umask(walFileName, "ab", flags, 0644);
+		if (!duplicate_file(walFileName, partialFileName))
+		{
+			log_error("Failed to duplicate pre-existing file \"%s\" into "
+					  "current partial file \"%s\", see above for details",
+					  walFileName,
+					  partialFileName);
+			return false;
+		}
+
+		privateContext->jsonFile =
+			fopen_with_umask(partialFileName, "ab", FOPEN_FLAGS_A, 0644);
+	}
+	else if (file_exists(partialFileName))
+	{
+		/* previous run might have been interrupted before rename */
+		log_notice("Found pre-existing partial file \"%s\"", partialFileName);
+
+		privateContext->jsonFile =
+			fopen_with_umask(partialFileName, "ab", FOPEN_FLAGS_A, 0644);
+	}
+	else
+	{
+		privateContext->jsonFile =
+			fopen_with_umask(partialFileName, "ab", FOPEN_FLAGS_W, 0644);
+	}
 
 	if (privateContext->jsonFile == NULL)
 	{
 		/* errors have already been logged */
 		log_error("Failed to open file \"%s\": %m",
-				  privateContext->walFileName);
+				  privateContext->partialFileName);
 		return false;
 	}
+
+	log_notice("Now streaming changes to \"%s\"", partialFileName);
 
 	/*
 	 * Also maintain the "latest" symbolic link to the latest file where
 	 * we've been streaming changes in.
 	 */
-	char latest[MAXPGPATH] = { 0 };
-
-	sformat(latest, sizeof(latest), "%s/latest", privateContext->paths.dir);
-
-	if (file_exists(latest))
+	if (!stream_update_latest_symlink(privateContext,
+									  privateContext->partialFileName))
 	{
-		if (!unlink_file(latest))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
-	if (!create_symbolic_link(privateContext->walFileName, latest))
-	{
-		/* errors have already been logged */
+		log_error("Failed to update latest symlink to \"%s\", "
+				  "see above for details",
+				  privateContext->partialFileName);
 		return false;
 	}
 
@@ -604,6 +1188,59 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 	StreamContext *privateContext = (StreamContext *) context->private;
 
 	/*
+	 * Before closing the JSON file, when we have reached endpos add a pgcopydb
+	 * 'E' message to signal transform and replay processes to skip replaying
+	 * the possibly opened transaction for now.
+	 *
+	 * Note that as the user can edit the endpos and restart pgcopydb, we neex
+	 * to be able to stop replay because of endpos and still skip replaying a
+	 * partial transaction.
+	 */
+	if (time_to_abort &&
+		privateContext->jsonFile != NULL &&
+		privateContext->endpos != InvalidXLogRecPtr &&
+		privateContext->endpos <= context->cur_record_lsn)
+	{
+		InternalMessage endpos = {
+			.action = STREAM_ACTION_ENDPOS,
+			.lsn = context->cur_record_lsn
+		};
+
+		if (!stream_write_internal_message(context, &endpos))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+	/*
+	 * On graceful exit, ROLLBACK the last incomplete transaction.
+	 * As we resume from a consistent point, there's no concern about
+	 * the transaction being rolled back here.
+	 *
+	 * TODO: For process crashes (e.g., segmentation faults), this
+	 * method won't work, potentially leaving incomplete transactions.
+	 * To handle this, we should read the last message from the "latest"
+	 * file and rollback any incomplete transaction found.
+	 */
+	if (time_to_abort &&
+		privateContext->jsonFile != NULL &&
+		privateContext->transactionInProgress)
+	{
+		InternalMessage rollback = {
+			.action = STREAM_ACTION_ROLLBACK,
+			.lsn = context->cur_record_lsn
+		};
+
+		if (!stream_write_internal_message(context, &rollback))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
+
+	/*
 	 * If we have a JSON file currently opened, then close it.
 	 *
 	 * Some situations exist where there is no JSON file currently opened and
@@ -612,17 +1249,43 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 	 */
 	if (privateContext->jsonFile != NULL)
 	{
-		log_debug("Closing file \"%s\"", privateContext->walFileName);
+		log_debug("Closing file \"%s\"", privateContext->partialFileName);
 
 		if (fclose(privateContext->jsonFile) != 0)
 		{
 			log_error("Failed to close file \"%s\": %m",
-					  privateContext->walFileName);
+					  privateContext->partialFileName);
 			return false;
 		}
 
 		/* reset the jsonFile FILE * pointer to NULL, it's closed now */
 		privateContext->jsonFile = NULL;
+
+		/* rename the .json.partial file to .json only */
+		log_debug("streamCloseFile: mv \"%s\" \"%s\"",
+				  privateContext->partialFileName,
+				  privateContext->walFileName);
+
+		if (rename(privateContext->partialFileName,
+				   privateContext->walFileName) != 0)
+		{
+			log_error("Failed to rename \"%s\" to \"%s\": %m",
+					  privateContext->partialFileName,
+					  privateContext->walFileName);
+			return false;
+		}
+
+		/* and also update the "latest" symlink, we need it for --resume */
+		if (!stream_update_latest_symlink(privateContext,
+										  privateContext->walFileName))
+		{
+			log_error("Failed to update latest symlink to \"%s\", "
+					  "see above for details",
+					  privateContext->walFileName);
+			return false;
+		}
+
+		log_notice("Closed file \"%s\"", privateContext->walFileName);
 	}
 
 	/* in prefetch mode, kick-in a transform process */
@@ -635,21 +1298,18 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 		}
 
 		case STREAM_MODE_PREFETCH:
+		case STREAM_MODE_CATCHUP:
 		{
 			/*
 			 * Now is the time to transform the JSON file into SQL.
-			 *
-			 * The transformation of the file uses enough CPU that we'd prefer
-			 * to start it in a subprocess.
 			 */
-			Queue *transformQueue = &(privateContext->transformQueue);
-
 			if (privateContext->firstLSN != InvalidXLogRecPtr)
 			{
-				if (!stream_transform_add_file(transformQueue,
+				if (!stream_transform_add_file(privateContext->transformQueue,
 											   privateContext->firstLSN))
 				{
-					/* errors have already been logged */
+					log_error("Failed to add LSN %X/%X to the transform queue",
+							  LSN_FORMAT_ARGS(privateContext->firstLSN));
 					return false;
 				}
 			}
@@ -664,19 +1324,19 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 			 */
 			if (time_to_abort)
 			{
-				if (!stream_transform_send_stop(transformQueue))
+				if (!stream_transform_send_stop(privateContext->transformQueue))
 				{
-					/* errors have already been logged */
-					return false;
-				}
-
-				if (!streamWaitForSubprocess(context))
-				{
-					/* errors have already been logged */
+					log_error("Failed to send STOP to the transform queue");
 					return false;
 				}
 			}
 
+			break;
+		}
+
+		case STREAM_MODE_REPLAY:
+		{
+			/* nothing else to do in that streaming mode */
 			break;
 		}
 
@@ -710,14 +1370,31 @@ streamFlush(LogicalStreamContext *context)
 		return true;
 	}
 
+	log_debug("streamFlush: %X/%X %X/%X",
+			  LSN_FORMAT_ARGS(context->tracking->written_lsn),
+			  LSN_FORMAT_ARGS(context->cur_record_lsn));
+
+	/* if needed, flush our current file now (fsync) */
 	if (context->tracking->flushed_lsn < context->tracking->written_lsn)
 	{
+		/*
+		 * When it's time to flush, inject a KEEPALIVE message to make sure we
+		 * mark the progress made in terms of LSN. Since we skip empty
+		 * transactions, we might be missing the last progress at endpos time
+		 * without this.
+		 */
+		if (!streamKeepalive(context))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		int fd = fileno(privateContext->jsonFile);
 
 		if (fsync(fd) != 0)
 		{
 			log_error("Failed to fsync file \"%s\": %m",
-					  privateContext->walFileName);
+					  privateContext->partialFileName);
 			return false;
 		}
 
@@ -725,7 +1402,66 @@ streamFlush(LogicalStreamContext *context)
 
 		log_debug("Flushed up to %X/%X in file \"%s\"",
 				  LSN_FORMAT_ARGS(context->tracking->flushed_lsn),
-				  privateContext->walFileName);
+				  privateContext->partialFileName);
+	}
+
+	return true;
+}
+
+
+/*
+ * streamKeepalive is a callback function for our LogicalStreamClient.
+ *
+ * This function is called when receiving a logical decoding keepalive packet.
+ */
+bool
+streamKeepalive(LogicalStreamContext *context)
+{
+	StreamContext *privateContext = (StreamContext *) context->private;
+
+	/* skip LSN 0/0 at the start of streaming */
+	if (context->cur_record_lsn == InvalidXLogRecPtr)
+	{
+		return true;
+	}
+
+	/* we might have to rotate to the next on-disk file */
+	if (!streamRotateFile(context))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* register progress made through receiving keepalive messages */
+	if (privateContext->jsonFile != NULL)
+	{
+		InternalMessage keepalive = {
+			.action = STREAM_ACTION_KEEPALIVE,
+			.lsn = context->cur_record_lsn,
+			.time = context->sendTime
+		};
+
+		if (!stream_write_internal_message(context, &keepalive))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		log_trace("Inserted action KEEPALIVE for lsn %X/%X @%s",
+				  LSN_FORMAT_ARGS(keepalive.lsn),
+				  keepalive.timeStr);
+
+		/* update the LSN tracking that's reported in the feedback */
+		context->tracking->written_lsn = context->cur_record_lsn;
+
+		/* time to update our lastWriteTime mark */
+		privateContext->lastWriteTime = time(NULL);
+
+		/* update the tracking for maximum LSN of messages written to disk so far */
+		if (privateContext->maxWrittenLSN < context->cur_record_lsn)
+		{
+			privateContext->maxWrittenLSN = context->cur_record_lsn;
+		}
 	}
 
 	return true;
@@ -772,18 +1508,22 @@ streamFeedback(LogicalStreamContext *context)
 {
 	StreamContext *privateContext = (StreamContext *) context->private;
 
-	int feedbackInterval = 10 * 1000; /* a minute */
+	int feedbackInterval = 1 * 1000; /* 1s */
 
-	if (!feTimestampDifferenceExceeds(context->lastFeedbackSync,
-									  context->now,
-									  feedbackInterval))
+	if (!context->forceFeedback)
 	{
-		return true;
+		if (!feTimestampDifferenceExceeds(context->lastFeedbackSync,
+										  context->now,
+										  feedbackInterval))
+		{
+			return true;
+		}
 	}
 
 	PGSQL src = { 0 };
+	char *pguri = privateContext->connStrings->source_pguri;
 
-	if (!pgsql_init(&src, privateContext->source_pguri, PGSQL_CONN_SOURCE))
+	if (!pgsql_init(&src, pguri, PGSQL_CONN_SOURCE))
 	{
 		/* errors have already been logged */
 		return false;
@@ -808,20 +1548,210 @@ streamFeedback(LogicalStreamContext *context)
 	privateContext->endpos = sentinel.endpos;
 	privateContext->startpos = sentinel.startpos;
 
-	context->endpos = privateContext->endpos;
+	context->endpos = sentinel.endpos;
 	context->tracking->applied_lsn = sentinel.replay_lsn;
 
 	context->lastFeedbackSync = context->now;
 
 	log_debug("streamFeedback: written %X/%X flushed %X/%X applied %X/%X "
-			  " endpos %X/%X apply %s",
+			  " startpos %X/%X endpos %X/%X apply %s",
 			  LSN_FORMAT_ARGS(context->tracking->written_lsn),
 			  LSN_FORMAT_ARGS(context->tracking->flushed_lsn),
 			  LSN_FORMAT_ARGS(context->tracking->applied_lsn),
-			  LSN_FORMAT_ARGS(context->endpos),
+			  LSN_FORMAT_ARGS(privateContext->startpos),
+			  LSN_FORMAT_ARGS(privateContext->endpos),
 			  privateContext->apply ? "enabled" : "disabled");
 
 	return true;
+}
+
+
+/*
+ * prepareMessageMetadataFromContext prepares the Logical Message Metadata from
+ * the fields grabbbed in the logical streaming protocol.
+ *
+ * See XLogData (B) protocol message description at:
+ *
+ * https://www.postgresql.org/docs/current/protocol-replication.html
+ */
+bool
+prepareMessageMetadataFromContext(LogicalStreamContext *context)
+{
+	StreamContext *privateContext = (StreamContext *) context->private;
+
+	LogicalMessageMetadata *metadata = &(privateContext->metadata);
+	LogicalMessageMetadata *previous = &(privateContext->previous);
+
+	/* ensure we have a new all-zero metadata structure for the new message */
+	(void) memset(metadata, 0, sizeof(LogicalMessageMetadata));
+
+	/* add the server start LSN to the LogicalMessageMetadata */
+	metadata->lsn = context->cur_record_lsn;
+
+	/* add the server sendTime to the LogicalMessageMetadata */
+	if (!pgsql_timestamptz_to_string(context->sendTime,
+									 metadata->timestamp,
+									 sizeof(metadata->timestamp)))
+	{
+		log_error("Failed to format server send time %lld to time string",
+				  (long long) context->sendTime);
+		return false;
+	}
+
+	/* now parse metadata found in the output_plugin data buffer itself */
+	if (!parseMessageActionAndXid(context))
+	{
+		log_error("Failed to parse header from logical decoding message: %s",
+				  context->buffer);
+		return false;
+	}
+
+	/* in case of filtering, early exit */
+	if (metadata->filterOut)
+	{
+		return true;
+	}
+
+	if (!prepareMessageJSONbuffer(context))
+	{
+		log_error("Failed to prepare a JSON buffer from "
+				  "logical decoding context buffer: %s, "
+				  "see above for details",
+				  context->buffer);
+		return false;
+	}
+
+	/*
+	 * Skip empty transactions, except every once in a while in order to
+	 * continue tracking LSN progress in our replay system.
+	 */
+	uint64_t now = time(NULL);
+	uint64_t elapsed = now - privateContext->lastWriteTime;
+
+	metadata->recvTime = now;
+
+	/* BEGIN message: always wait to see if next message is a COMMIT */
+	if (metadata->action == STREAM_ACTION_BEGIN)
+	{
+		metadata->skipping = true;
+	}
+
+	/* COMMIT message and previous one is a BEGIN */
+	else if (previous->action == STREAM_ACTION_BEGIN &&
+			 metadata->action == STREAM_ACTION_COMMIT)
+	{
+		metadata->skipping = true;
+
+		/* add a synthetic KEEPALIVE message once in a while */
+		if (STREAM_EMPTY_TX_TIMEOUT <= elapsed)
+		{
+			if (!streamKeepalive(context))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
+	}
+
+	/*
+	 * NOT a COMMIT message and previous one is a BEGIN
+	 *
+	 * It probably means the transaction is an INSERT/UPDATE/DELETE/TRUNCATE or
+	 * maybe even a SWITCH or something. In any case we want to now write the
+	 * previous BEGIN message out in the JSON stream.
+	 */
+	else if (previous->action == STREAM_ACTION_BEGIN &&
+			 metadata->action != STREAM_ACTION_COMMIT)
+	{
+		previous->skipping = false;
+		metadata->skipping = false;
+
+		bool previous = true;
+
+		if (!stream_write_json(context, previous))
+		{
+			/* errors have been logged */
+			return false;
+		}
+	}
+
+	/*
+	 * Any other case: current message is not a BEGIN, previous message is not
+	 * a BEGIN either.
+	 *
+	 * We don't need to keep track of the previous message anymore, and we need
+	 * to prepare for the next iteration by copying the current message
+	 * wholesale into the previous location.
+	 */
+	*previous = *metadata;
+
+	return true;
+}
+
+
+/*
+ * parseMessageXid retrieves the XID from the logical replication message found
+ * in the buffer. It might be a buffer formatted by any supported output
+ * plugin, at the moment either wal2json or test_decoding.
+ *
+ * Not all messages are supposed to have the XID information.
+ */
+bool
+parseMessageActionAndXid(LogicalStreamContext *context)
+{
+	switch (context->plugin)
+	{
+		case STREAM_PLUGIN_TEST_DECODING:
+		{
+			return parseTestDecodingMessageActionAndXid(context);
+		}
+
+		case STREAM_PLUGIN_WAL2JSON:
+		{
+			return parseWal2jsonMessageActionAndXid(context);
+		}
+
+		default:
+		{
+			log_error("BUG in parseMessageActionAndXid: unknown plugin %d",
+					  context->plugin);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * prepareMessageJSONbuffer prepares a buffer in the JSON format from the raw
+ * message sent by the logical decoding buffer.
+ */
+bool
+prepareMessageJSONbuffer(LogicalStreamContext *context)
+{
+	switch (context->plugin)
+	{
+		case STREAM_PLUGIN_TEST_DECODING:
+		{
+			return prepareTestDecodingMessage(context);
+		}
+
+		case STREAM_PLUGIN_WAL2JSON:
+		{
+			return prepareWal2jsonMessage(context);
+		}
+
+		default:
+		{
+			log_error("BUG in prepareMessageJSONbuffer: unknown plugin %d",
+					  context->plugin);
+			return NULL;
+		}
+	}
+
+	/* keep compiler happy */
+	return NULL;
 }
 
 
@@ -864,7 +1794,7 @@ parseMessageMetadata(LogicalMessageMetadata *metadata,
 			return false;
 		}
 
-		/* message entries {action: "M"} do not have xid, lsn, nextlsn fields */
+		/* message entries {action: "M"} do not have xid, lsn fields */
 		if (metadata->action == STREAM_ACTION_MESSAGE)
 		{
 			log_debug("Skipping message: %s", buffer);
@@ -872,52 +1802,91 @@ parseMessageMetadata(LogicalMessageMetadata *metadata,
 		}
 	}
 
-	if (metadata->action != STREAM_ACTION_SWITCH)
+	if (json_object_has_value_of_type(jsobj, "xid", JSONString))
+	{
+		const char *xid = json_object_get_string(jsobj, "xid");
+
+		if (!stringToUInt32(xid, &(metadata->xid)))
+		{
+			log_error("Failed to parse XID \"%s\" in message: %s", xid, buffer);
+			return false;
+		}
+	}
+	else if (json_object_has_value_of_type(jsobj, "xid", JSONNumber))
 	{
 		double xid = json_object_get_number(jsobj, "xid");
 		metadata->xid = (uint32_t) xid;
 	}
-
-	char *lsn = (char *) json_object_get_string(jsobj, "lsn");
-
-	if (lsn == NULL)
+	else
 	{
-		log_error("Failed to parse JSON message LSN: \"%s\"", buffer);
-		return false;
-	}
-
-	if (!parseLSN(lsn, &(metadata->lsn)))
-	{
-		log_error("Failed to parse LSN \"%s\"", lsn);
-		return false;
-	}
-
-	char *nextlsn = (char *) json_object_get_string(jsobj, "nextlsn");
-
-	if (nextlsn != NULL)
-	{
-		if (!parseLSN(nextlsn, &(metadata->nextlsn)))
+		if (!skipAction &&
+			(metadata->action == STREAM_ACTION_BEGIN ||
+			 metadata->action == STREAM_ACTION_COMMIT))
 		{
-			log_error("Failed to parse Next LSN \"%s\"", nextlsn);
+			log_error("Failed to parse XID for action %c in JSON message: %s",
+					  metadata->action,
+					  buffer);
 			return false;
 		}
 	}
 
-	char *timestamp = (char *) json_object_get_string(jsobj, "timestamp");
-
-	if (timestamp != NULL)
+	if (json_object_has_value(jsobj, "lsn"))
 	{
-		size_t n = sizeof(metadata->timestamp);
+		char *lsn = (char *) json_object_get_string(jsobj, "lsn");
 
-		if (strlcpy(metadata->timestamp, timestamp, n) >= n)
+		if (lsn != NULL)
 		{
-			log_error("Failed to parse JSON message timestamp value \"%s\" "
-					  "which is %lu bytes long, pgcopydb only support timestamps "
-					  "up to %lu bytes",
-					  timestamp,
-					  strlen(timestamp),
-					  sizeof(metadata->timestamp));
-			return false;
+			if (!parseLSN(lsn, &(metadata->lsn)))
+			{
+				log_error("Failed to parse LSN \"%s\"", lsn);
+				return false;
+			}
+		}
+	}
+
+	if (json_object_has_value(jsobj, "commit_lsn"))
+	{
+		char *txnCommitLSN = (char *) json_object_get_string(jsobj, "commit_lsn");
+
+		if (txnCommitLSN != NULL)
+		{
+			if (!parseLSN(txnCommitLSN, &(metadata->txnCommitLSN)))
+			{
+				log_error("Failed to parse LSN \"%s\"", txnCommitLSN);
+				return false;
+			}
+		}
+	}
+
+	if (!skipAction &&
+		metadata->lsn == InvalidXLogRecPtr &&
+		(metadata->action == STREAM_ACTION_BEGIN ||
+		 metadata->action == STREAM_ACTION_COMMIT))
+	{
+		log_error("Failed to parse LSN for action %c in message: %s",
+				  metadata->action,
+				  buffer);
+		return false;
+	}
+
+	if (json_object_has_value(jsobj, "timestamp"))
+	{
+		char *timestamp = (char *) json_object_get_string(jsobj, "timestamp");
+
+		if (timestamp != NULL)
+		{
+			size_t n = sizeof(metadata->timestamp);
+
+			if (strlcpy(metadata->timestamp, timestamp, n) >= n)
+			{
+				log_error("Failed to parse JSON message timestamp value \"%s\" "
+						  "which is %lu bytes long, "
+						  "pgcopydb only support timestamps up to %lu bytes",
+						  timestamp,
+						  strlen(timestamp),
+						  sizeof(metadata->timestamp));
+				return false;
+			}
 		}
 	}
 
@@ -1018,6 +1987,38 @@ stream_read_latest(StreamSpecs *specs, StreamContent *content)
 
 
 /*
+ * stream_update_latest_symlink updates the latest symbolic link to the given
+ * filename, that must already exists on the file system.
+ */
+bool
+stream_update_latest_symlink(StreamContext *privateContext,
+							 const char *filename)
+{
+	char latest[MAXPGPATH] = { 0 };
+
+	sformat(latest, sizeof(latest), "%s/latest", privateContext->paths.dir);
+
+	if (!unlink_file(latest))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!create_symbolic_link((char *) filename, latest))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	log_debug("stream_update_latest_symlink: \"%s\" -> \"%s\"",
+			  latest,
+			  privateContext->partialFileName);
+
+	return true;
+}
+
+
+/*
  * updateStreamCounters increment the counter that matches the received
  * message.
  */
@@ -1066,7 +2067,7 @@ updateStreamCounters(StreamContext *context, LogicalMessageMetadata *metadata)
 
 		default:
 		{
-			log_debug("Skipping counters for message action \"%c\"",
+			log_trace("Skipping counters for message action \"%c\"",
 					  metadata->action);
 			break;
 		}
@@ -1081,7 +2082,7 @@ updateStreamCounters(StreamContext *context, LogicalMessageMetadata *metadata)
  * replication=database from the connection string that's passed as input.
  */
 bool
-buildReplicationURI(const char *pguri, char *repl_pguri)
+buildReplicationURI(const char *pguri, char **repl_pguri)
 {
 	URIParams params = { 0 };
 	bool checkForCompleteURI = false;
@@ -1094,6 +2095,7 @@ buildReplicationURI(const char *pguri, char *repl_pguri)
 
 	/* if replication is already found, we override it to value "1" */
 	if (!parse_pguri_info_key_vals(pguri,
+								   &connStringDefaults,
 								   &replicationParams,
 								   &params,
 								   checkForCompleteURI))
@@ -1105,9 +2107,11 @@ buildReplicationURI(const char *pguri, char *repl_pguri)
 	if (!buildPostgresURIfromPieces(&params, repl_pguri))
 	{
 		log_error("Failed to produce the replication connection string");
+		freeURIParams(&params);
 		return false;
 	}
 
+	freeURIParams(&params);
 	return true;
 }
 
@@ -1161,6 +2165,21 @@ StreamActionFromChar(char action)
 			return STREAM_ACTION_SWITCH;
 		}
 
+		case 'K':
+		{
+			return STREAM_ACTION_KEEPALIVE;
+		}
+
+		case 'E':
+		{
+			return STREAM_ACTION_ENDPOS;
+		}
+
+		case 'R':
+		{
+			return STREAM_ACTION_ROLLBACK;
+		}
+
 		default:
 		{
 			log_error("Failed to parse JSON message action: \"%c\"", action);
@@ -1174,72 +2193,101 @@ StreamActionFromChar(char action)
 
 
 /*
- * streamWaitForSubprocess calls waitpid() and blocks until the current
- * subprocess is reported terminated by the Operating System.
+ * StreamActionToString returns a text representation of the action.
  */
-bool
-streamWaitForSubprocess(LogicalStreamContext *context)
+char *
+StreamActionToString(StreamAction action)
 {
-	StreamContext *privateContext = (StreamContext *) context->private;
-
-	/* if a subprocess had been started before, wait until it's done. */
-	if (privateContext->subprocess <= 0)
+	switch (action)
 	{
-		return true;
+		case STREAM_ACTION_UNKNOWN:
+		{
+			return "unknown";
+		}
+
+		case STREAM_ACTION_BEGIN:
+		{
+			return "BEGIN";
+		}
+
+		case STREAM_ACTION_COMMIT:
+		{
+			return "COMMIT";
+		}
+
+		case STREAM_ACTION_INSERT:
+		{
+			return "INSERT";
+		}
+
+		case STREAM_ACTION_UPDATE:
+		{
+			return "UPDATE";
+		}
+
+		case STREAM_ACTION_DELETE:
+		{
+			return "DELETE";
+		}
+
+		case STREAM_ACTION_TRUNCATE:
+		{
+			return "TRUNCATE";
+		}
+
+		case STREAM_ACTION_MESSAGE:
+		{
+			return "MESSAGE";
+		}
+
+		case STREAM_ACTION_SWITCH:
+		{
+			return "SWITCH";
+		}
+
+		case STREAM_ACTION_KEEPALIVE:
+		{
+			return "KEEPALIVE";
+		}
+
+		case STREAM_ACTION_ENDPOS:
+		{
+			return "ENDPOS";
+		}
+
+		case STREAM_ACTION_ROLLBACK:
+		{
+			return "ROLLBACK";
+		}
+
+		default:
+		{
+			log_error("Failed to parse message action: \"%c\"", action);
+			return "unknown";
+		}
 	}
-	int status = 0;
 
-	if (waitpid(privateContext->subprocess, &status, 0) == -1)
-	{
-		log_error("Failed to wait for pid %d: %m",
-				  privateContext->subprocess);
-		return false;
-	}
-
-	int returnCode = WEXITSTATUS(status);
-
-	if (returnCode != 0)
-	{
-		log_error("Stream Transform Worker %d exited with code %d, "
-				  "see above for details",
-				  privateContext->subprocess,
-				  returnCode);
-	}
-	else
-	{
-		log_debug("Transform subprocess %d exited successfully [%d]",
-				  privateContext->subprocess,
-				  returnCode);
-	}
-
-	privateContext->subprocess = 0;
-
-	return returnCode == 0;
+	/* keep compiler happy */
+	return "unknown";
 }
 
 
 /*
- * stream_setup_source_database sets up the source database with a replication
- * slot, a sentinel table, and the target database with a replication origin.
+ * stream_setup_source_database sets up the source database with a sentinel
+ * table, and the target database with a replication origin.
  */
 bool
-stream_setup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
+stream_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 {
-	uint64_t lsn = 0;
+	ReplicationSlot *slot = &(streamSpecs->slot);
 
-	if (!stream_create_repl_slot(copySpecs, slotName, &lsn))
+	if (!stream_create_sentinel(copySpecs, slot->lsn, InvalidXLogRecPtr))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!stream_create_sentinel(copySpecs, lsn, InvalidXLogRecPtr))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!stream_create_origin(copySpecs, origin, lsn))
+	if (!stream_create_origin(copySpecs, streamSpecs->origin, slot->lsn))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1262,7 +2310,7 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 	/*
 	 * Cleanup the source database (replication slot, pgcopydb sentinel).
 	 */
-	if (!pgsql_init(&src, copySpecs->source_pguri, PGSQL_CONN_SOURCE))
+	if (!pgsql_init(&src, copySpecs->connStrings.source_pguri, PGSQL_CONN_SOURCE))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1280,6 +2328,8 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 		return false;
 	}
 
+	log_info("Removing schema pgcopydb and its objects");
+
 	if (!pgsql_execute(&src, "drop schema if exists pgcopydb cascade"))
 	{
 		/* errors have already been logged */
@@ -1293,9 +2343,31 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 	}
 
 	/*
+	 * When we have dropped the replication slot, we can remove the slot file
+	 * on-disk and also the snapshot file.
+	 */
+	log_notice("Removing slot file \"%s\"", copySpecs->cfPaths.cdc.slotfile);
+
+	if (!unlink_file(copySpecs->cfPaths.cdc.slotfile))
+	{
+		log_error("Failed to unlink the slot file \"%s\"",
+				  copySpecs->cfPaths.cdc.slotfile);
+		return false;
+	}
+
+	log_notice("Removing snapshot file \"%s\"", copySpecs->cfPaths.snfile);
+
+	if (!unlink_file(copySpecs->cfPaths.snfile))
+	{
+		log_error("Failed to unlink the snapshot file \"%s\"",
+				  copySpecs->cfPaths.snfile);
+		return false;
+	}
+
+	/*
 	 * Now cleanup the target database (replication origin).
 	 */
-	if (!pgsql_init(&dst, copySpecs->target_pguri, PGSQL_CONN_TARGET))
+	if (!pgsql_init(&dst, copySpecs->connStrings.target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1312,162 +2384,6 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 
 
 /*
- * stream_create_repl_slot creates a replication slot on the source database.
- */
-bool
-stream_create_repl_slot(CopyDataSpec *copySpecs, char *slotName, uint64_t *lsn)
-{
-	PGSQL *pgsql = &(copySpecs->sourceSnapshot.pgsql);
-
-	/*
-	 * When using Postgres 9.6, we're using the logical decoding replication
-	 * protocol command CREATE_REPLICATION_SLOT to both create the replication
-	 * and also export a snapshot.
-	 */
-	if (copySpecs->sourceSnapshot.exportedCreateSlotSnapshot)
-	{
-		bool slotExists = false;
-
-		if (!pgsql_init(pgsql, copySpecs->source_pguri, PGSQL_CONN_SOURCE))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!pgsql_begin(pgsql))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!pgsql_server_version(pgsql))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		log_info("Postgres server version %s (%d)",
-				 pgsql->pgversion, pgsql->pgversion_num);
-
-		if (!pgsql_replication_slot_exists(pgsql, slotName, &slotExists, lsn))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!pgsql_commit(pgsql))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!slotExists)
-		{
-			log_error("Logical replication slot \"%s\" does not exist, "
-					  "it is expected to have been created by the replication "
-					  "command CREATE_REPLICATION_SLOT when using Postgres %s",
-					  slotName,
-					  copySpecs->sourceSnapshot.stream.pgsql.pgversion);
-			return false;
-		}
-
-		return true;
-	}
-
-	/*
-	 * When --snapshot has been used, open a transaction using that snapshot.
-	 */
-	if (!IS_EMPTY_STRING_BUFFER(copySpecs->sourceSnapshot.snapshot))
-	{
-		if (!copydb_set_snapshot(copySpecs))
-		{
-			/* errors have already been logged */
-			log_fatal("Failed to use given --snapshot \"%s\"",
-					  copySpecs->sourceSnapshot.snapshot);
-			return false;
-		}
-	}
-	else
-	{
-		if (!pgsql_init(pgsql, copySpecs->source_pguri, PGSQL_CONN_SOURCE))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!pgsql_begin(pgsql))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
-	/*
-	 * The pgsql_create_replication_slot SQL query text depends on the source
-	 * Postgres version, because the "lsn" column used to be named
-	 * "xlog_position" in 9.6. Make sure to retrieve the source server version
-	 * now.
-	 */
-	if (!pgsql_server_version(pgsql))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	bool slotExists = false;
-
-	if (!pgsql_replication_slot_exists(pgsql, slotName, &slotExists, lsn))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (slotExists)
-	{
-		if (!copySpecs->resume)
-		{
-			log_error("Failed to create replication slot \"%s\": already exists",
-					  slotName);
-			pgsql_rollback(pgsql);
-			return false;
-		}
-
-		log_info("Logical replication slot \"%s\" already exists at LSN %X/%X",
-				 slotName,
-				 LSN_FORMAT_ARGS(*lsn));
-
-		pgsql_commit(pgsql);
-		return true;
-	}
-	else
-	{
-		if (!pgsql_create_replication_slot(pgsql,
-										   slotName,
-										   REPLICATION_PLUGIN,
-										   lsn))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!pgsql_commit(pgsql))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		log_info("Created logical replication slot \"%s\" with plugin \"%s\" "
-				 "at LSN %X/%X",
-				 slotName,
-				 REPLICATION_PLUGIN,
-				 LSN_FORMAT_ARGS(*lsn));
-	}
-
-	return true;
-}
-
-
-/*
  * stream_create_origin creates a replication origin on the target database.
  */
 bool
@@ -1475,7 +2391,7 @@ stream_create_origin(CopyDataSpec *copySpecs, char *nodeName, uint64_t startpos)
 {
 	PGSQL dst = { 0 };
 
-	if (!pgsql_init(&dst, copySpecs->target_pguri, PGSQL_CONN_TARGET))
+	if (!pgsql_init(&dst, copySpecs->connStrings.target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1589,7 +2505,7 @@ stream_create_sentinel(CopyDataSpec *copySpecs,
 
 	PGSQL *pgsql = &(copySpecs->sourceSnapshot.pgsql);
 
-	if (!pgsql_init(pgsql, copySpecs->source_pguri, PGSQL_CONN_SOURCE))
+	if (!pgsql_init(pgsql, copySpecs->connStrings.source_pguri, PGSQL_CONN_SOURCE))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1609,7 +2525,7 @@ stream_create_sentinel(CopyDataSpec *copySpecs,
 		if (!pgsql_execute(pgsql, sql[i]))
 		{
 			/* errors have already been logged */
-			exit(EXIT_CODE_SOURCE);
+			return false;
 		}
 	}
 
@@ -1661,8 +2577,11 @@ bool
 stream_write_context(StreamSpecs *specs, LogicalStreamClient *stream)
 {
 	IdentifySystem *system = &(stream->system);
-
 	char wal_segment_size[BUFSIZE] = { 0 };
+
+	/* also cache the system and WalSegSz in the StreamSpecs */
+	specs->system = stream->system;
+	specs->WalSegSz = stream->WalSegSz;
 
 	int bytes =
 		sformat(wal_segment_size, sizeof(wal_segment_size), "%lld",
@@ -1717,6 +2636,9 @@ stream_cleanup_context(StreamSpecs *specs)
 	success = success && unlink_file(specs->paths.tlifile);
 	success = success && unlink_file(specs->paths.tlihistfile);
 
+	/* reset the timeline, so that we always read from the disk */
+	specs->system.timeline = 0;
+
 	return success;
 }
 
@@ -1731,6 +2653,9 @@ stream_read_context(CDCPaths *paths,
 					uint32_t *WalSegSz)
 {
 	char *wal_segment_size = NULL;
+	char *tli = NULL;
+	char *history = NULL;
+
 	long size = 0L;
 
 	/*
@@ -1741,20 +2666,47 @@ stream_read_context(CDCPaths *paths,
 	 */
 	ConnectionRetryPolicy retryPolicy = { 0 };
 
+	int maxT = 10;              /* 10s */
+	int maxSleepTime = 1500;    /* 1.5s */
+	int baseSleepTime = 100;    /* 100ms */
+
 	(void) pgsql_set_retry_policy(&retryPolicy,
-								  CATCHINGUP_SLEEP_MS,
+								  maxT,
 								  -1, /* unbounded number of attempts */
-								  CATCHINGUP_SLEEP_MS / 1000,
-								  CATCHINGUP_SLEEP_MS / 1000);
+								  maxSleepTime,
+								  baseSleepTime);
 
 	while (!pgsql_retry_policy_expired(&retryPolicy))
 	{
+		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
+		{
+			return false;
+		}
+
 		if (file_exists(paths->walsegsizefile) &&
 			file_exists(paths->tlifile) &&
 			file_exists(paths->tlihistfile))
 		{
-			/* success: break out of the retry loop */
-			break;
+			/*
+			 * File did exist, but might have been deleted now (race condition
+			 * at prefetch and transform processes start-up).
+			 */
+			bool success = true;
+
+			success = success &&
+					  read_file(paths->walsegsizefile, &wal_segment_size, &size);
+
+			success = success &&
+					  read_file(paths->tlifile, &tli, &size);
+
+			success = success &&
+					  read_file(paths->tlihistfile, &history, &size);
+
+			if (success)
+			{
+				/* success: break out of the retry loop */
+				break;
+			}
 		}
 
 		int sleepTimeMs =
@@ -1768,46 +2720,48 @@ stream_read_context(CDCPaths *paths,
 		(void) pg_usleep(sleepTimeMs * 1000);
 	}
 
-	/* we don't want to retry anymore, error out if files still don't exist */
-	if (!read_file(paths->walsegsizefile, &wal_segment_size, &size))
+	/* did retry policy expire before the files are created? */
+	if (!(file_exists(paths->walsegsizefile) &&
+		  file_exists(paths->tlifile) &&
+		  file_exists(paths->tlihistfile)))
 	{
-		/* errors have already been logged */
+		log_error("Failed to read stream context file: retry policy expired");
 		return false;
 	}
 
+	/*
+	 * Now that we could read the file contents, parse it.
+	 */
 	if (!stringToUInt(wal_segment_size, WalSegSz))
 	{
 		/* errors have already been logged */
-		return false;
-	}
-
-	char *tli;
-
-	if (!read_file(paths->tlifile, &tli, &size))
-	{
-		/* errors have already been logged */
+		free(wal_segment_size);
+		free(tli);
+		free(history);
 		return false;
 	}
 
 	if (!stringToUInt(tli, &(system->timeline)))
 	{
 		/* errors have already been logged */
-		return false;
-	}
-
-	char *history = NULL;
-
-	if (!read_file(paths->tlihistfile, &history, &size))
-	{
-		/* errors have already been logged */
+		free(wal_segment_size);
+		free(tli);
+		free(history);
 		return false;
 	}
 
 	if (!parseTimeLineHistory(paths->tlihistfile, history, system))
 	{
 		/* errors have already been logged */
+		free(wal_segment_size);
+		free(tli);
+		free(history);
 		return false;
 	}
+
+	free(wal_segment_size);
+	free(tli);
+	free(history);
 
 	return true;
 }

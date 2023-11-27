@@ -3,7 +3,7 @@
 pgcopydb snapshot
 =================
 
-pgcopydb snapshot - Create and exports a snapshot on the source database
+pgcopydb snapshot - Create and export a snapshot on the source database
 
 The command ``pgcopydb snapshot`` connects to the source database and
 executes a SQL query to export a snapshot. The obtained snapshot is both
@@ -12,11 +12,14 @@ expect to find it.
 
 ::
 
-   pgcopydb snapshot: Create and exports a snapshot on the source database
+   pgcopydb snapshot: Create and export a snapshot on the source database
    usage: pgcopydb snapshot  --source ...
 
      --source         Postgres URI to the source database
      --dir            Work directory to use
+     --follow         Implement logical decoding to replay changes
+     --plugin         Output plugin to use (test_decoding, wal2json)
+     --slot-name      Use this Postgres replication slot name
 
 Options
 -------
@@ -41,44 +44,32 @@ drop`` subcommands:
   ``${TMPDIR}/pgcopydb`` when the environment variable is set, or
   then to ``/tmp/pgcopydb``.
 
---snapshot
+--follow
 
-  Instead of exporting its own snapshot by calling the PostgreSQL function
-  ``pg_export_snapshot()`` it is possible for pgcopydb to re-use an already
-  exported snapshot.
+  When the ``--follow`` option is used then pgcopydb implements Change Data
+  Capture as detailed in the manual page for :ref:`pgcopydb_follow` in
+  parallel to the main copy database steps.
+
+  The replication slot is created using the Postgres replication protocol
+  command CREATE_REPLICATION_SLOT, which then exports the snapshot being
+  used in that command.
+
+--plugin
+
+  Logical decoding output plugin to use. The default is `test_decoding`__
+  which ships with Postgres core itself, so is probably already available on
+  your source server.
+
+  It is possible to use `wal2json`__ instead. The support for wal2json is
+  mostly historical in pgcopydb, it should not make a user visible
+  difference whether you use the default test_decoding or wal2json.
+
+  __ https://www.postgresql.org/docs/current/test-decoding.html
+  __ https://github.com/eulerto/wal2json/
 
 --slot-name
 
-  Logical replication slot name to use, default to ``pgcopydb``. The slot
-  should be created within the same transaction snapshot as the initial data
-  copy.
-
-  Must be using the `wal2json`__ output plugin, available with
-  format-version 2.
-
-  __ https://github.com/eulerto/wal2json/
-
---origin
-
-  Logical replication target system needs to track the transactions that
-  have been applied already, so that in case we get disconnected or need to
-  resume operations we can skip already replayed transaction.
-
-  Postgres uses a notion of an origin node name as documented in
-  `Replication Progress Tracking`__. This option allows to pick your own
-  node name and defaults to "pgcopydb". Picking a different name is useful
-  in some advanced scenarios like migrating several sources in the same
-  target, where each source should have their own unique origin node name.
-
-  __ https://www.postgresql.org/docs/current/replication-origins.html
-
---startpos
-
-  Logical replication target system registers progress by assigning a
-  current LSN to the ``--origin`` node name. When creating an origin on the
-  target database system, it is required to provide the current LSN from the
-  source database system, in order to properly bootstrap pgcopydb logical
-  decoding.
+  Logical decoding slot name to use.
 
 --verbose
 

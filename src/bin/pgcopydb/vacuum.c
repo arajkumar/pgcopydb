@@ -23,6 +23,12 @@
 bool
 vacuum_start_workers(CopyDataSpec *specs)
 {
+	if (specs->skipVacuum)
+	{
+		log_info("STEP 8: skipping VACUUM jobs per --skip-vacuum");
+		return true;
+	}
+
 	log_info("STEP 8: starting %d VACUUM processes", specs->vacuumJobs);
 	log_trace("vacuum_start_workers: \"%s\"", specs->cfPaths.tbldir);
 
@@ -41,13 +47,15 @@ vacuum_start_workers(CopyDataSpec *specs)
 		{
 			case -1:
 			{
-				log_error("Failed to fork a worker process: %m");
+				log_error("Failed to fork a vacuum worker process: %m");
 				return false;
 			}
 
 			case 0:
 			{
 				/* child process runs the command */
+				(void) set_ps_title("pgcopydb: vacuum worker");
+
 				if (!vacuum_worker(specs))
 				{
 					/* errors have already been logged */
@@ -77,28 +85,34 @@ vacuum_start_workers(CopyDataSpec *specs)
 bool
 vacuum_worker(CopyDataSpec *specs)
 {
+	pid_t pid = getpid();
+
+	log_notice("Started VACUUM worker %d [%d]", pid, getppid());
+	log_trace("vacuum_worker: \"%s\"", specs->cfPaths.tbldir);
+
 	int errors = 0;
 	bool stop = false;
 
-	log_notice("Started VACUUM worker %d [%d]", getpid(), getppid());
-	log_trace("vacuum_worker: \"%s\"", specs->cfPaths.tbldir);
-
 	while (!stop)
 	{
-		QMessage mesg = { 0 };
+		QMessage *mesg = (QMessage *) calloc(1, sizeof(QMessage));
+		bool recv_ok = queue_receive(&(specs->vacuumQueue), mesg);
 
 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
+			log_error("VACUUM worker has been interrupted");
+			free(mesg);
 			return false;
 		}
 
-		if (!queue_receive(&(specs->vacuumQueue), &mesg))
+		if (!recv_ok)
 		{
 			/* errors have already been logged */
-			break;
+			free(mesg);
+			return false;
 		}
 
-		switch (mesg.type)
+		switch (mesg->type)
 		{
 			case QMSG_TYPE_STOP:
 			{
@@ -109,10 +123,19 @@ vacuum_worker(CopyDataSpec *specs)
 
 			case QMSG_TYPE_TABLEOID:
 			{
-				/* ignore errors */
-				if (!vacuum_analyze_table_by_oid(specs, mesg.data.oid))
+				if (!vacuum_analyze_table_by_oid(specs, mesg->data.oid))
 				{
 					++errors;
+
+					log_error("Failed to vacuum table with oid %u, "
+							  "see above for details",
+							  mesg->data.oid);
+
+					if (specs->failFast)
+					{
+						free(mesg);
+						return false;
+					}
 				}
 				break;
 			}
@@ -120,14 +143,26 @@ vacuum_worker(CopyDataSpec *specs)
 			default:
 			{
 				log_error("Received unknown message type %ld on vacuum queue %d",
-						  mesg.type,
+						  mesg->type,
 						  specs->vacuumQueue.qId);
 				break;
 			}
 		}
+
+		free(mesg);
 	}
 
-	return stop == true && errors == 0;
+	bool success = (stop == true && errors == 0);
+
+	if (errors > 0)
+	{
+		log_error("VACUUM worker %d encountered %d errors, "
+				  "see above for details",
+				  pid,
+				  errors);
+	}
+
+	return success;
 }
 
 
@@ -141,8 +176,6 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 {
 	CopyFilePaths *cfPaths = &(specs->cfPaths);
 	TableFilePaths tablePaths = { 0 };
-
-	log_trace("vacuum_analyze_table_by_oid: \"%s\"", specs->cfPaths.tbldir);
 
 	if (!copydb_init_tablepaths(cfPaths, &tablePaths, oid))
 	{
@@ -169,14 +202,15 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 
 	if (!read_table_summary(&tableSummary, tablePaths.doneFile))
 	{
-		/* errors have already been logged */
+		log_error("Failed to read table summary file: \"%s\"",
+				  tablePaths.doneFile);
 		return false;
 	}
 
 	PGSQL dst = { 0 };
 
 	/* initialize our connection to the target database */
-	if (!pgsql_init(&dst, specs->target_pguri, PGSQL_CONN_TARGET))
+	if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
 	{
 		/* errors have already been logged */
 		return false;
@@ -186,15 +220,20 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
 	char vacuum[BUFSIZE] = { 0 };
 
 	sformat(vacuum, sizeof(vacuum),
-			"VACUUM ANALYZE \"%s\".\"%s\"",
+			"VACUUM ANALYZE %s.%s",
 			table.nspname,
 			table.relname);
 
-	log_info("%s;", vacuum);
+	/* also set the process title for this specific table */
+	char psTitle[BUFSIZE] = { 0 };
+	sformat(psTitle, sizeof(psTitle), "pgcopydb: %s", vacuum);
+	(void) set_ps_title(psTitle);
+
+	log_notice("%s;", vacuum);
 
 	if (!pgsql_execute(&dst, vacuum))
 	{
-		/* errors have already been logged */
+		log_error("Failed to run command, see above for details: %s", vacuum);
 		return false;
 	}
 
@@ -209,12 +248,14 @@ vacuum_analyze_table_by_oid(CopyDataSpec *specs, uint32_t oid)
  * given table.
  */
 bool
-vacuum_add_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
+vacuum_add_table(CopyDataSpec *specs, uint32_t oid)
 {
 	QMessage mesg = {
 		.type = QMSG_TYPE_TABLEOID,
-		.data.oid = tableSpecs->sourceTable->oid
+		.data.oid = oid
 	};
+
+	log_debug("vacuum_add_table: %u", oid);
 
 	if (!queue_send(&(specs->vacuumQueue), &mesg))
 	{
@@ -235,6 +276,11 @@ vacuum_add_table(CopyDataSpec *specs, CopyTableDataSpec *tableSpecs)
 bool
 vacuum_send_stop(CopyDataSpec *specs)
 {
+	if (specs->skipVacuum)
+	{
+		return true;
+	}
+
 	for (int i = 0; i < specs->vacuumJobs; i++)
 	{
 		QMessage stop = { .type = QMSG_TYPE_STOP, .data.oid = 0 };

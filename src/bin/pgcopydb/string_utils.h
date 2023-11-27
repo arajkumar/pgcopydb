@@ -9,6 +9,8 @@
 
 #define IS_EMPTY_STRING_BUFFER(strbuf) (strbuf[0] == '\0')
 
+#define NULL_AS_EMPTY_STRING(str) (str == NULL ? "" : str)
+
 #define streq(a, b) (a != NULL && b != NULL && strcmp(a, b) == 0)
 
 #define strneq(x, y) \
@@ -37,6 +39,9 @@ bool stringToInt32(const char *str, int32_t *number);
 bool stringToUInt32(const char *str, uint32_t *number);
 
 bool stringToDouble(const char *str, double *number);
+
+bool hexStringToUInt32(const char *str, uint32_t *number);
+
 bool IntervalToString(uint64_t millisecs, char *buffer, size_t size);
 
 int countLines(char *buffer);
@@ -44,6 +49,8 @@ int splitLines(char *buffer, char **linesArray, int size);
 void processBufferCallback(const char *buffer, bool error);
 
 void pretty_print_bytes(char *buffer, size_t size, uint64_t bytes);
+void pretty_print_bytes_per_second(char *buffer, size_t size, uint64_t bytes,
+								   uint64_t durationMs);
 void pretty_print_count(char *buffer, size_t size, uint64_t count);
 
 #endif /* STRING_UTILS_h */

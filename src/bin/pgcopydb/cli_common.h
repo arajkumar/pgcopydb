@@ -14,34 +14,53 @@
 #include <getopt.h>
 #include <stdbool.h>
 
+#include "copydb_paths.h"
 #include "defaults.h"
 #include "parson.h"
+#include "parsing_utils.h"
 #include "pgcmd.h"
 #include "pgsql.h"
+
+typedef struct SplitTableLargerThan
+{
+	uint64_t bytes;
+	char bytesPretty[NAMEDATALEN];
+} SplitTableLargerThan;
+
 
 typedef struct CopyDBOptions
 {
 	char dir[MAXPGPATH];
 
-	char source_pguri[MAXCONNINFO];
-	char target_pguri[MAXCONNINFO];
+	ConnStrings connStrings;
 
 	int tableJobs;
 	int indexJobs;
-	uint64_t splitTablesLargerThan;
-	char splitTablesLargerThanPretty[NAMEDATALEN];
+	int lObjectJobs;
+
+	SplitTableLargerThan splitTablesLargerThan;
 
 	RestoreOptions restoreOptions;
 
 	bool roles;
 	bool skipLargeObjects;
 	bool skipExtensions;
+	bool skipCommentOnExtension;
+	bool skipCollations;
+	bool skipVacuum;
+	bool noRolesPasswords;
+	bool failFast;
 
 	bool restart;
 	bool resume;
 	bool notConsistent;
+
+	ReplicationSlot slot;
 	char snapshot[BUFSIZE];
 	char origin[BUFSIZE];
+
+	bool stdIn;
+	bool stdOut;
 
 	bool follow;
 	bool createSlot;
@@ -50,10 +69,7 @@ typedef struct CopyDBOptions
 	uint64_t startpos;
 
 	char filterFileName[MAXPGPATH];
-	char slotName[MAXPGPATH];
-
-	char hookPreCopy[MAXPGPATH];
-	char hookPostCopy[MAXPGPATH];
+	char requirementsFileName[MAXPGPATH];
 } CopyDBOptions;
 
 extern bool outputJSON;
@@ -67,8 +83,17 @@ void cli_print_version(int argc, char **argv);
 void cli_pprint_json(JSON_Value *js);
 char * logLevelToString(int logLevel);
 
+bool cli_copydb_getenv_source_pguri(char **pguri);
+bool cli_copydb_getenv_split(SplitTableLargerThan *splitTablesLargerThan);
+
 bool cli_copydb_getenv(CopyDBOptions *options);
 bool cli_copydb_is_consistent(CopyDBOptions *options);
+bool cli_read_previous_options(CopyDBOptions *options, CopyFilePaths *cfPaths);
+
+bool cli_read_one_line(const char *filename,
+					   const char *name,
+					   char *target,
+					   size_t size);
 
 int cli_copy_db_getopts(int argc, char **argv);
 
@@ -76,5 +101,7 @@ bool cli_parse_bytes_pretty(const char *byteString,
 							uint64_t *bytes,
 							char *bytesPretty,
 							size_t bytesPrettySize);
+
+bool cli_prepare_pguris(ConnStrings *connStrings);
 
 #endif  /* CLI_COMMON_H */

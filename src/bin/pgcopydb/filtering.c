@@ -144,16 +144,34 @@ parse_filters(const char *filename, SourceFilters *filters)
 	struct section
 	{
 		char name[NAMEDATALEN];
+		SourceFilterSection section;
 		SourceFilterTableList *list;
-	};
-
-	struct section sections[] = {
-		{ "exclude-schema", NULL },
-		{ "exclude-table", &(filters->excludeTableList) },
-		{ "exclude-table-data", &(filters->excludeTableDataList) },
-		{ "exclude-index", &(filters->excludeIndexList) },
-		{ "include-only-table", &(filters->includeOnlyTableList) },
-		{ "", NULL },
+	}
+	sections[] =
+	{
+		{ "include-only-schema", SOURCE_FILTER_INCLUDE_ONLY_SCHEMA, NULL },
+		{ "exclude-schema", SOURCE_FILTER_EXCLUDE_SCHEMA, NULL },
+		{
+			"exclude-table",
+			SOURCE_FILTER_EXCLUDE_TABLE,
+			&(filters->excludeTableList)
+		},
+		{
+			"exclude-table-data",
+			SOURCE_FILTER_EXCLUDE_TABLE_DATA,
+			&(filters->excludeTableDataList)
+		},
+		{
+			"exclude-index",
+			SOURCE_FILTER_EXCLUDE_INDEX,
+			&(filters->excludeIndexList)
+		},
+		{
+			"include-only-table",
+			SOURCE_FILTER_INCLUDE_ONLY_TABLE,
+			&(filters->includeOnlyTableList)
+		},
+		{ "", SOURCE_FILTER_UNKNOWN, NULL },
 	};
 
 	for (int i = 0; sections[i].name[0] != '\0'; i++)
@@ -186,14 +204,36 @@ parse_filters(const char *filename, SourceFilters *filters)
 		/*
 		 * The index in the sections table is a SourceFilterSection enum value.
 		 */
-		switch (i)
+		switch (sections[i].section)
 		{
+			case SOURCE_FILTER_INCLUDE_ONLY_SCHEMA:
+			{
+				filters->includeOnlySchemaList.count = optionCount;
+				filters->includeOnlySchemaList.array =
+					(SourceFilterSchema *) calloc(optionCount,
+												  sizeof(SourceFilterSchema));
+
+				for (int o = 0; o < optionCount; o++)
+				{
+					SourceFilterSchema *schema =
+						&(filters->includeOnlySchemaList.array[o]);
+
+					const char *optionName =
+						ini_property_name(ini, sectionIndex, o);
+
+					strlcpy(schema->nspname, optionName, sizeof(schema->nspname));
+
+					log_debug("including only schema \"%s\"", schema->nspname);
+				}
+				break;
+			}
+
 			case SOURCE_FILTER_EXCLUDE_SCHEMA:
 			{
 				filters->excludeSchemaList.count = optionCount;
-				filters->excludeSchemaList.array = (SourceFilterSchema *)
-												   malloc(optionCount *
-														  sizeof(SourceFilterSchema));
+				filters->excludeSchemaList.array =
+					(SourceFilterSchema *) calloc(optionCount,
+												  sizeof(SourceFilterSchema));
 
 				for (int o = 0; o < optionCount; o++)
 				{
@@ -260,20 +300,54 @@ parse_filters(const char *filename, SourceFilters *filters)
 	 * and any other filtering rule, which are exclusion rules. Otherwise it's
 	 * unclear what to do with tables that are not excluded and not included
 	 * either.
+	 *
+	 * Using both exclude-schema and include-only-table sections is allowed,
+	 * the user needs to pay attention not to exclude schemas of tables that
+	 * are then to be included only.
+	 *
+	 * Using both exclude-schema and include-only-schema is disallowed too. It
+	 * does not make sense to use both at the same time.
 	 */
+	if (filters->includeOnlySchemaList.count > 0 &&
+		filters->excludeSchemaList.count > 0)
+	{
+		log_error("Filtering setup in \"%s\" contains %d entries "
+				  "in section \"%s\" and %d entries in section \"%s\", "
+				  "please use only one of these section.",
+				  filename,
+				  filters->includeOnlySchemaList.count,
+				  "include-only-schema",
+				  filters->excludeSchemaList.count,
+				  "exclude-schema");
+		return false;
+	}
+
 	if (filters->includeOnlyTableList.count > 0 &&
-		(filters->excludeTableList.count > 0 ||
-		 filters->excludeSchemaList.count > 0))
+		filters->excludeTableList.count > 0)
 	{
 		log_error("Filtering setup in \"%s\" contains "
-				  "%d entries in \"%s\" section and %d entries in \"%s\" "
-				  "sections, please use only one of those.",
+				  "%d entries in section \"%s\" and %d entries in "
+				  "section \"%s\", please use only one of these sections.",
 				  filename,
 				  filters->includeOnlyTableList.count,
 				  "include-only-table",
 				  filters->excludeTableList.count,
 				  "exclude-table");
 		return false;
+	}
+
+	if (filters->includeOnlyTableList.count > 0 &&
+		filters->excludeSchemaList.count > 0)
+	{
+		log_warn("Filtering setup in \"%s\" contains %d entries "
+				 "in \"%s\" section and %d entries in \"%s\" section, "
+				 "please make sure not to filter-out schema of "
+				 "tables you want to include",
+				 filename,
+				 filters->includeOnlyTableList.count,
+				 "include-only-table",
+				 filters->excludeSchemaList.count,
+				 "exclude-schema");
 	}
 
 	/*
@@ -283,7 +357,14 @@ parse_filters(const char *filename, SourceFilters *filters)
 	{
 		filters->type = SOURCE_FILTER_TYPE_INCL;
 	}
-	else if (filters->excludeSchemaList.count > 0 ||
+
+	/*
+	 * include-only-schema works the same as an exclude-schema filter, it only
+	 * allows another spelling of it that might be more useful -- it's still an
+	 * exclusion filter.
+	 */
+	else if (filters->includeOnlySchemaList.count > 0 ||
+			 filters->excludeSchemaList.count > 0 ||
 			 filters->excludeTableList.count > 0 ||
 			 filters->excludeTableDataList.count > 0)
 	{
@@ -338,26 +419,26 @@ parse_filter_quoted_table_name(SourceFilterTable *table, const char *qname)
 
 	if (qname[0] == '"' && *(dot - 1) != '"')
 	{
-		char str[BUFSIZE] = { 0 };
-
-		strlcpy(str, qname, Min(dot - qname, sizeof(str)));
-
-		log_error("Failed to parse quoted relation name: %s", str);
+		log_error("Failed to parse quoted relation name: \"%s\"", qname);
 		return false;
 	}
 
 	char *nspnameStart = qname[0] == '"' ? (char *) qname + 1 : (char *) qname;
 	char *nspnameEnd = *(dot - 1) == '"' ? dot - 1 : dot;
-	size_t nsplen = nspnameEnd - nspnameStart + 1;
 
-	if (strlcpy(table->nspname, nspnameStart, nsplen) >= sizeof(table->nspname))
+	/* skip last character of the range, either a closing quote or the dot */
+	int nsplen = nspnameEnd - nspnameStart;
+
+	size_t nspbytes =
+		sformat(table->nspname, sizeof(table->nspname), "%.*s",
+				nsplen,
+				nspnameStart);
+
+	if (nspbytes >= sizeof(table->nspname))
 	{
-		char str[BUFSIZE] = { 0 };
-		strlcpy(str, nspnameStart, Min(nsplen, sizeof(str)));
-
-		log_error("Failed to parse schema name \"%s\" (%lu bytes long), "
+		log_error("Failed to parse schema name \"%s\" (%d bytes long), "
 				  "pgcopydb and Postgres only support names up to %lu bytes",
-				  str,
+				  table->nspname,
 				  nsplen,
 				  sizeof(table->nspname));
 		return false;
@@ -375,23 +456,24 @@ parse_filter_quoted_table_name(SourceFilterTable *table, const char *qname)
 
 	if (ptr[0] == '"' && *(end - 1) != '"')
 	{
-		char str[BUFSIZE] = { 0 };
-
-		strlcpy(str, ptr, Min(end - ptr, sizeof(str)));
-
-		log_error("Failed to parse quoted relation name: %s", str);
+		log_error("Failed to parse quoted relation name: \"%s\"", ptr);
 		return false;
 	}
 
 	char *relnameStart = ptr[0] == '"' ? ptr + 1 : ptr;
 	char *relnameEnd = *(end - 1) == '"' ? end - 1 : end;
-	size_t rellen = relnameEnd - relnameStart + 1;
+	int rellen = relnameEnd - relnameStart + 1;
 
-	if (strlcpy(table->relname, relnameStart, rellen) >= sizeof(table->relname))
+	size_t relbytes =
+		sformat(table->relname, sizeof(table->relname), "%.*s",
+				rellen,
+				relnameStart);
+
+	if (relbytes >= sizeof(table->relname))
 	{
-		log_error("Failed to parse relation name \"%s\" (%lu bytes long), "
+		log_error("Failed to parse relation name \"%s\" (%d bytes long), "
 				  "pgcopydb and Postgres only support names up to %lu bytes",
-				  ptr,
+				  table->relname,
 				  rellen,
 				  sizeof(table->relname));
 		return false;

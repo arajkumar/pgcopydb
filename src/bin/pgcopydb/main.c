@@ -13,6 +13,7 @@
 #endif
 
 #include "cli_root.h"
+#include "copydb.h"
 #include "defaults.h"
 #include "env_utils.h"
 #include "file_utils.h"
@@ -24,17 +25,18 @@
 
 char pgcopydb_argv0[MAXPGPATH];
 char pgcopydb_program[MAXPGPATH];
-int pgconnect_timeout = 10;     /* see also POSTGRES_CONNECT_TIMEOUT */
 
 char *ps_buffer;                /* will point to argv area */
 size_t ps_buffer_size;          /* space determined at run time */
 size_t last_status_len;         /* use to minimize length of clobber */
 
+FILE *logfp = NULL;
 Semaphore log_semaphore = { 0 }; /* allows inter-process locking */
 
+SysVResArray system_res_array = { 0 };
 
 static void set_logger(void);
-static void log_semaphore_unlink_atexit(void);
+static void unlink_system_res_atexit(void);
 
 
 /*
@@ -43,6 +45,15 @@ static void log_semaphore_unlink_atexit(void);
 int
 main(int argc, char **argv)
 {
+	/*
+	 * Create a new process group and set current process as its leader.  This
+	 * allows the process group to be easily controlled, without affecting any
+	 * wrapper processes around the pgcopydb command. No errors are defined for
+	 * setpgrp and it has no effect when the calling process is a session
+	 * leader.
+	 */
+	setpgrp();
+
 	CommandLine command = root;
 
 	/* allows changing process title in ps/top/ptree etc */
@@ -61,8 +72,8 @@ main(int argc, char **argv)
 	pg_logging_init(argv[0]);
 	#endif
 
-	/* register our logging clean-up atexit */
-	atexit(log_semaphore_unlink_atexit);
+	/* register our System V resources clean-up atexit */
+	atexit(unlink_system_res_atexit);
 
 	/*
 	 * When PGCOPYDB_DEBUG is set in the environment, provide the user
@@ -71,30 +82,6 @@ main(int argc, char **argv)
 	if (env_exists(PGCOPYDB_DEBUG))
 	{
 		command = root_with_debug;
-	}
-
-	/*
-	 * When PGCONNECT_TIMEOUT is set in the environment, keep a copy of it in
-	 * our own global variable pgconnect_timeout. We implement our own
-	 * connection retry policy and will change change the environment variable
-	 * setting when calling pg_basebackup and other tools anyway.
-	 */
-	if (env_exists("PGCONNECT_TIMEOUT"))
-	{
-		char env_pgtimeout[BUFSIZE] = { 0 };
-
-		if (get_env_copy("PGCONNECT_TIMEOUT", env_pgtimeout, BUFSIZE) > 0)
-		{
-			if (!stringToInt(env_pgtimeout, &pgconnect_timeout))
-			{
-				log_warn("Failed to parse environment variable "
-						 "PGCONNECT_TIMEOUT value \"%s\" as a "
-						 "number of seconds (integer), "
-						 "using our default %d seconds instead",
-						 env_pgtimeout,
-						 pgconnect_timeout);
-			}
-		}
 	}
 
 	/*
@@ -174,7 +161,88 @@ set_logger()
 	 * Log messages go to stderr. We use colours when stderr is being shown
 	 * directly to the user to make it easier to spot warnings and errors.
 	 */
-	log_use_colors(isatty(fileno(stderr)));
+	bool interactive = isatty(fileno(stderr));
+
+	log_use_colors(interactive);
+	log_show_file_line(!interactive);
+
+	bool logJSON = false;
+	bool logJSONFile = false;
+	char log_json[128] = { 0 };
+
+	if (!get_env_copy_with_fallback(PGCOPYDB_LOG_JSON,
+									log_json, sizeof(log_json), "false"))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!parse_bool(log_json, &logJSON))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!get_env_copy_with_fallback(PGCOPYDB_LOG_JSON_FILE,
+									log_json, sizeof(log_json), "false"))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!parse_bool(log_json, &logJSONFile))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	log_use_json(logJSON);
+
+	char *log_time_format_default = LOG_TFORMAT_SHORT;
+
+	/* when logging in JSON, even when interactive, prefer long format */
+	if (logJSON || !interactive)
+	{
+		log_time_format_default = LOG_TFORMAT_LONG;
+	}
+
+	/* in all cases, if PGCOPYDB_LOG_TIME_FORMAT is defined, use that */
+	char log_time_format[128] = { 0 };
+
+	if (!get_env_copy_with_fallback(PGCOPYDB_LOG_TIME_FORMAT,
+									log_time_format,
+									sizeof(log_time_format),
+									log_time_format_default))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	log_set_tformat(log_time_format);
+
+	if (env_exists(PGCOPYDB_LOG_FILENAME))
+	{
+		char log_filename[MAXPGPATH] = { 0 };
+
+		if (!get_env_copy(PGCOPYDB_LOG_FILENAME, log_filename, MAXPGPATH))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		logfp = fopen(log_filename, "w"); /* IGNORE-BANNED */
+
+		if (logfp == NULL)
+		{
+			fformat(stderr,
+					"Failed to open log file \"%s\": %m\n",
+					log_filename);
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		log_set_fp(logfp);
+		log_use_json_file(logJSONFile);
+	}
 
 	/* initialize the semaphore used for locking log output */
 	if (!semaphore_init(&log_semaphore))
@@ -189,10 +257,20 @@ set_logger()
 
 
 /*
- * log_semaphore_unlink_atexit calls semaphore_unlink() atexit.
+ * unlink_system_res_atexit cleans-up System V resources that have been
+ * registered in the global array during run-time. It is registered as an
+ * atexit(3) facility.
  */
 static void
-log_semaphore_unlink_atexit(void)
+unlink_system_res_atexit(void)
 {
-	(void) semaphore_finish(&log_semaphore);
+	if (logfp != NULL)
+	{
+		if (fclose(logfp) != 0)
+		{
+			fformat(stderr, "Failed to close log file: %m\n");
+		}
+	}
+
+	(void) copydb_cleanup_sysv_resources(&system_res_array);
 }

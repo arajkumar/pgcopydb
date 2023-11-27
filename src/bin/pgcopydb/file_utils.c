@@ -4,6 +4,7 @@
  */
 
 #include <limits.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -12,7 +13,7 @@
 #endif
 
 #include "postgres_fe.h"
-
+#include "pqexpbuffer.h"
 #include "snprintf.h"
 
 #include "cli_root.h"
@@ -20,6 +21,8 @@
 #include "env_utils.h"
 #include "file_utils.h"
 #include "log.h"
+#include "signals.h"
+#include "string_utils.h"
 
 static bool read_file_internal(FILE *fileStream,
 							   const char *filePath,
@@ -372,6 +375,330 @@ read_file_internal(FILE *fileStream,
 
 
 /*
+ * write_to_stream writes given buffer of given size to the given stream. It
+ * loops around calling write(2) if necessary: not all the bytes of the buffer
+ * might be sent in a single call.
+ */
+bool
+write_to_stream(FILE *stream, const char *buffer, size_t size)
+{
+	long bytes_left = size;
+	long bytes_written = 0;
+
+	while (bytes_left > 0)
+	{
+		int ret;
+
+		ret = fwrite(buffer + bytes_written,
+					 sizeof(char),
+					 bytes_left,
+					 stream);
+
+		if (ret < 0)
+		{
+			log_error("Failed to write %ld bytes: %m", bytes_left);
+			return false;
+		}
+
+		/* Write was successful, advance our position */
+		bytes_written += ret;
+		bytes_left -= ret;
+	}
+
+	return true;
+}
+
+
+/*
+ * read_from_stream reads lines from an input stream, such as a Unix Pipe, and
+ * for each line read calls the provided context->callback function with its
+ * own private context as an argument.
+ */
+bool
+read_from_stream(FILE *stream, ReadFromStreamContext *context)
+{
+	int countFdsReadyToRead, nfds; /* see man select(2) */
+	fd_set readFileDescriptorSet;
+	fd_set exceptFileDescriptorSet;
+
+	context->fd = fileno(stream);
+	nfds = context->fd + 1;
+
+	bool doneReading = false;
+
+	uint64_t multiPartCount = 0;
+	PQExpBuffer multiPartBuffer = NULL;
+
+	while (!doneReading)
+	{
+		/* feof returns non-zero when the end-of-file indicator is set */
+		if (feof(stream) != 0)
+		{
+			log_debug("read_from_stream: stream closed");
+			break;
+		}
+
+		struct timeval timeout = { 0, 100 * 1000 }; /* 100 ms */
+
+		FD_ZERO(&readFileDescriptorSet);
+		FD_SET(context->fd, &readFileDescriptorSet);
+
+		FD_ZERO(&exceptFileDescriptorSet);
+		FD_SET(context->fd, &exceptFileDescriptorSet);
+
+		countFdsReadyToRead =
+			select(nfds,
+				   &readFileDescriptorSet, NULL, &exceptFileDescriptorSet,
+				   &timeout);
+
+		if (countFdsReadyToRead == -1)
+		{
+			log_debug("countFdsReadyToRead == -1");
+
+			if (errno == EINTR || errno == EAGAIN)
+			{
+				log_debug("received EINTR or EAGAIN");
+
+				if (asked_to_quit)
+				{
+					/*
+					 * When asked_to_stop || asked_to_stop_fast still continue
+					 * reading through EOF on the input stream, then quit
+					 * normally.
+					 */
+					doneReading = true;
+				}
+
+				continue;
+			}
+			else
+			{
+				log_error("Failed to select on file descriptor %d: %m",
+						  context->fd);
+				return false;
+			}
+		}
+
+		if (FD_ISSET(context->fd, &exceptFileDescriptorSet))
+		{
+			log_error("Failed to select on file descriptor %d: "
+					  "an exceptional condition happened",
+					  context->fd);
+			return false;
+		}
+
+		/*
+		 * When asked_to_stop || asked_to_stop_fast still continue reading
+		 * through EOF on the input stream, then quit normally. Here when
+		 * select(2) reports that there is no data to read, it's a good time to
+		 * quit.
+		 */
+		if (countFdsReadyToRead == 0)
+		{
+			if (asked_to_quit)
+			{
+				doneReading = true;
+				log_notice("read_from_stream was asked to quit");
+			}
+
+			continue;
+		}
+
+		/*
+		 * data is expected to be written one line at a time, if any data is
+		 * available per select(2) call, then we should be able to read an
+		 * entire line now.
+		 */
+		if (FD_ISSET(context->fd, &readFileDescriptorSet))
+		{
+			/*
+			 * Typical Unix PIPE buffer size is 64kB. Make sure it fits in our
+			 * buffer.
+			 */
+			size_t availableBytes = 0;
+
+			if (ioctl(context->fd, FIONREAD, &availableBytes) == -1)
+			{
+				log_debug("Failed to request current PIPE buffer size: %m");
+				availableBytes = 128 * 1024;
+			}
+
+			/* add 1 byte for the terminating \0 */
+			char *buf = calloc(availableBytes + 1, sizeof(char));
+			size_t bytes = read(context->fd, buf, availableBytes);
+
+			if (bytes == -1)
+			{
+				log_error("Failed to read from input stream: %m");
+				free(buf);
+				return false;
+			}
+			else if (bytes == 0)
+			{
+				free(buf);
+				doneReading = true;
+				continue;
+			}
+
+			/* ensure properly terminated C-string now */
+			buf[bytes] = '\0';
+
+			/* if the buffer doesn't terminate with \n it's a partial read */
+			bool partialRead = buf[bytes - 1] != '\n';
+
+			int count = countLines(buf);
+			char **lines = (char **) calloc(count, sizeof(char *));
+			int lineCount = splitLines(buf, lines, count);
+
+			log_trace("read_from_stream read %6zu bytes in %d lines %s[%lld]",
+					  bytes,
+					  lineCount,
+					  partialRead ? "partial" : "",
+					  (long long) multiPartCount);
+
+			for (int i = 0; i < lineCount; i++)
+			{
+				/*
+				 * Now might look like a good time to check for interrupts...
+				 * That said we want to finish processing the current buffer.
+				 */
+				char *line = lines[i];
+
+				/*
+				 * Take care of partial reads:
+				 *
+				 * - when we're reading the first partial buffer of a series
+				 *   (partialRead is true, multiPartCount is still zero) append
+				 *   only the last line received to the multiPartBuffer.
+				 *
+				 * - when we're reading a middle part partial buffer then
+				 *   multiPartCount is non-zero and lineCount is 1 and i == 0.
+				 *
+				 * - when we're reading the last partial buffer of a series
+				 *   (partialRead is false or lineCount > 1, multiPartCount is
+				 *   non-zero) append only the first line received to the
+				 *   multiPartBuffer.
+				 *
+				 * - we could also receive the last part of a multiPartBuffer
+				 *   and the first part of the next multiPartBuffer in the
+				 *   same read() call, hence the previous para condition:
+				 *
+				 *   multiPartCount > 0 && (!partialRead || lineCount > 1)
+				 */
+				bool firstLine = i == 0;
+				bool lastLine = (i == (lineCount - 1));
+				bool callUserCallback = true;
+				bool appendToCurrentBuffer = false;
+
+				/* first part of a multi-part buffer (last line read) */
+				if (partialRead && multiPartCount == 0 && lastLine)
+				{
+					multiPartBuffer = createPQExpBuffer();
+					callUserCallback = false;
+					appendToCurrentBuffer = true;
+				}
+
+				/* middle part of a multi-part buffer */
+				else if (partialRead && multiPartCount > 0 && lineCount == 1)
+				{
+					if (multiPartBuffer == NULL)
+					{
+						log_error("BUG: multiPartBuffer is NULL, "
+								  "multiPartCount == %lld, "
+								  "line == %d, lineCount == 1",
+								  (long long) multiPartCount, i);
+						return false;
+					}
+					callUserCallback = false;
+					appendToCurrentBuffer = true;
+				}
+
+				/* last part of a multi-part buffer */
+				else if (multiPartCount > 0 && firstLine)
+				{
+					callUserCallback = true;
+					appendToCurrentBuffer = true;
+				}
+
+				/*
+				 * If needed append to the current buffer, which has
+				 * already been created even when multiPartCount is zero.
+				 */
+				if (appendToCurrentBuffer)
+				{
+					if (multiPartBuffer == NULL)
+					{
+						log_error("BUG: appendToCurrentBuffer is true, "
+								  "multiPartBuffer is NULL");
+						return false;
+					}
+
+					++multiPartCount;
+					appendPQExpBufferStr(multiPartBuffer, line);
+
+					if (PQExpBufferBroken(multiPartBuffer))
+					{
+						log_error("Failed to read multi-part message: "
+								  "out of memory");
+						destroyPQExpBuffer(multiPartBuffer);
+						return false;
+					}
+				}
+
+				/*
+				 * Unless still reading a multi-part message, call user-defined
+				 * callback function.
+				 */
+				if (callUserCallback)
+				{
+					/* replace the line pointer for multi-parts messages */
+					if (multiPartCount > 0)
+					{
+						line = multiPartBuffer->data;
+					}
+
+					/* we count stream input lines as if reading from a file */
+					++context->lineno;
+
+					/* call the user-provided function */
+					bool stop = false;
+
+					if (!(*context->callback)(context->ctx, line, &stop))
+					{
+						free(buf);
+						destroyPQExpBuffer(multiPartBuffer);
+						return false;
+					}
+
+					/* reset multiPartBuffer and count after callback */
+					if (multiPartCount > 0)
+					{
+						destroyPQExpBuffer(multiPartBuffer);
+						multiPartCount = 0;
+						multiPartBuffer = NULL;
+					}
+
+					if (stop)
+					{
+						doneReading = true;
+						break;
+					}
+				}
+			}
+
+			free(lines);
+			free(buf);
+		}
+
+		/* doneReading might have been set from the user callback already */
+		doneReading = doneReading || feof(stream) != 0;
+	}
+
+	return true;
+}
+
+
+/*
  * move_file is a utility function to move a file from sourcePath to
  * destinationPath. It behaves like mv system command. First attempts to move
  * a file using rename. if it fails with EXDEV error, the function duplicates
@@ -513,7 +840,9 @@ create_symbolic_link(char *sourcePath, char *targetPath)
 {
 	if (symlink(sourcePath, targetPath) != 0)
 	{
-		log_error("Failed to create symbolic link to \"%s\": %m", targetPath);
+		log_error("Failed to create symbolic link \"%s\" -> \"%s\": %m",
+				  targetPath,
+				  sourcePath);
 		return false;
 	}
 	return true;
@@ -702,6 +1031,21 @@ unlink_file(const char *filename)
 	}
 
 	return true;
+}
+
+
+/*
+ * close_fd_or_exit calls close(2) on given file descriptor, and exits if that
+ * failed.
+ */
+void
+close_fd_or_exit(int fd)
+{
+	if (close(fd) != 0)
+	{
+		log_fatal("Failed to close fd %d: %m", fd);
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 }
 
 
@@ -957,11 +1301,21 @@ set_ps_title(const char *title)
 		return;
 	}
 
-	int n = sformat(ps_buffer, ps_buffer_size, "%s", title);
-
 	/* pad our process title string */
-	for (size_t i = n; i < ps_buffer_size; i++)
+	int n = strlen(title);
+
+	for (size_t i = 0; i < ps_buffer_size; i++)
 	{
-		*(ps_buffer + i) = '\0';
+		if (i < n)
+		{
+			*(ps_buffer + i) = title[i];
+		}
+		else
+		{
+			*(ps_buffer + i) = '\0';
+		}
 	}
+
+	/* make sure we have an \0 at the end of the ps_buffer */
+	*(ps_buffer + ps_buffer_size - 1) = '\0';
 }
