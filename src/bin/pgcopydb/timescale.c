@@ -41,15 +41,20 @@ parseHypertableDetails(void *ctx, PGresult *res)
 			char *columnValue = PQgetvalue(res, i, j);
 			if (streq(columnName, "id"))
 			{
-				chunkMapEntry->hypertableID = atoi(columnValue);
+				if (!stringToUInt32(columnValue, &chunkMapEntry->hypertableID))
+				{
+					log_error("Failed to parse hypertable id: %s", columnValue);
+					continue; /* Skip this row */
+				}
+
 			}
 			else if (streq(columnName, "schema_name"))
 			{
-				strncpy(chunkMapEntry->nspname, columnValue, NAMEDATALEN);
+				strlcpy(chunkMapEntry->nspname, columnValue, NAMEDATALEN);
 			}
 			else if (streq(columnName, "table_name"))
 			{
-				strncpy(chunkMapEntry->relname, columnValue, NAMEDATALEN);
+				strlcpy(chunkMapEntry->relname, columnValue, NAMEDATALEN);
 			}
 		}
 
@@ -109,8 +114,11 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 		/* Move the pointer to the character after the prefix */
 		prefixPosition += strlen(prefix);
 
-		/* Extract the number using atoi */
-		*hypertableID = atoi(prefixPosition);
+		if (!stringToUInt32(prefixPosition, hypertableID))
+		{
+			log_error("Failed to parse hypertable id from %s", input);
+			return false;
+		}
 		return true;
 	}
 
@@ -145,8 +153,8 @@ timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nspname_
 	log_trace("Found mapping for chunk %s.%s => %s.%s", nspname_in, relname_in,
 			  foundMapEntry->nspname, foundMapEntry->relname);
 
-	strcpy(nspname_out, foundMapEntry->nspname);
-	strcpy(relname_out, foundMapEntry->relname);
+	strlcpy(nspname_out, foundMapEntry->nspname, NAMEDATALEN);
+	strlcpy(relname_out, foundMapEntry->relname, NAMEDATALEN);
 	return true;
 }
 

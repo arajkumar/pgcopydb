@@ -6,6 +6,16 @@ FROM --platform=${TARGETPLATFORM} debian:11-slim as build
 ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
+ARG PGVERSION=14
+
+RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
+  && apt install -qqy --no-install-recommends \
+	curl \
+	ca-certificates \
+	gnupg
+
+RUN curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+RUN echo "deb http://apt.postgresql.org/pub/repos/apt bullseye-pgdg main ${PGVERSION}" > /etc/apt/sources.list.d/pgdg.list
 
 RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
   && apt install -qqy --no-install-recommends \
@@ -34,9 +44,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     watch \
     make \
     openssl \
-    postgresql-common \
-    postgresql-client-common \
-    postgresql-server-dev-all \
+    postgresql-server-dev-14 \
     psutils \
     tmux \
     watch \
@@ -60,6 +68,15 @@ ARG TARGETARCH
 LABEL org.opencontainers.image.source https://github.com/dimitri/pgcopydb
 
 RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
+  && apt install -qqy --no-install-recommends \
+	curl \
+	ca-certificates \
+	gnupg
+
+RUN curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+RUN echo "deb http://apt.postgresql.org/pub/repos/apt bullseye-pgdg main ${PGVERSION}" > /etc/apt/sources.list.d/pgdg.list
+
+RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
   && apt install -qqy --no-install-suggests --no-install-recommends \
     sudo \
 	passwd \
@@ -79,7 +96,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
 RUN useradd -rm -d /var/lib/postgres -s /bin/bash -g postgres -G sudo docker
 RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
-COPY --from=build --chmod=755 /usr/lib/postgresql/13/bin/pgcopydb /usr/local/bin
+COPY --from=build --chmod=755 /usr/lib/postgresql/14/bin/pgcopydb /usr/local/bin
 
 USER docker
 
