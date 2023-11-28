@@ -10,6 +10,9 @@ import shutil
 import tempfile
 import threading
 import queue
+import uuid
+import json
+
 from housekeeping import start_housekeeping
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,10 +23,153 @@ from urllib.parse import urlparse
 # process.
 IS_TTY = os.isatty(0)
 DELAY_THRESHOLD = 30  # Megabytes.
+SCRIPT_VERSION = "0.0.1"
 
 env = os.environ.copy()
 
 LIVE_MIGRATION_DOCKER = env.get('LIVE_MIGRATION_DOCKER') == 'true'
+
+
+def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
+    stdout = subprocess.PIPE
+    stderr = subprocess.PIPE
+    if log_path != "":
+        fname_stdout = f"{log_path}_stdout.log"
+        stdout = open(fname_stdout, "w")
+        fname_stderr = f"{log_path}_stderr.log"
+        stderr = open(fname_stderr, "w")
+    result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
+    if result.returncode != 0 and not ignore_non_zero_code:
+        # Do not collect telemetry from this command as it may contain user sensitive data.
+        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}")
+    return str(result.stdout)
+
+
+def psql(uri: str, sql: str):
+    return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d {uri} -c " {sql} " """
+
+
+def run_sql(execute_on_target: bool, sql: str):
+    dest = "$PGCOPYDB_SOURCE_PGURI"
+    if execute_on_target:
+        dest = "$PGCOPYDB_TARGET_PGURI"
+    run_cmd(psql(dest, sql))
+
+
+class TelemetryDBStats:
+    def __init__(self, uri: str) -> None:
+        result = run_cmd(psql(uri, """
+select
+    (select substring(current_setting('server_version') from '^[0-9\.]+')) as pg_version,
+    (select extversion from pg_extension where extname='timescaledb') as ts_version,
+    (select pg_database_size(current_database())) as size_approx,
+    (select count(*) from pg_catalog.pg_tables where
+        schemaname NOT LIKE 'pg_%' and schemaname not in (
+            '_timescaledb_catalog', '_timescaledb_cache', '_timescaledb_config', '_timescaledb_internal', 'information_schema', 'timescaledb_experimental', 'timescaledb_information'
+        )) as num_user_tables,
+    (select count(*) from timescaledb_information.hypertables) as num_hypertables
+"""))[:-1]
+        result = result.split("|")
+        self.pg_version = result[0]
+        self.ts_version = result[1]
+        self.size_approx = int(result[2])
+        self.num_user_tables = int(result[3])
+        self.num_hypertables = int(result[4])
+
+    def object(self) -> str:
+        return {
+            "pg_version": self.pg_version,
+            "ts_version": self.ts_version,
+            "db_size_approx": self.size_approx,
+            "num_user_tables": self.num_user_tables,
+            "num_hypertables": self.num_hypertables
+        }
+
+
+class Telemetry:
+    tag = "migration"
+    command = ""
+    command_start = 0.0
+
+    def __init__(self) -> None:
+        source_db_stats = TelemetryDBStats(env["PGCOPYDB_SOURCE_PGURI"])
+
+        self.migration = {
+            "type": "migration",
+            "start": time.time(),
+            "success": False,
+            "metadata": {
+                "version": SCRIPT_VERSION,
+                "method": "LIVE_MIGRATION",
+                "migration_id": str(uuid.uuid4())
+            },
+            "command_by_duration_seconds": [],
+            "total_duration_seconds": 0,
+            "source_db_stats": source_db_stats.object(),
+            "target_db_stats": {},
+            "errors": []
+        }
+
+    def start_command(self, command: str):
+        """
+        starts the command and notes its start time.
+        """
+        if self.command != "" or self.command_start != 0.0:
+            err = "previous command was not marked complete"
+            self.register_runtime_error_and_write(err)
+            raise RuntimeError(err)
+        self.command = command
+        self.command_start = time.time()
+
+    def command_complete(self):
+        """
+        Marks the started command as complete and calculates the lapsed duration.
+        """
+        self.migration["command_by_duration_seconds"].append([self.command, int(time.time() - self.command_start)])
+        self.command = ""
+        self.command_start = 0.0
+
+    def complete(self):
+        target_db_stats = TelemetryDBStats(env["PGCOPYDB_TARGET_PGURI"])
+        self.migration["success"] = True
+        self.migration["total_duration_seconds"] = int(time.time() - self.migration["start"])
+        self.migration["target_db_stats"] = target_db_stats.object()
+        self.write()
+
+    def register_runtime_error_and_write(self, err: str):
+        target_db_stats = TelemetryDBStats(env["PGCOPYDB_TARGET_PGURI"])
+        self.migration["target_db_stats"] = target_db_stats.object()
+        self.migration["errors"].append(err)
+        self.migration["success"] = False
+        self.migration["total_duration_seconds"] = int(time.time() - self.migration["start"])
+        self.write()
+
+    def write(self):
+        data = json.dumps(self.migration)
+        sql = f"insert into _timescaledb_catalog.telemetry_event(tag, body) values('{self.tag}'::name, '{data}'::jsonb)"
+        sql = sql.replace('"', '\\"')
+        run_sql(execute_on_target=True, sql=sql)
+
+telemetry = Telemetry()
+
+def telemetry_command(title):
+    def decorator(func):
+        def wrapper_func(*args, **kwargs):
+            telemetry.start_command(title)
+            try:
+                result = func(*args, **kwargs)
+            except Exception as e:
+                telemetry.register_runtime_error_and_write(e.__str__())
+                raise e
+            else:
+                telemetry.command_complete()
+            return result
+        return wrapper_func
+    return decorator
+
+def telemetry_error(err: str) -> str:
+    telemetry.register_runtime_error_and_write(err)
+    return err
 
 
 class Command:
@@ -46,13 +192,18 @@ class Command:
     def process_wait(self):
         self.process.wait()
         code = self.process.returncode
-        if code != 0 and code != -15 and code != -9:
-            # -15 is for SIGTERM; -9 is for SIGKILL
-            # We ignore process execution that stops for SIGTERM and SIGKILL since these are signals
+        if code not in {-9, 0, 12}:
+            # code -9 is for SIGKILL.
+            # We ignore process execution that stops for SIGKILL since these are signals
             # given by self.terminate() and self.kill(). pgcopydb often requires these signals to stop.
             #
             # If we do not give these signals during the program execution (as and when required),
             # then pgcopydb hangs indefinitely (for some reason) even if it has completed its execution.
+            #
+            # code 12 is received when `pgcopydb follow`'s internal child processes exit due to an external signal.
+            # We believe ignoring this code to be safe.
+            #
+            # Do not collect telemetry from this command as it may contain user sensitive data.
             raise RuntimeError(f"command '{self.command}' exited with {self.process.returncode} code stderr={self.process.stderr}")
 
     def wait(self):
@@ -69,31 +220,6 @@ class Command:
 
     def kill(self):
         self.process.kill()
-
-
-def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
-    stdout = subprocess.PIPE
-    stderr = subprocess.PIPE
-    if log_path != "":
-        fname_stdout = f"{log_path}_stdout.log"
-        stdout = open(fname_stdout, "w")
-        fname_stderr = f"{log_path}_stderr.log"
-        stderr = open(fname_stderr, "w")
-    result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
-    if result.returncode != 0 and not ignore_non_zero_code:
-        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code stderr={result.stderr} stdout={result.stdout}")
-    return str(result.stdout)
-
-
-def psql(uri: str, sql: str):
-    return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d {uri} -c " {sql} " """
-
-
-def run_sql(execute_on_target: bool, sql: str):
-    dest = "$PGCOPYDB_SOURCE_PGURI"
-    if execute_on_target:
-        dest = "$PGCOPYDB_TARGET_PGURI"
-    run_cmd(psql(dest, sql))
 
 
 def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
@@ -157,8 +283,9 @@ def pgcopydb_init_env(work_dir: Path):
     env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
 
     (work_dir / "logs").mkdir(exist_ok=False)
+    os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
 
-
+@telemetry_command("check_timescaledb_version")
 def check_timescaledb_version():
     result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
     source_ts_version = str(result)[:-1]
@@ -169,7 +296,7 @@ def check_timescaledb_version():
     if source_ts_version != target_ts_version:
         raise RuntimeError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
 
-
+@telemetry_command("cleanup_replication_progress")
 def cleanup_replication_progress():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
@@ -177,6 +304,7 @@ def cleanup_replication_progress():
         raise RuntimeError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
 
 
+@telemetry_command("create_snapshot_and_follow")
 def create_snapshot_and_follow():
     print("Creating snapshot ...")
     snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
@@ -191,18 +319,30 @@ def create_snapshot_and_follow():
                           log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
     return (snapshot_proc, follow_proc)
 
-def dbname_from_uri(uri: str) -> str:
-    result = urlparse(uri)
-    # Input `uri`: 'postgres://tsdb:abcd@a.timescaledb.io:26479/rbac_test?sslmode=require'
-    # result.path[1]: '/rbac_test'
-    return result.path[1:]  # Remove leading '/'
 
+def dbname_from_uri(uri: str) -> str:
+    if "dbname=" in uri:
+        parameters = uri.split()
+        for param in parameters:
+            key, value = param.split("=")
+            if key == "dbname":
+                return value
+    else:
+        # Input => uri: 'postgres://tsdb:abcd@a.timescaledb.io:26479/rbac_test?sslmode=require'
+        # result.path[1]: '/rbac_test'
+        result = urlparse(uri)
+        return result.path[1:]
+
+
+@telemetry_command("migrate_existing_data")
 def migrate_existing_data():
     print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
     start = time.time()
 
     source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
     source_dbname = dbname_from_uri(source_pg_uri)
+    if source_dbname == "":
+        raise RuntimeError(telemetry_error("unable to extract dbname from uri"))
     roles_file_path = f"{env['PGCOPYDB_DIR']}/roles.sql"
     dump_roles = f"""pg_dumpall -d $PGCOPYDB_SOURCE_PGURI --quote-all-identifiers --roles-only --no-role-passwords -l {source_dbname} --file={roles_file_path}"""
     run_cmd(dump_roles)
@@ -246,7 +386,7 @@ sed -i -E \
     run_sql(execute_on_target=True,
             sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
 
-
+@telemetry_command("wait_for_DBs_to_sync")
 def wait_for_DBs_to_sync():
     def get_delay():
         delay_bytes = int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) delay from pgcopydb.sentinel;")))
@@ -261,12 +401,16 @@ def wait_for_DBs_to_sync():
 
     while True:
         delay_mb = get_delay()
-        if not IS_TTY and LIVE_MIGRATION_DOCKER:
-            print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. To stop live-replay, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>'")
-        elif not IS_TTY:
-            print(f"[WATCH] Source DB - Target DB=> {delay_mb}MB. To stop live - replay, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+        diff = f"[WATCH] Source DB - Target DB => {delay_mb}MB"
+        if not analyzed:
+            print(diff)
         else:
-            print(f"[WATCH] Source DB - Target DB => {delay_mb}MB. Press 's' (and ENTER) to stop live-replay")
+            if not IS_TTY and LIVE_MIGRATION_DOCKER:
+                print(f"{diff}. To stop live-replay, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>'")
+            elif not IS_TTY:
+                print(f"{diff}. To stop live-replay, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+            else:
+                print(f"{diff}. Press 's' (and ENTER) to stop live-replay")
         if not analyzed and delay_mb < DELAY_THRESHOLD:
             print("Starting analyze on Target DB. This might take a long time to complete ...")
             run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
@@ -278,7 +422,7 @@ def wait_for_DBs_to_sync():
             break
         time.sleep(10)
 
-
+@telemetry_command("wait_for_LSN_to_sync")
 def wait_for_LSN_to_sync():
     switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --plugin wal2json --slot-name switchover"
     switchover_snapshot_proc = Command(command=switchover_snapshot_command, use_shell=True,
@@ -328,10 +472,12 @@ def wait_for_LSN_to_sync():
     return switchover_snapshot_proc
 
 
+@telemetry_command("copy_sequences")
 def copy_sequences():
     run_cmd("pgcopydb copy sequences", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
 
 
+@telemetry_command("migrate_caggs_metadata")
 def migrate_caggs_metadata():
     print(f"Dumping metadata from Source DB to {env['PGCOPYDB_METADATA_DIR']} ...")
     metadata_pg_dump_command = f"pg_dump -d $PGCOPYDB_SOURCE_PGURI --no-owner --no-privileges --no-tablespaces --quote-all-identifiers --format d --file $PGCOPYDB_METADATA_DIR --table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_SWITCH_OVER_DIR']}/snapshot)"
@@ -348,13 +494,14 @@ def migrate_caggs_metadata():
     print(f"Completed in {time_taken:.1f}m")
 
 
+@telemetry_command("enable_caggs_policies")
 def enable_caggs_policies():
     run_sql(execute_on_target=True,
             sql="select alter_job(job_id, scheduled => true) from timescaledb_information.jobs where application_name like 'Refresh Continuous%';")
     run_sql(execute_on_target=True,
             sql="select timescaledb_post_restore();")
 
-
+@telemetry_command("cleanup")
 def cleanup():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR")
@@ -433,9 +580,9 @@ if __name__ == "__main__":
 
     print("Cleaning up replication data ...")
     cleanup()
-
     print("Migration successfully completed")
 
+    telemetry.complete()
     housekeeping_stop_event.set()
     housekeeping_thread.join()
     sys.exit(0)

@@ -44,7 +44,7 @@ env = os.environ.copy()
 def run_cmd(cmd: str) -> str:
     result = subprocess.run(cmd, shell=True, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code ")
+        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}")
     return str(result.stdout)
 
 
