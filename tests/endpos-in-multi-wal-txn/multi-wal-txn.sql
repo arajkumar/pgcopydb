@@ -2,6 +2,18 @@
 
 BEGIN;
 
+INSERT INTO table_a(f1) VALUES (50011);
+COMMIT;
+
+BEGIN;
+    -- generate 100000 rows for table_a
+    SELECT pg_switch_wal();
+    INSERT INTO table_a(f1) SELECT (random() * 100 + 1)::int FROM generate_series(1, 1000000);
+    SELECT pg_switch_wal();
+ROLLBACK;
+
+BEGIN;
+
 INSERT INTO table_a(f1) VALUES ((random() * 100 + 1)::int);
 
 SELECT
