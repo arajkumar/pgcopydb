@@ -304,15 +304,16 @@ def pgcopydb_init_env(work_dir: Path):
             raise ValueError(f"${key} not found")
 
     env["PGCOPYDB_DIR"] = str(work_dir.absolute())
-    switch_over_dir = (work_dir / "switch_over").absolute()
-    env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
-    env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
+    if not IS_POSTGRES_SOURCE:
+        switch_over_dir = (work_dir / "switch_over").absolute()
+        env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
+        env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
 
     (work_dir / "logs").mkdir(exist_ok=False)
     os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
 
-@telemetry_command("check_source_is_timescale")
-def check_source_is_timescale():
+@telemetry_command("check_source_is_timescaledb")
+def check_source_is_timescaledb():
     result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
     return result == "t\n"
 
@@ -654,7 +655,7 @@ if __name__ == "__main__":
     pgcopydb_init_env(work_dir)
 
     force_postgres_source = os.getenv("POSTGRES_SOURCE") == "true"
-    if not force_postgres_source and check_source_is_timescale():
+    if not force_postgres_source and check_source_is_timescaledb():
         print("Migrating from Timescale to Timescale ...")
         print("Verifying TimescaleDB version in Source DB and Target DB ...")
         check_timescaledb_version()
@@ -687,6 +688,9 @@ if __name__ == "__main__":
     if IS_POSTGRES_SOURCE:
         print("Stopping live-replay ...")
         run_cmd("pgcopydb stream sentinel set endpos --current")
+
+        print("Waiting for live-replay to stop ...")
+        follow_proc.wait()
     else:
         print("Waiting for live-replay to stop ...")
         follow_proc.terminate_process_including_children()
@@ -726,6 +730,7 @@ if __name__ == "__main__":
         enable_caggs_policies()
 
         follow_proc.terminate_process_including_children()
+
 
     print("Cleaning up replication data ...")
     cleanup()
