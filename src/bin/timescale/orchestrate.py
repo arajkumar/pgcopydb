@@ -30,6 +30,13 @@ env = os.environ.copy()
 LIVE_MIGRATION_DOCKER = env.get('LIVE_MIGRATION_DOCKER') == 'true'
 
 
+class RedactedException(Exception):
+    def __init__(self, err, redacted):
+        super().__init__(str(err))
+        self.err = err
+        self.redacted = redacted
+
+
 def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
     stdout = subprocess.PIPE
     stderr = subprocess.PIPE
@@ -40,8 +47,10 @@ def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) ->
         stderr = open(fname_stderr, "w")
     result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
     if result.returncode != 0 and not ignore_non_zero_code:
-        # Do not collect telemetry from this command as it may contain user sensitive data.
-        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}")
+        cmd_name = cmd.split()[0]
+        raise RedactedException(
+            f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}",
+            f"{cmd_name} exited with code {result.returncode}")
     return str(result.stdout)
 
 
@@ -93,7 +102,6 @@ class Telemetry:
 
     def __init__(self) -> None:
         source_db_stats = TelemetryDBStats(env["PGCOPYDB_SOURCE_PGURI"])
-
         self.migration = {
             "type": "migration",
             "start": time.time(),
@@ -117,7 +125,7 @@ class Telemetry:
         if self.command != "" or self.command_start != 0.0:
             err = "previous command was not marked complete"
             self.register_runtime_error_and_write(err)
-            raise RuntimeError(err)
+            raise ValueError(err)
         self.command = command
         self.command_start = time.time()
 
@@ -129,7 +137,12 @@ class Telemetry:
         self.command = ""
         self.command_start = 0.0
 
-    def complete(self):
+    def complete_fail(self):
+        self.migration["success"] = False
+        self.migration["total_duration_seconds"] = int(time.time() - self.migration["start"])
+        self.write()
+
+    def complete_success(self):
         target_db_stats = TelemetryDBStats(env["PGCOPYDB_TARGET_PGURI"])
         self.migration["success"] = True
         self.migration["total_duration_seconds"] = int(time.time() - self.migration["start"])
@@ -158,18 +171,20 @@ def telemetry_command(title):
             telemetry.start_command(title)
             try:
                 result = func(*args, **kwargs)
-            except Exception as e:
+            except RedactedException as e:
+                telemetry.register_runtime_error_and_write(e.redacted)
+                raise e
+            except ValueError as e:
                 telemetry.register_runtime_error_and_write(e.__str__())
+                raise e
+            except Exception as e:
+                telemetry.complete_fail()
                 raise e
             else:
                 telemetry.command_complete()
             return result
         return wrapper_func
     return decorator
-
-def telemetry_error(err: str) -> str:
-    telemetry.register_runtime_error_and_write(err)
-    return err
 
 
 class Command:
@@ -201,10 +216,11 @@ class Command:
             # then pgcopydb hangs indefinitely (for some reason) even if it has completed its execution.
             #
             # code 12 is received when `pgcopydb follow`'s internal child processes exit due to an external signal.
-            # We believe ignoring this code to be safe.
-            #
-            # Do not collect telemetry from this command as it may contain user sensitive data.
-            raise RuntimeError(f"command '{self.command}' exited with {self.process.returncode} code stderr={self.process.stderr}")
+            # We believe ignoring this code is safe.
+            cmd_name = self.command.split()[0]
+            raise RedactedException(
+                f"command '{self.command}' exited with {self.process.returncode} code stderr={self.process.stderr}",
+                f"{cmd_name} exited with code {self.process.returncode}")
 
     def wait(self):
         """
@@ -294,14 +310,14 @@ def check_timescaledb_version():
     target_ts_version = str(result)[:-1]
 
     if source_ts_version != target_ts_version:
-        raise RuntimeError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
+        raise ValueError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
 
 @telemetry_command("cleanup_replication_progress")
 def cleanup_replication_progress():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
     if run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb' or slot_name = 'switchover');")) == "t":
-        raise RuntimeError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
+        raise ValueError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
 
 
 @telemetry_command("create_snapshot_and_follow")
@@ -342,7 +358,7 @@ def migrate_existing_data():
     source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
     source_dbname = dbname_from_uri(source_pg_uri)
     if source_dbname == "":
-        raise RuntimeError(telemetry_error("unable to extract dbname from uri"))
+        raise ValueError("unable to extract dbname from uri")
     roles_file_path = f"{env['PGCOPYDB_DIR']}/roles.sql"
     dump_roles = f"""pg_dumpall -d $PGCOPYDB_SOURCE_PGURI --quote-all-identifiers --roles-only --no-role-passwords -l {source_dbname} --file={roles_file_path}"""
     run_cmd(dump_roles)
@@ -582,7 +598,7 @@ if __name__ == "__main__":
     cleanup()
     print("Migration successfully completed")
 
-    telemetry.complete()
+    telemetry.complete_success()
     housekeeping_stop_event.set()
     housekeeping_thread.join()
     sys.exit(0)
