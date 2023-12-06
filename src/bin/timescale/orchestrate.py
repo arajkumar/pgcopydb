@@ -308,9 +308,9 @@ def pgcopydb_init_env(work_dir: Path):
         switch_over_dir = (work_dir / "switch_over").absolute()
         env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
         env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
+        os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
 
     (work_dir / "logs").mkdir(exist_ok=False)
-    os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
 
 @telemetry_command("check_source_is_timescaledb")
 def check_source_is_timescaledb():
@@ -379,7 +379,6 @@ def migrate_existing_data_from_pg():
                                    "--no-tablespaces",
                                    "--no-owner",
                                    "--no-privileges",
-                                   "--schema-only",
                                    "--section=pre-data",
                                    "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
                                    "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
@@ -399,8 +398,12 @@ def migrate_existing_data_from_pg():
         run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore", ignore_non_zero_code=True)
 
     create_hypertable_message = """Now, let's transform your regular tables into hypertables.
+
 Execute the following command for each table you want to convert on the target DB:
     `SELECT create_hypertable('<table name>', '<time column name>', chunk_time_interval => INTERVAL '<chunk interval>');`
+
+    Refer to https://docs.timescale.com/use-timescale/latest/hypertables/create/#create-hypertables for more details.
+
 Once you are done"""
     key_event_queue = queue.Queue(maxsize=1)
     wait_for_sigusr1(key_event_queue)
@@ -417,10 +420,6 @@ Once you are done"""
     copy_table_data = " ".join(["pgcopydb",
                              "copy",
                              "table-data",
-                             "--source",
-                             "$PGCOPYDB_SOURCE_PGURI",
-                             "--target",
-                             "$PGCOPYDB_TARGET_PGURI",
                              "--snapshot",
                              "$(cat ${PGCOPYDB_DIR}/snapshot)",
                              "--table-jobs",
@@ -428,7 +427,7 @@ Once you are done"""
                              "--restart",
                              "--not-consistent",
                              ])
-    print("pgcopydb copy table-data ...")
+    print("Copying table data ...")
     with timeit():
         run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
 
@@ -442,7 +441,6 @@ Once you are done"""
                                    "--no-tablespaces",
                                    "--no-owner",
                                    "--no-privileges",
-                                   "--schema-only",
                                    "--section=post-data",
                                    "--file=$PGCOPYDB_DIR/post-data-dump.sql",
                                    "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
@@ -456,6 +454,8 @@ Once you are done"""
                                  "-d",
                                  "$PGCOPYDB_TARGET_PGURI",
                                  "--echo-errors",
+                                 "-v",
+                                 "ON_ERROR_STOP=1",
                                  "-f",
                                  "$PGCOPYDB_DIR/post-data-dump.sql",
                                  ])
@@ -496,8 +496,8 @@ sed -i -E \
         run_cmd(restore_roles)
 
 
-@telemetry_command("migrate_existing_data")
-def migrate_existing_data():
+@telemetry_command("migrate_existing_data_from_ts")
+def migrate_existing_data_from_ts():
     print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
     start = time.time()
 
@@ -599,7 +599,9 @@ def wait_for_LSN_to_sync():
         if done:
             break
 
-    endpos_follow_proc.kill()
+    # todo: we can remove the pattern matching the log file
+    # and wait for the endpos_follow_proc to complete.
+    endpos_follow_proc.terminate_process_including_children()
     return switchover_snapshot_proc
 
 
@@ -655,13 +657,13 @@ if __name__ == "__main__":
     pgcopydb_init_env(work_dir)
 
     force_postgres_source = os.getenv("POSTGRES_SOURCE") == "true"
-    if not force_postgres_source and check_source_is_timescaledb():
+    if force_postgres_source or not check_source_is_timescaledb():
+        print("Migrating from Postgres to Timescale ...")
+        IS_POSTGRES_SOURCE = True
+    else:
         print("Migrating from Timescale to Timescale ...")
         print("Verifying TimescaleDB version in Source DB and Target DB ...")
         check_timescaledb_version()
-    else:
-        print("Migrating from Postgres to Timescale ...")
-        IS_POSTGRES_SOURCE = True
 
     print("Cleaning up any replication progress ...")
     cleanup_replication_progress()
@@ -675,7 +677,7 @@ if __name__ == "__main__":
     if IS_POSTGRES_SOURCE:
         migrate_existing_data_from_pg()
     else:
-        migrate_existing_data()
+        migrate_existing_data_from_ts()
 
     snapshot_proc.terminate()
     (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
@@ -689,7 +691,7 @@ if __name__ == "__main__":
         print("Stopping live-replay ...")
         run_cmd("pgcopydb stream sentinel set endpos --current")
 
-        print("Waiting for live-replay to stop ...")
+        print("Waiting for live-replay to complete ...")
         follow_proc.wait()
     else:
         print("Waiting for live-replay to stop ...")
@@ -728,9 +730,6 @@ if __name__ == "__main__":
 
         print("Enabling continuous aggregates refresh policies ...")
         enable_caggs_policies()
-
-        follow_proc.terminate_process_including_children()
-
 
     print("Cleaning up replication data ...")
     cleanup()
