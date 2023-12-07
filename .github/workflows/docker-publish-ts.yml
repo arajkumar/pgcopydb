@@ -3,10 +3,10 @@ name: Docker Timescale
 on:
   push:
     branches:
-      - team-data-ingest
+      - main
   pull_request:
     branches:
-      - team-data-ingest
+      - main
 
 jobs:
   docker-ts:
@@ -34,13 +34,13 @@ jobs:
             latest=false
           tags: |
             type=edge
-            type=edge,branch=team-data-ingest
+            type=edge,branch=main
 
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'push' && github.ref == 'team-data-ingest'}}
+          push: ${{ github.event_name == 'push' && github.ref == 'main'}}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           file: ./Dockerfile.live-migration
