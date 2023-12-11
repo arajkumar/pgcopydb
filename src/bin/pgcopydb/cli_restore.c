@@ -63,6 +63,8 @@ static CommandLine restore_schema_pre_data_command =
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --skip-extensions    Skip restoring extensions\n" \
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -82,6 +84,8 @@ static CommandLine restore_schema_post_data_command =
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --skip-extensions    Skip restoring extensions\n" \
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -624,7 +628,7 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 
 	log_info("Restoring database from existing files at \"%s\"", cfPaths->topdir);
 
-	if (!copydb_init_specs(copySpecs, &restoreDBoptions, DATA_SECTION_NONE))
+	if (!copydb_init_specs(copySpecs, &restoreDBoptions, DATA_SECTION_ALL))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -641,6 +645,22 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 			exit(EXIT_CODE_BAD_ARGS);
 		}
 	}
+
+	if (!copydb_prepare_snapshot(copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* fetch schema information from source catalogs, including filtering */
+	if (!copydb_fetch_schema_and_prepare_specs(copySpecs))
+	{
+		/* errors have already been logged */
+		(void) copydb_close_snapshot(copySpecs);
+		exit(EXIT_CODE_TARGET);
+	}
+
+	(void) copydb_close_snapshot(copySpecs);
 
 	log_info("Using pg_restore for Postgres \"%s\" at \"%s\"",
 			 pgPaths->pg_version,
