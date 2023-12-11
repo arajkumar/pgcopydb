@@ -1,9 +1,12 @@
 name: Docker Timescale
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -35,12 +38,14 @@ jobs:
           tags: |
             type=edge
             type=edge,branch=main
+            type=ref,event=tag
+            type=ref,event=branch
 
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'push' && github.ref == 'main'}}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           file: ./Dockerfile.live-migration
