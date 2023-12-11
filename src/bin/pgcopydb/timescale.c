@@ -1,6 +1,7 @@
 #include "timescale.h"
 #include "log.h"
 #include "string_utils.h"
+#include "file_utils.h"
 #include "uthash.h"
 
 typedef struct ChunkHypertableMap
@@ -46,7 +47,6 @@ parseHypertableDetails(void *ctx, PGresult *res)
 					log_error("Failed to parse hypertable id: %s", columnValue);
 					continue; /* Skip this row */
 				}
-
 			}
 			else if (streq(columnName, "schema_name"))
 			{
@@ -114,7 +114,18 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 		/* Move the pointer to the character after the prefix */
 		prefixPosition += strlen(prefix);
 
-		if (!stringToUInt32(prefixPosition, hypertableID))
+		char hypertableIDStr[NAMEDATALEN] = { 0 };
+
+		/* Copy the hypertable id string into a temporary buffer */
+		sformat(hypertableIDStr, NAMEDATALEN, "%s", prefixPosition);
+
+		/* Find the position of the first underscore after the hypertable id */
+		char *endptr = strchr(hypertableIDStr, '_');
+
+		/* Replace the underscore with a null character */
+		*endptr = '\0';
+
+		if (!stringToUInt32(hypertableIDStr, hypertableID))
 		{
 			log_error("Failed to parse hypertable id from %s", input);
 			return false;
