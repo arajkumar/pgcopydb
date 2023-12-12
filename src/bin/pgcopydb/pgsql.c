@@ -1648,11 +1648,7 @@ pgsql_send_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 		if (pgsql->logSQL)
 		{
 			log_error("SQL query: %s", sql);
-
-			if (paramCount > 0)
-			{
-				log_error("SQL params: %s", debugParameters->data);
-			}
+			log_error("SQL params: %s", debugParameters->data);
 		}
 
 		destroyPQExpBuffer(debugParameters);
