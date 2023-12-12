@@ -282,6 +282,17 @@ def wait_for_sigusr1(notify_queue) -> queue.Queue:
     signal.signal(signal.SIGUSR1, handler)
 
 
+def install_signal_handler():
+    def handler(signum, frame):
+        print("Received signal")
+        run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
+        # 130 is the exit code for SIGINT
+        # https://tldp.org/LDP/abs/html/exitcodes.html
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
 def extract_lsn_and_snapshot(log_line: str):
     """
     This function takes a log_line from pgcopydb snapshot and returns a LSN and snapshot ID.
@@ -302,9 +313,14 @@ def extract_lsn_and_snapshot(log_line: str):
     return lsn, snapshot_id
 
 
-def pgcopydb_init_env(work_dir: Path):
-
+def pgcopydb_init_env():
     global env
+
+    work_dir = os.getenv("PGCOPYDB_DIR")
+    if work_dir is not None:
+        work_dir = Path(work_dir)
+    else:
+        work_dir = Path(tempfile.gettempdir()) / "pgcopydb"
 
     for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
         if key not in env or env[key] == "" or env[key] is None:
@@ -315,9 +331,18 @@ def pgcopydb_init_env(work_dir: Path):
         switch_over_dir = (work_dir / "switch_over").absolute()
         env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
         env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
-        os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=False)
 
-    (work_dir / "logs").mkdir(exist_ok=False)
+    return work_dir
+
+def create_dirs(work_dir: Path):
+    global env
+    (work_dir / "logs").mkdir(parents=True, exist_ok=True)
+    if not IS_POSTGRES_SOURCE:
+        os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=True)
+
+    # This is needed because cleanup doesn't support --dir
+    pgcopydb_dir = Path(tempfile.gettempdir()) / "pgcopydb"
+    pgcopydb_dir.mkdir(parents=True, exist_ok=True)
 
 @telemetry_command("check_source_is_timescaledb")
 def check_source_is_timescaledb():
@@ -335,26 +360,50 @@ def check_timescaledb_version():
     if source_ts_version != target_ts_version:
         raise ValueError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
 
-@telemetry_command("cleanup_replication_progress")
-def cleanup_replication_progress():
+def source_has_incomplete_migration():
+    r = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI",
+                sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb');"))
+    return r == "t\n"
+
+def is_initial_data_copy_complete():
+    return os.path.exists(f"{env['PGCOPYDB_DIR']}/run/restore-post.done")
+
+def is_caggs_metadata_copy_complete():
+    return os.path.exists(f"{env['PGCOPYDB_DIR']}/run/caggs-restore-post.done")
+
+def mark_caggs_metadata_copy_complete():
+    Path(f"{env['PGCOPYDB_DIR']}/run/caggs-restore-post.done").touch()
+
+def mark_initial_data_copy_complete():
+    Path(f"{env['PGCOPYDB_DIR']}/run/restore-post.done").touch()
+
+@telemetry_command("cleanup")
+def cleanup():
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
     if not IS_POSTGRES_SOURCE:
         run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
-    if run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb' or slot_name = 'switchover');")) == "t":
-        raise ValueError("Replication slots are occuiped for 'pgcopydb' or 'switchover'. Remove them for normal execution")
+        shutil.rmtree(str(env["PGCOPYDB_SWITCH_OVER_DIR"]), ignore_errors=True)
+
+    shutil.rmtree(str(env["PGCOPYDB_DIR"]), ignore_errors=True)
 
 
 @telemetry_command("create_snapshot_and_follow")
-def create_snapshot_and_follow():
-    print("Creating snapshot ...")
-    snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
-    snapshot_proc = Command(command=snapshot_command, use_shell=True,
-                            log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
+def create_snapshot_and_follow(resume: bool = False):
+    snapshot_proc = None
+    # Previous run would have already completed the initial data copy
+    # hence creation of snapshot is not needed.
+    if not resume:
+        print("Creating snapshot ...")
+        snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
+        snapshot_proc = Command(command=snapshot_command, use_shell=True,
+                                log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
 
-    time.sleep(10)
+        time.sleep(10)
 
     print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc ...")
     follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
+    if resume:
+        follow_command += " --resume"
     follow_proc = Command(command=follow_command, use_shell=True,
                           log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
     return (snapshot_proc, follow_proc)
@@ -432,6 +481,8 @@ Once you are done"""
                              "--table-jobs",
                              "8",
                              "--restart",
+                             "--dir",
+                             "$PGCOPYDB_DIR/table-data-copy",
                              ])
     print("Copying table data ...")
     with timeit():
@@ -637,6 +688,19 @@ def migrate_caggs_metadata():
     print(f"Completed in {time_taken:.1f}m")
 
 
+def cleanup_pid_files(work_dir: Path):
+    global env
+
+    print("Cleaning up pid files ...")
+
+    (work_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
+    (work_dir / "pgcopydb.pid").unlink(missing_ok=True)
+
+    if not IS_POSTGRES_SOURCE:
+        switchover_dir = Path(env["PGCOPYDB_SWITCH_OVER_DIR"])
+        (switchover_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
+        (switchover_dir / "pgcopydb.pid").unlink(missing_ok=True)
+
 @telemetry_command("enable_caggs_policies")
 def enable_caggs_policies():
     run_sql(execute_on_target=True,
@@ -644,27 +708,8 @@ def enable_caggs_policies():
     run_sql(execute_on_target=True,
             sql="select timescaledb_post_restore();")
 
-@telemetry_command("cleanup")
-def cleanup():
-    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
-    if not IS_POSTGRES_SOURCE:
-        run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR")
-
-
 if __name__ == "__main__":
-    work_dir = os.getenv("PGCOPYDB_DIR")
-    if work_dir is not None:
-        work_dir = Path(work_dir)
-        # This is needed because cleanup doesn't support --dir
-        pgcopydb_dir = Path(tempfile.gettempdir()) / "pgcopydb"
-        pgcopydb_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        work_dir = Path(tempfile.gettempdir()) / "pgcopydb"
-
-    shutil.rmtree(str(work_dir), ignore_errors=True)
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    pgcopydb_init_env(work_dir)
+    install_signal_handler()
 
     force_postgres_source = os.getenv("POSTGRES_SOURCE") == "true"
     if force_postgres_source or not check_source_is_timescaledb():
@@ -675,21 +720,50 @@ if __name__ == "__main__":
         print("Verifying TimescaleDB version in Source DB and Target DB ...")
         check_timescaledb_version()
 
-    print("Cleaning up any replication progress ...")
-    cleanup_replication_progress()
+    work_dir = pgcopydb_init_env()
 
-    snapshot_proc, follow_proc = create_snapshot_and_follow()
+    skip_initial_data_copy = False
 
-    print("Migrating roles from Source DB to Target DB ...")
-    migrate_roles()
+    if source_has_incomplete_migration():
+        if is_initial_data_copy_complete():
+            skip_initial_data_copy = True
+            run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
 
-    print("Migrating existing data from Source DB to Target DB ...")
-    if IS_POSTGRES_SOURCE:
-        migrate_existing_data_from_pg()
+            # this is needed for docker environment, where the process
+            # always gets deterministic pid while starting.
+            cleanup_pid_files(work_dir)
+            print("Resuming migration ...")
+        else:
+            print("Cleaning up incomplete migration artifacts ...")
+            run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
+            cleanup()
+            shutil.rmtree(str(work_dir), ignore_errors=True)
+            print("Cleanup the target DB and attempt migration again")
+            sys.exit(1)
     else:
-        migrate_existing_data_from_ts()
+        shutil.rmtree(str(work_dir), ignore_errors=True)
 
-    snapshot_proc.terminate()
+    create_dirs(work_dir)
+
+    snapshot_proc, follow_proc = create_snapshot_and_follow(resume=skip_initial_data_copy)
+
+    if skip_initial_data_copy:
+        print("Skipping roles & initial data migration during resume ...")
+    else:
+        print("Migrating roles from Source DB to Target DB ...")
+        migrate_roles()
+
+        print("Migrating existing data from Source DB to Target DB ...")
+
+        if IS_POSTGRES_SOURCE:
+            migrate_existing_data_from_pg()
+        else:
+            migrate_existing_data_from_ts()
+
+        mark_initial_data_copy_complete()
+
+        snapshot_proc.terminate()
+
     (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
     print("Applying buffered transactions ...")
@@ -733,15 +807,19 @@ if __name__ == "__main__":
     copy_sequences()
 
     if not IS_POSTGRES_SOURCE:
-        print("Migrating caggs metadata ...")
-        migrate_caggs_metadata()
+        if is_caggs_metadata_copy_complete():
+            print("Skipping caggs metadata migration ...")
+        else:
+            print("Migrating caggs metadata ...")
+            migrate_caggs_metadata()
+            mark_caggs_metadata_copy_complete()
 
         switchover_snapshot_proc.terminate()
 
         print("Enabling continuous aggregates refresh policies ...")
         enable_caggs_policies()
 
-    print("Cleaning up replication data ...")
+    print("Cleaning up ...")
     cleanup()
     print("Migration successfully completed")
 
