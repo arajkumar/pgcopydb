@@ -32,7 +32,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: timescaledev/live-migration
+          images: timescale/live-migration
           flavor: |
             latest=false
           tags: |
