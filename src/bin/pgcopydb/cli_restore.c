@@ -38,6 +38,7 @@ static CommandLine restore_schema_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --drop-if-exists     On the target database, clean-up from a previous run first\n"
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
@@ -57,10 +58,13 @@ static CommandLine restore_schema_pre_data_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --drop-if-exists     On the target database, clean-up from a previous run first\n"
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --skip-extensions    Skip restoring extensions\n" \
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -76,9 +80,12 @@ static CommandLine restore_schema_post_data_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --skip-extensions    Skip restoring extensions\n" \
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -93,7 +100,8 @@ static CommandLine restore_roles_command =
 		" --dir <dir> [ --source <URI> ] --target <URI> ",
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
-		"  --dir                Work directory to use\n",
+		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n",
 		cli_restore_schema_getopts,
 		cli_restore_roles);
 
@@ -148,6 +156,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		{ "drop-if-exists", no_argument, NULL, 'c' }, /* pg_restore -c */
 		{ "no-owner", no_argument, NULL, 'O' },       /* pg_restore -O */
 		{ "no-comments", no_argument, NULL, 'X' },
+		{ "restore-jobs", required_argument, NULL, 'j' },      /* pg_restore --jobs */
 		{ "no-acl", no_argument, NULL, 'x' }, /* pg_restore -x */
 		{ "filter", required_argument, NULL, 'F' },
 		{ "filters", required_argument, NULL, 'F' },
@@ -170,6 +179,10 @@ cli_restore_schema_getopts(int argc, char **argv)
 
 	optind = 0;
 
+	/* install default values */
+	options.indexJobs = DEFAULT_INDEX_JOBS;
+	options.restoreOptions.jobs = DEFAULT_RESTORE_JOBS;
+
 	/* read values from the environment */
 	if (!cli_copydb_getenv(&options))
 	{
@@ -177,7 +190,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:D:s:cOxXFeErRCNVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:D:s:cOj:xXFeErRCNVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -226,6 +239,19 @@ cli_restore_schema_getopts(int argc, char **argv)
 			{
 				options.restoreOptions.noOwner = true;
 				log_trace("--no-owner");
+				break;
+			}
+
+			case 'j':
+			{
+				if (!stringToInt(optarg, &options.restoreOptions.jobs) ||
+					options.restoreOptions.jobs < 1 ||
+					options.restoreOptions.jobs > 128)
+				{
+					log_fatal("Failed to parse --restore-jobs count: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--restore-jobs %d", options.restoreOptions.jobs);
 				break;
 			}
 
@@ -382,6 +408,13 @@ cli_restore_schema_getopts(int argc, char **argv)
 	if (errors > 0)
 	{
 		exit(EXIT_CODE_BAD_ARGS);
+	}
+
+	/* if we haven't set restore-jobs, set it to index-jobs */
+	if (options.restoreOptions.jobs == DEFAULT_RESTORE_JOBS)
+	{
+		options.restoreOptions.jobs = options.indexJobs;
+		log_trace("--restore-jobs %d", options.indexJobs);
 	}
 
 	/* publish our option parsing in the global variable */
@@ -595,7 +628,7 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 
 	log_info("Restoring database from existing files at \"%s\"", cfPaths->topdir);
 
-	if (!copydb_init_specs(copySpecs, &restoreDBoptions, DATA_SECTION_NONE))
+	if (!copydb_init_specs(copySpecs, &restoreDBoptions, DATA_SECTION_ALL))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -612,6 +645,22 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 			exit(EXIT_CODE_BAD_ARGS);
 		}
 	}
+
+	if (!copydb_prepare_snapshot(copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* fetch schema information from source catalogs, including filtering */
+	if (!copydb_fetch_schema_and_prepare_specs(copySpecs))
+	{
+		/* errors have already been logged */
+		(void) copydb_close_snapshot(copySpecs);
+		exit(EXIT_CODE_TARGET);
+	}
+
+	(void) copydb_close_snapshot(copySpecs);
 
 	log_info("Using pg_restore for Postgres \"%s\" at \"%s\"",
 			 pgPaths->pg_version,

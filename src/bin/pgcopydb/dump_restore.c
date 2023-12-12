@@ -261,10 +261,10 @@ copydb_copy_database_properties(CopyDataSpec *specs)
 				{
 					PQExpBuffer command = createPQExpBuffer();
 
-					makeAlterConfigCommand(conn, property->setconfig,
-										   "ROLE", property->rolname,
-										   "DATABASE", specs->connStrings.safeTargetPGURI.uriParams.dbname,
-										   command);
+					makeAlterConfigCommand(conn, property->setconfig, "ROLE",
+										   property->rolname, "DATABASE",
+										   specs->connStrings.safeTargetPGURI.uriParams.
+										   dbname, command);
 
 					/* chomp the \n */
 					if (command->data[command->len - 1] == '\n')
@@ -297,9 +297,9 @@ copydb_copy_database_properties(CopyDataSpec *specs)
 			{
 				PQExpBuffer command = createPQExpBuffer();
 
-				makeAlterConfigCommand(conn, property->setconfig,
-									   "DATABASE", specs->connStrings.safeTargetPGURI.uriParams.dbname, NULL, NULL,
-									   command);
+				makeAlterConfigCommand(conn, property->setconfig, "DATABASE",
+									   specs->connStrings.safeTargetPGURI.uriParams.dbname,
+									   NULL, NULL, command);
 
 				if (command->data[command->len - 1] == '\n')
 				{
@@ -505,8 +505,8 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 	 *
 	 * Here's how to filter out some objects with pg_restore:
 	 *
-	 *   1. pg_restore -f out.list --list post.dump
-	 *   2. edit post.list to comment out lines
+	 *   1. pg_restore -f post.list --list post.dump
+	 *   2. edit post.list to comment out lines and save as filtered.list
 	 *   3. pg_restore --use-list filtered.list post.dump
 	 */
 	ArchiveContentArray contents = { 0 };
