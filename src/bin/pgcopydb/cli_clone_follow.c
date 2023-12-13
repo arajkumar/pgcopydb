@@ -57,6 +57,8 @@
 	"  --create-slot              Create the replication slot\n" \
 	"  --origin                   Use this Postgres replication origin node name\n" \
 	"  --endpos                   Stop replaying changes when reaching this LSN\n" \
+	"  --hook-pre-copy            Run this command for each table just prior to the data COPY\n" \
+	"  --hook-post-copy           Run this command for each table just after completing the data COPY\n" \
 
 CommandLine clone_command =
 	make_command(

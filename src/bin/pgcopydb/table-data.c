@@ -22,6 +22,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "runprogram.h"
 
 
 /*
@@ -896,6 +897,48 @@ copydb_mark_table_as_done(CopyDataSpec *specs,
 	/* enter the critical section to communicate that we're done */
 	(void) semaphore_lock(&(specs->tableSemaphore));
 
+	/* Start post-copy hook  */
+	if (!IS_EMPTY_STRING_BUFFER(specs->hookPostCopy) &&
+		!file_exists(tableSpecs->tablePaths.hookPostCopyDoneFile))
+	{
+		/*
+		 * run the post-copy hook, if the hook fails, we return false and the table will not be marked as done, and it'll retry
+		 */
+		Program prog = run_program(specs->hookPostCopy,
+								   "post-copy",
+								   tableSpecs->connStrings->source_pguri,
+								   tableSpecs->connStrings->target_pguri,
+								   tableSpecs->sourceTable->qname,
+								   specs->sourceSnapshot.snapshot,
+								   NULL);
+		if (prog.returnCode != 0)
+		{
+			errno = prog.error;
+			char command[BUFSIZE] = { 0 };
+			(void) snprintf_program_command_line(&prog, command, BUFSIZE);
+			log_error("Failed to run post-copy hook \"%s\": %m", command);
+
+			free_program(&prog);
+
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(specs->tableSemaphore));
+			return false;
+		}
+
+		log_notice("post-copy stdout: %s", prog.stdOut);
+		log_notice("post-copy stderr: %s", prog.stdErr);
+
+		free_program(&prog);
+
+		/* drop our done file */
+		if (!write_file("", 0, tableSpecs->tablePaths.hookPostCopyDoneFile))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(specs->tableSemaphore));
+			return false;
+		}
+	}
+
 	if (!unlink_file(tableSpecs->tablePaths.lockFile))
 	{
 		log_error("Failed to remove the lockFile \"%s\"",
@@ -1080,6 +1123,49 @@ copydb_copy_table(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 	}
 
 	truncate = false;
+
+	/* Start pre-copy hook, entering the critical section */
+	(void) semaphore_lock(&(specs->tableSemaphore));
+
+	if (!IS_EMPTY_STRING_BUFFER(specs->hookPreCopy) &&
+		!file_exists(tableSpecs->tablePaths.hookPreCopyDoneFile))
+	{
+		Program prog = run_program(specs->hookPreCopy,
+								   "pre-copy",
+								   tableSpecs->connStrings->source_pguri,
+								   tableSpecs->connStrings->target_pguri,
+								   tableSpecs->sourceTable->qname,
+								   specs->sourceSnapshot.snapshot,
+								   NULL);
+		if (prog.returnCode != 0)
+		{
+			errno = prog.error;
+			char command[BUFSIZE] = { 0 };
+
+			(void) snprintf_program_command_line(&prog, command, BUFSIZE);
+			log_error("Failed to run pre-copy hook \"%s\": %m", command);
+			free_program(&prog);
+
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(specs->tableSemaphore));
+			return false;
+		}
+
+		log_notice("pre-copy stdout: %s", prog.stdOut);
+		log_notice("pre-copy stderr: %s", prog.stdErr);
+
+		free_program(&prog);
+
+		/* drop our done file */
+		if (!write_file("", 0, tableSpecs->tablePaths.hookPreCopyDoneFile))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(specs->tableSemaphore));
+			return false;
+		}
+	}
+
+	(void) semaphore_unlock(&(specs->tableSemaphore));
 
 	/* Now copy the data from source to target */
 	log_notice("%s", summary->command);

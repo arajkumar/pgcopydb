@@ -735,6 +735,20 @@ copydb_init_specs(CopyDataSpec *specs,
 				sizeof(tmpCopySpecs.sourceSnapshot.snapshot));
 	}
 
+	if (!IS_EMPTY_STRING_BUFFER(options->hookPreCopy))
+	{
+		strlcpy(tmpCopySpecs.hookPreCopy,
+				options->hookPreCopy,
+				sizeof(tmpCopySpecs.hookPreCopy));
+	}
+
+	if (!IS_EMPTY_STRING_BUFFER(options->hookPostCopy))
+	{
+		strlcpy(tmpCopySpecs.hookPostCopy,
+				options->hookPostCopy,
+				sizeof(tmpCopySpecs.hookPostCopy));
+	}
+
 	/* copy the structure as a whole memory area to the target place */
 	*specs = tmpCopySpecs;
 
@@ -871,6 +885,20 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 				"%s/%u.truncate",
 				tableSpecs->cfPaths->tbldir,
 				source->oid);
+
+		/*
+		 * The pre- and post-copy table hook done files, needed as they run in
+		 * a critical section.
+		 */
+		sformat(tableSpecs->tablePaths.hookPreCopyDoneFile, MAXPGPATH,
+				"%s/%u.hook-pre-copy",
+				tableSpecs->cfPaths->tbldir,
+				source->oid);
+		sformat(tableSpecs->tablePaths.hookPostCopyDoneFile, MAXPGPATH,
+				"%s/%u.hook-post-copy",
+				tableSpecs->cfPaths->tbldir,
+				source->oid);
+
 	}
 	else
 	{
@@ -910,6 +938,13 @@ copydb_init_tablepaths(CopyFilePaths *cfPaths,
 {
 	sformat(tablePaths->lockFile, MAXPGPATH, "%s/%d",
 			cfPaths->rundir,
+			oid);
+
+	sformat(tablePaths->hookPreCopyDoneFile, MAXPGPATH, "%s/%d.hook-pre-copy",
+			cfPaths->tbldir,
+			oid);
+	sformat(tablePaths->hookPostCopyDoneFile, MAXPGPATH, "%s/%d.hook-post-copy",
+			cfPaths->tbldir,
 			oid);
 
 	sformat(tablePaths->doneFile, MAXPGPATH, "%s/%d.done",

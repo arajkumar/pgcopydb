@@ -70,6 +70,9 @@ typedef struct CopyDBOptions
 
 	char filterFileName[MAXPGPATH];
 	char requirementsFileName[MAXPGPATH];
+
+	char hookPreCopy[MAXPGPATH];
+	char hookPostCopy[MAXPGPATH];
 } CopyDBOptions;
 
 extern bool outputJSON;

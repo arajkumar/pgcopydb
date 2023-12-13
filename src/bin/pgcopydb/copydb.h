@@ -291,6 +291,9 @@ typedef struct CopyDataSpec
 	SourceCatalog catalog;
 	TargetCatalog targetCatalog;
 	CopyTableDataSpecsArray tableSpecsArray;
+
+	char hookPreCopy[MAXPGPATH];
+	char hookPostCopy[MAXPGPATH];
 } CopyDataSpec;
 
 
