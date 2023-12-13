@@ -77,7 +77,10 @@ def run_sql(execute_on_target: bool, sql: str):
 
 class TelemetryDBStats:
     def __init__(self, uri: str) -> None:
-        result = run_cmd(psql(uri, """
+        num_hypertables_query = "select count(*) from timescaledb_information.hypertables"
+        if not self.is_timescaledb(uri):
+            num_hypertables_query = "select 0"
+        query = f"""
 select
     (select substring(current_setting('server_version') from '^[0-9\.]+')) as pg_version,
     (select extversion from pg_extension where extname='timescaledb') as ts_version,
@@ -86,14 +89,18 @@ select
         schemaname NOT LIKE 'pg_%' and schemaname not in (
             '_timescaledb_catalog', '_timescaledb_cache', '_timescaledb_config', '_timescaledb_internal', 'information_schema', 'timescaledb_experimental', 'timescaledb_information'
         )) as num_user_tables,
-    (select count(*) from timescaledb_information.hypertables) as num_hypertables
-"""))[:-1]
+    ({num_hypertables_query}) as num_hypertables
+"""
+        result = run_cmd(psql(uri, query))[:-1]
         result = result.split("|")
         self.pg_version = result[0]
         self.ts_version = result[1]
         self.size_approx = int(result[2])
         self.num_user_tables = int(result[3])
         self.num_hypertables = int(result[4])
+
+    def is_timescaledb(self, uri: str) -> bool:
+        return run_cmd(psql(uri, "select exists(select 1 from pg_extension where extname='timescaledb')"))[:-1] == "t"
 
     def object(self) -> str:
         return {
@@ -425,7 +432,6 @@ Once you are done"""
                              "--table-jobs",
                              "8",
                              "--restart",
-                             "--not-consistent",
                              ])
     print("Copying table data ...")
     with timeit():
@@ -480,6 +486,10 @@ def migrate_roles():
 sed -i -E \
 -e '/CREATE ROLE "postgres";/d' \
 -e '/ALTER ROLE "postgres"/d' \
+-e '/CREATE ROLE "rds/d' \
+-e '/ALTER ROLE "rds/d' \
+-e '/TO "rds/d' \
+-e '/GRANT "rds/d' \
 -e 's/(NO)*SUPERUSER//g' \
 -e 's/(NO)*REPLICATION//g' \
 -e 's/(NO)*BYPASSRLS//g' \
