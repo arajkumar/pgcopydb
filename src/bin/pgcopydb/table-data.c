@@ -24,6 +24,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "runprogram.h"
 
 
 static bool copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table);

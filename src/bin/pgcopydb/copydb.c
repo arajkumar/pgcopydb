@@ -548,6 +548,13 @@ copydb_init_specs(CopyDataSpec *specs,
 				sizeof(tmpCopySpecs.sourceSnapshot.snapshot));
 	}
 
+	if (!IS_EMPTY_STRING_BUFFER(options->hooksDir))
+	{
+		strlcpy(tmpCopySpecs.hooksDir,
+				options->hooksDir,
+				sizeof(tmpCopySpecs.hooksDir));
+	}
+
 	/* copy the structure as a whole memory area to the target place */
 	*specs = tmpCopySpecs;
 
@@ -968,4 +975,34 @@ copydb_cleanup_sysv_resources(SysVResArray *array)
 	}
 
 	return true;
+}
+
+bool copydb_run_hooks(const char *dir, const char *name, ...)
+{
+	char program[MAXPGPATH] = { 0 };
+
+	sformat(program, MAXPGPATH, "%s/%s", dir, name);
+
+	va_list args;
+
+	va_start(args, fmt);
+	Program prog = run_program(program, args);
+	va_end(args);
+
+	bool success = prog.returnCode == 0;
+
+	if (!success)
+	{
+		errno = prog.error;
+		char command[BUFSIZE] = { 0 };
+		(void) snprintf_program_command_line(&prog, command, BUFSIZE);
+		log_error("Failed to run %s hook \"%s\": %m", name, command);
+	}
+
+	log_notice("%s stdout: %s", name, prog.stdOut);
+	log_notice("%s stderr: %s", name, prog.stdErr);
+
+	free_program(&prog);
+
+	return success;
 }

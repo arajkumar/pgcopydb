@@ -59,6 +59,7 @@
 	"  --create-slot                 Create the replication slot\n" \
 	"  --origin                      Use this Postgres replication origin node name\n" \
 	"  --endpos                      Stop replaying changes when reaching this LSN\n" \
+	"  --hooks-dir                   Hooks directory to use\n" \
 
 CommandLine clone_command =
 	make_command(
