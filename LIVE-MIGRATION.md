@@ -22,8 +22,7 @@ docker run --rm -it \
   timescaledev/live-migration:edge
 ```
 
-To persist the CDC replicated files to support resuming (currently not
-implemented):
+To persist the CDC replicated files to support resuming:
 
 ```sh
 docker run --rm -it \
