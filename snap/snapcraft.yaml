@@ -7,7 +7,7 @@ description: |
   pgcopydb.
 
 grade: devel
-confinement: classic
+confinement: strict
 
 apps:
   live-migration:
@@ -15,6 +15,7 @@ apps:
     plugs: [network, network-bind]
     environment:
       HOME: /home/$USER
+      PERL5LIB: "$SNAP/usr/share/perl5"
 
 parts:
   pgcopydb:
@@ -28,6 +29,7 @@ parts:
       make DESTDIR="$DESTDIR" BINDIR="$BINDIR" install
       install -d "${DESTDIR}/${BINDIR}"
       install -m 0755 src/bin/timescale/*.py "${DESTDIR}/${BINDIR}"
+      sed -i 's#/usr/lib/postgresql#$ENV{SNAP}/usr/lib/postgresql#g' ${SNAPCRAFT_PART_INSTALL}/usr/share/perl5/PgCommon.pm
     source: .
     build-packages:
      - build-essential
@@ -58,12 +60,19 @@ parts:
     stage-packages:
      - ca-certificates
      - openssl
-     - sudo
      - tmux
      - watch
      - lsof
      - psmisc
      - libpq5
      - postgresql-client-common
-     - postgresql-client-14
+     - postgresql-client-15
      - python3
+
+package-repositories:
+  - type: apt
+    components: [main]
+    formats: [deb]
+    suites: [jammy-pgdg]
+    key-id: B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+    url: https://apt.postgresql.org/pub/repos/apt
