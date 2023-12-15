@@ -1,0 +1,69 @@
+name: live-migration
+base: core22
+version: '0.0.1'
+summary: Low downtime migration tool for Postgres and Timescale
+description: |
+  Low downtime migration tool for Postgres and Timescale developed on
+  pgcopydb.
+
+grade: devel
+confinement: classic
+
+apps:
+  live-migration:
+    command: bin/orchestrate.py
+    plugs: [network, network-bind]
+    environment:
+      HOME: /home/$USER
+
+parts:
+  pgcopydb:
+    plugin: make
+    override-build: |
+      echo "Building on $SNAP_ARCH"
+      set -x
+      BINDIR="/bin"
+      DESTDIR="$SNAPCRAFT_PART_INSTALL"
+      make -j"${SNAPCRAFT_PARALLEL_BUILD_COUNT}"
+      make DESTDIR="$DESTDIR" BINDIR="$BINDIR" install
+      install -d "${DESTDIR}/${BINDIR}"
+      install -m 0755 src/bin/timescale/*.py "${DESTDIR}/${BINDIR}"
+    source: .
+    build-packages:
+     - build-essential
+     - libicu-dev
+     - libkrb5-dev
+     - libssl-dev
+     - libzstd-dev
+     - libedit-dev
+     - libreadline-dev
+     - libpam-dev
+     - zlib1g-dev
+     - liblz4-dev
+     - libxml2-dev
+     - libxslt1-dev
+     - libselinux1-dev
+     - libncurses-dev
+     - libncurses6
+     - make
+     - openssl
+     - postgresql-common
+     - libpq5
+     - libpq-dev
+     - postgresql-server-dev-all
+     - postgresql-common
+     - postgresql-client-common
+    build-attributes:
+     - enable-patchelf
+    stage-packages:
+     - ca-certificates
+     - openssl
+     - sudo
+     - tmux
+     - watch
+     - lsof
+     - psmisc
+     - libpq5
+     - postgresql-client-common
+     - postgresql-client-14
+     - python3
