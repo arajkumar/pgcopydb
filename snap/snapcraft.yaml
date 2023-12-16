@@ -12,10 +12,18 @@ confinement: strict
 apps:
   live-migration:
     command: bin/orchestrate.py
-    plugs: [network, network-bind]
+    plugs: [network, network-bind, home]
     environment:
       HOME: /home/$USER
       PERL5LIB: "$SNAP/usr/share/perl5"
+
+plugs:
+  home:
+    interface: system-files
+    read:
+     - /home
+    write:
+     - /home
 
 parts:
   pgcopydb:
@@ -55,8 +63,8 @@ parts:
      - postgresql-server-dev-all
      - postgresql-common
      - postgresql-client-common
-    build-attributes:
-     - enable-patchelf
+    # build-attributes:
+    #  - enable-patchelf
     stage-packages:
      - ca-certificates
      - openssl
@@ -66,7 +74,7 @@ parts:
      - psmisc
      - libpq5
      - postgresql-client-common
-     - postgresql-client-15
+     - postgresql-client-16
      - python3
 
 package-repositories:
