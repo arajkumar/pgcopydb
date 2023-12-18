@@ -809,15 +809,13 @@ duplicate_file(char *sourcePath, char *destinationPath)
 	{
 		if (chown(destinationPath, sourceFileStat.st_uid, sourceFileStat.st_gid) != 0)
 		{
-			log_error("Failed to set user and group id on \"%s\"",
+			log_warn("Failed to set user and group id on \"%s\"",
 					  destinationPath);
-			foundError = true;
 		}
 		if (chmod(destinationPath, sourceFileStat.st_mode) != 0)
 		{
-			log_error("Failed to set file permissions on \"%s\"",
+			log_warn("Failed to set file permissions on \"%s\"",
 					  destinationPath);
-			foundError = true;
 		}
 	}
 

@@ -12,13 +12,13 @@ confinement: strict
 apps:
   live-migration:
     command: bin/orchestrate.py
-    plugs: [network, network-bind, home]
+    plugs: [network, network-bind, home-dir]
     environment:
       HOME: /home/$USER
       PERL5LIB: "$SNAP/usr/share/perl5"
 
 plugs:
-  home:
+  home-dir:
     interface: system-files
     read:
      - /home
