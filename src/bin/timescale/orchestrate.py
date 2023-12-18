@@ -13,10 +13,12 @@ import queue
 import uuid
 import json
 
-from housekeeping import start_housekeeping
+from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 from time import perf_counter
+
+from housekeeping import start_housekeeping
 
 # If the process is not running on a TTY then reading from stdin will raise and
 # exception. We read from stdin to start the switch-over phase. If it's not a
@@ -25,11 +27,14 @@ from time import perf_counter
 IS_TTY = os.isatty(0)
 DELAY_THRESHOLD = 30  # Megabytes.
 SCRIPT_VERSION = "0.0.1"
-IS_POSTGRES_SOURCE = False
 
 env = os.environ.copy()
 
 LIVE_MIGRATION_DOCKER = env.get('LIVE_MIGRATION_DOCKER') == 'true'
+
+class DBType(Enum):
+    POSTGRES = 1
+    TIMESCALEDB = 2
 
 class timeit:
     def __enter__(self):
@@ -313,7 +318,7 @@ def extract_lsn_and_snapshot(log_line: str):
     return lsn, snapshot_id
 
 
-def pgcopydb_init_env():
+def pgcopydb_init_env(source_type: DBType):
     global env
 
     work_dir = os.getenv("PGCOPYDB_DIR")
@@ -327,17 +332,17 @@ def pgcopydb_init_env():
             raise ValueError(f"${key} not found")
 
     env["PGCOPYDB_DIR"] = str(work_dir.absolute())
-    if not IS_POSTGRES_SOURCE:
+    if source_type == DBType.TIMESCALEDB:
         switch_over_dir = (work_dir / "switch_over").absolute()
         env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
         env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
 
     return work_dir
 
-def create_dirs(work_dir: Path):
+def create_dirs(work_dir: Path, source_type: DBType):
     global env
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)
-    if not IS_POSTGRES_SOURCE:
+    if source_type == DBType.TIMESCALEDB:
         os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=True)
 
     # This is needed because cleanup doesn't support --dir
@@ -345,9 +350,11 @@ def create_dirs(work_dir: Path):
     pgcopydb_dir.mkdir(parents=True, exist_ok=True)
 
 @telemetry_command("check_source_is_timescaledb")
-def check_source_is_timescaledb():
-    result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
-    return result == "t\n"
+def get_dbtype(uri):
+    result = run_cmd(psql(uri=uri, sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
+    if result == "t\n":
+        return DBType.TIMESCALEDB
+    return DBType.POSTGRES
 
 @telemetry_command("check_timescaledb_version")
 def check_timescaledb_version():
@@ -378,9 +385,9 @@ def mark_initial_data_copy_complete():
     Path(f"{env['PGCOPYDB_DIR']}/run/restore-post.done").touch()
 
 @telemetry_command("cleanup")
-def cleanup():
+def cleanup(source_type: DBType):
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
-    if not IS_POSTGRES_SOURCE:
+    if source_type == DBType.TIMESCALEDB:
         run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
         shutil.rmtree(str(env["PGCOPYDB_SWITCH_OVER_DIR"]), ignore_errors=True)
 
@@ -424,7 +431,7 @@ def dbname_from_uri(uri: str) -> str:
 
 
 @telemetry_command("migrate_existing_data_from_pg")
-def migrate_existing_data_from_pg():
+def migrate_existing_data_from_pg(target_type: DBType):
     print(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
     with timeit():
         pgdump_command = " ".join(["pg_dump",
@@ -461,17 +468,18 @@ Execute the following command for each table you want to convert on the target D
     Refer to https://docs.timescale.com/use-timescale/latest/hypertables/create/#create-hypertables for more details.
 
 Once you are done"""
-    key_event_queue = queue.Queue(maxsize=1)
-    wait_for_sigusr1(key_event_queue)
-    if IS_TTY:
-        wait_for_keypress(key_event_queue, key="c")
-    if not IS_TTY and LIVE_MIGRATION_DOCKER:
-        print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>' to continue")
-    elif not IS_TTY:
-        print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}' to continue")
-    else:
-        print(f"{create_hypertable_message}, press 'c' (and ENTER) to continue")
-    key_event_queue.get()
+    if target_type == DBType.TIMESCALEDB:
+        key_event_queue = queue.Queue(maxsize=1)
+        wait_for_sigusr1(key_event_queue)
+        if IS_TTY:
+            wait_for_keypress(key_event_queue, key="c")
+        if not IS_TTY and LIVE_MIGRATION_DOCKER:
+            print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>' to continue")
+        elif not IS_TTY:
+            print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}' to continue")
+        else:
+            print(f"{create_hypertable_message}, press 'c' (and ENTER) to continue")
+        key_event_queue.get()
 
     copy_table_data = " ".join(["pgcopydb",
                              "copy",
@@ -688,7 +696,7 @@ def migrate_caggs_metadata():
     print(f"Completed in {time_taken:.1f}m")
 
 
-def cleanup_pid_files(work_dir: Path):
+def cleanup_pid_files(work_dir: Path, source_type: DBType):
     global env
 
     print("Cleaning up pid files ...")
@@ -696,7 +704,7 @@ def cleanup_pid_files(work_dir: Path):
     (work_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
     (work_dir / "pgcopydb.pid").unlink(missing_ok=True)
 
-    if not IS_POSTGRES_SOURCE:
+    if source_type == DBType.TIMESCALEDB:
         switchover_dir = Path(env["PGCOPYDB_SWITCH_OVER_DIR"])
         (switchover_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
         (switchover_dir / "pgcopydb.pid").unlink(missing_ok=True)
@@ -712,15 +720,32 @@ if __name__ == "__main__":
     install_signal_handler()
 
     force_postgres_source = os.getenv("POSTGRES_SOURCE") == "true"
-    if force_postgres_source or not check_source_is_timescaledb():
-        print("Migrating from Postgres to Timescale ...")
-        IS_POSTGRES_SOURCE = True
-    else:
-        print("Migrating from Timescale to Timescale ...")
-        print("Verifying TimescaleDB version in Source DB and Target DB ...")
-        check_timescaledb_version()
+    force_postgres_target = os.getenv("POSTGRES_TARGET") == "true"
 
-    work_dir = pgcopydb_init_env()
+    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
+    target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
+
+    source_type = get_dbtype(source_pg_uri)
+    target_type = get_dbtype(target_pg_uri)
+
+    if force_postgres_source:
+        source_type = DBType.POSTGRES
+    if force_postgres_target:
+        target_type = DBType.POSTGRES
+
+    match (source_type, target_type):
+        case (DBType.POSTGRES, DBType.POSTGRES):
+            print("Migrating from Postgres to Postgres ...")
+        case (DBType.POSTGRES, DBType.TIMESCALEDB):
+            print("Migrating from Postgres to TimescaleDB ...")
+        case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
+            print("Migrating from TimescaleDB to TimescaleDB ...")
+            check_timescaledb_version()
+        case (DBType.TIMESCALEDB, DBType.POSTGRES):
+            print("Migration from TimescaleDB to Postgres is not supported")
+            sys.exit(1)
+
+    work_dir = pgcopydb_init_env(source_type)
 
     skip_initial_data_copy = False
 
@@ -731,19 +756,19 @@ if __name__ == "__main__":
 
             # this is needed for docker environment, where the process
             # always gets deterministic pid while starting.
-            cleanup_pid_files(work_dir)
+            cleanup_pid_files(work_dir, source_type)
             print("Resuming migration ...")
         else:
             print("Cleaning up incomplete migration artifacts ...")
             run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
-            cleanup()
+            cleanup(source_type)
             shutil.rmtree(str(work_dir), ignore_errors=True)
             print("Cleanup the target DB and attempt migration again")
             sys.exit(1)
     else:
         shutil.rmtree(str(work_dir), ignore_errors=True)
 
-    create_dirs(work_dir)
+    create_dirs(work_dir, source_type)
 
     snapshot_proc, follow_proc = create_snapshot_and_follow(resume=skip_initial_data_copy)
 
@@ -755,8 +780,8 @@ if __name__ == "__main__":
 
         print("Migrating existing data from Source DB to Target DB ...")
 
-        if IS_POSTGRES_SOURCE:
-            migrate_existing_data_from_pg()
+        if source_type == DBType.POSTGRES:
+            migrate_existing_data_from_pg(target_type)
         else:
             migrate_existing_data_from_ts()
 
@@ -771,7 +796,7 @@ if __name__ == "__main__":
 
     wait_for_DBs_to_sync()
 
-    if IS_POSTGRES_SOURCE:
+    if source_type == DBType.POSTGRES:
         print("Stopping live-replay ...")
         run_cmd("pgcopydb stream sentinel set endpos --current")
 
@@ -799,14 +824,14 @@ if __name__ == "__main__":
     # At this moment, user has finished verifying data integrity. He is ready to resume the migration process
     # and move into the switch-over phase. Note, the traffic remains halted ATM.
 
-    if not IS_POSTGRES_SOURCE:
+    if source_type == DBType.TIMESCALEDB:
         print("Syncing last LSN in Source DB to Target DB ...")
         switchover_snapshot_proc = wait_for_LSN_to_sync()
 
     print("Copying sequences ...")
     copy_sequences()
 
-    if not IS_POSTGRES_SOURCE:
+    if source_type == DBType.TIMESCALEDB:
         if is_caggs_metadata_copy_complete():
             print("Skipping caggs metadata migration ...")
         else:
@@ -820,7 +845,7 @@ if __name__ == "__main__":
         enable_caggs_policies()
 
     print("Cleaning up ...")
-    cleanup()
+    cleanup(source_type)
     print("Migration successfully completed")
 
     telemetry.complete_success()
