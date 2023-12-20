@@ -265,7 +265,7 @@ def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
         while True:
             k = input()
             if k.lower() == key.lower():
-                print(f"Received key press event: '{key}'")
+                print(f'Received key press event: "{key}"')
                 notify_queue.put(1)
                 notify_queue.task_done()
                 return
@@ -590,7 +590,7 @@ def wait_for_DBs_to_sync():
     key_event_queue = queue.Queue(maxsize=1)
     wait_for_sigusr1(key_event_queue)
     if IS_TTY:
-        wait_for_keypress(key_event_queue, key="s")
+        wait_for_keypress(key_event_queue, key="c")
 
     while True:
         delay_mb = get_delay()
@@ -599,11 +599,11 @@ def wait_for_DBs_to_sync():
             print(diff)
         else:
             if not IS_TTY and LIVE_MIGRATION_DOCKER:
-                print(f"{diff}. To stop live-replay, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>'")
+                print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill --s=SIGUSR1 <container_name>"')
             elif not IS_TTY:
-                print(f"{diff}. To stop live-replay, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+                print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
             else:
-                print(f"{diff}. Press 's' (and ENTER) to stop live-replay")
+                print(f'{diff}. Press "c" (and ENTER) to proceed')
         if not analyzed and delay_mb < DELAY_THRESHOLD:
             print("Starting analyze on Target DB. This might take a long time to complete ...")
             run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
@@ -782,22 +782,9 @@ if __name__ == "__main__":
         follow_proc.terminate_process_including_children()
         print("Stopped")
 
-    if not IS_TTY and LIVE_MIGRATION_DOCKER:
-        print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'docker kill -s=USR1 <container_name>'")
-    elif not IS_TTY:
-        print(f"[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, send a USR1 signal with 'kill -s=USR1 {os.getpid()}' to continue")
-    else:
-        print("[ACTION NEEDED] Now, you should check integrity of your data. Once you are confident, you need Press 'c' (and ENTER) to continue")
-    notify_queue = queue.Queue(maxsize=1)
-    wait_for_sigusr1(notify_queue)
-    if IS_TTY:
-        wait_for_keypress(notify_queue, key="c")
-
-    notify_queue.get()
-    print("Continuing ...")
-
-    # At this moment, user has finished verifying data integrity. He is ready to resume the migration process
-    # and move into the switch-over phase. Note, the traffic remains halted ATM.
+    # At this moment, user has finished verifying data integrity. He is ready
+    # to resume the migration process and move into the switch-over phase.
+    # Note, the traffic remains halted ATM.
 
     if not IS_POSTGRES_SOURCE:
         print("Syncing last LSN in Source DB to Target DB ...")
