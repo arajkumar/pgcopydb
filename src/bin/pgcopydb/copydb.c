@@ -1076,7 +1076,7 @@ copydb_register_sysv_semaphore(SysVResArray *array, Semaphore *semaphore)
 			  semaphore->semId);
 
 	array->array[array->count].kind = SYSV_SEMAPHORE;
-	array->array[array->count].res.semaphore = semaphore;
+	array->array[array->count].res.semaphore = *semaphore;
 
 	++(array->count);
 
@@ -1095,7 +1095,7 @@ copydb_unlink_sysv_semaphore(SysVResArray *array, Semaphore *semaphore)
 		SysVRes *res = &(array->array[i]);
 
 		if (res->kind == SYSV_SEMAPHORE &&
-			res->res.semaphore->semId == semaphore->semId)
+			res->res.semaphore.semId == semaphore->semId)
 		{
 			res->unlinked = true;
 			return true;
@@ -1130,7 +1130,7 @@ copydb_register_sysv_queue(SysVResArray *array, Queue *queue)
 			  queue->qId);
 
 	array->array[array->count].kind = SYSV_QUEUE;
-	array->array[array->count].res.queue = queue;
+	array->array[array->count].res.queue = *queue;
 
 	++(array->count);
 
@@ -1148,7 +1148,7 @@ copydb_unlink_sysv_queue(SysVResArray *array, Queue *queue)
 	{
 		SysVRes *res = &(array->array[i]);
 
-		if (res->kind == SYSV_QUEUE && res->res.queue->qId == queue->qId)
+		if (res->kind == SYSV_QUEUE && res->res.queue.qId == queue->qId)
 		{
 			res->unlinked = true;
 			return true;
@@ -1192,7 +1192,7 @@ copydb_cleanup_sysv_resources(SysVResArray *array)
 		{
 			case SYSV_QUEUE:
 			{
-				Queue *queue = res->res.queue;
+				Queue *queue = &res->res.queue;
 
 				if (queue->owner == pid)
 				{
@@ -1208,7 +1208,7 @@ copydb_cleanup_sysv_resources(SysVResArray *array)
 
 			case SYSV_SEMAPHORE:
 			{
-				Semaphore *semaphore = res->res.semaphore;
+				Semaphore *semaphore = &res->res.semaphore;
 
 				if (!semaphore_finish(semaphore))
 				{
