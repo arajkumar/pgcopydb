@@ -3,6 +3,7 @@
 #include "string_utils.h"
 #include "file_utils.h"
 #include "uthash.h"
+#include "ld_stream.h"
 
 typedef struct ChunkHypertableMap
 {
@@ -100,6 +101,50 @@ timescale_init(PGSQL *pgsql, char *pguri)
 	return true;
 }
 
+static bool
+GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
+										   char **nspname, char **relname)
+{
+	switch (stmt->action)
+	{
+		case STREAM_ACTION_INSERT:
+		{
+			*nspname = stmt->stmt.insert.nspname;
+			*relname = stmt->stmt.insert.relname;
+			break;
+		}
+
+		case STREAM_ACTION_UPDATE:
+		{
+			*nspname = stmt->stmt.update.nspname;
+			*relname = stmt->stmt.update.relname;
+			break;
+		}
+
+		case STREAM_ACTION_DELETE:
+		{
+			*nspname = stmt->stmt.delete.nspname;
+			*relname = stmt->stmt.delete.relname;
+			break;
+		}
+
+		case STREAM_ACTION_TRUNCATE:
+		{
+			*nspname = stmt->stmt.truncate.nspname;
+			*relname = stmt->stmt.truncate.relname;
+			break;
+		}
+
+		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
+		default:
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+
 
 static bool
 extract_hypertable_id(const char *input, uint32_t *hypertableID)
@@ -195,11 +240,18 @@ timescale_is_chunk(const char *nspname_in, const char *relname_in)
 
 
 bool
-timescale_allow_statement(const char *nspname_in, const char *relname_in)
+timescale_allow_statement(LogicalTransactionStatement *stmt)
 {
 	if (!isTimescale)
 	{
 		return true;
+	}
+
+	char *nspname, *relname;
+
+	if (!GetRelationFromLogicalTransactionStatement(stmt, &nspname, &relname))
+	{
+		return false;
 	}
 
 	const char *denylist[][2] = {
@@ -215,13 +267,25 @@ timescale_allow_statement(const char *nspname_in, const char *relname_in)
 		const char *deny_nspname = denylist[i][0];
 		const char *deny_relname = denylist[i][1];
 
-		if (streq(nspname_in, deny_nspname))
+		if (streq(nspname, deny_nspname))
 		{
-			if (deny_relname == NULL || strstr(relname_in, deny_relname) == relname_in)
+			if (deny_relname == NULL || strstr(relname, deny_relname) == relname)
 			{
 				return false; /* Found in denylist, so disallowed */
 			}
 		}
+	}
+
+	/* Don't allow truncate on chunks */
+	if (timescale_is_chunk(nspname, relname))
+	{
+		if (stmt->action == STREAM_ACTION_TRUNCATE)
+		{
+			log_warn("Skipping TRUNCATE on chunk %s.%s", nspname, relname);
+			return false;
+		}
+
+		return true;
 	}
 
 	return true; /* Not found in denylist, allowed */

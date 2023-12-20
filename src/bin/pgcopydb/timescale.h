@@ -7,6 +7,7 @@
 #define TIMESCALE_H
 
 #include "pgsql.h"
+#include "ld_stream.h"
 
 bool timescale_init(PGSQL *pgsql, char *pguri);
 
@@ -23,8 +24,8 @@ bool timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nsp
 bool timescale_is_chunk(const char *nspname_in, const char *relname_in);
 
 /*
- * Checks whether to ignore the given nspname and relname.
+ * Checks whether to ignore the statement.
  */
-bool timescale_allow_statement(const char *nspname_in, const char *relname_in);
+bool timescale_allow_statement(LogicalTransactionStatement *stmt);
 
 #endif /* TIMESCALE_H */

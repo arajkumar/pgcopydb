@@ -1523,50 +1523,6 @@ FreeLogicalMessage(LogicalMessage *msg)
 }
 
 
-bool
-GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
-										   char **nspname, char **relname)
-{
-	switch (stmt->action)
-	{
-		case STREAM_ACTION_INSERT:
-		{
-			*nspname = stmt->stmt.insert.nspname;
-			*relname = stmt->stmt.insert.relname;
-			break;
-		}
-
-		case STREAM_ACTION_UPDATE:
-		{
-			*nspname = stmt->stmt.update.nspname;
-			*relname = stmt->stmt.update.relname;
-			break;
-		}
-
-		case STREAM_ACTION_DELETE:
-		{
-			*nspname = stmt->stmt.delete.nspname;
-			*relname = stmt->stmt.delete.relname;
-			break;
-		}
-
-		case STREAM_ACTION_TRUNCATE:
-		{
-			*nspname = stmt->stmt.truncate.nspname;
-			*relname = stmt->stmt.truncate.relname;
-			break;
-		}
-
-		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
-		default:
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-
 /*
  * FreeLogicalTransactionStatement frees the malloc'ated memory areas of a
  * LogicalTransaction.
