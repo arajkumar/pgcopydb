@@ -599,7 +599,7 @@ def wait_for_DBs_to_sync():
             print(diff)
         else:
             if not IS_TTY and LIVE_MIGRATION_DOCKER:
-                print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill --s=SIGUSR1 <container_name>"')
+                print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill -s=SIGUSR1 <container_name>"')
             elif not IS_TTY:
                 print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
             else:
