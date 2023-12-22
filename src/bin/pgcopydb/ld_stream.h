@@ -135,32 +135,35 @@ typedef struct LogicalMessageTupleArray
 	LogicalMessageTuple *array; /* malloc'ed area */
 } LogicalMessageTupleArray;
 
+typedef struct LogicalMessageRelation
+{
+	char *nspname;  /* malloc'ed area */
+	char *relname;  /* malloc'ed area */
+	bool pqMemory;
+} LogicalMessageRelation;
+
 typedef struct LogicalMessageInsert
 {
-	char nspname[PG_NAMEDATALEN];
-	char relname[PG_NAMEDATALEN];
+	LogicalMessageRelation table;
 	LogicalMessageTupleArray new;   /* {"columns": ...} */
 } LogicalMessageInsert;
 
 typedef struct LogicalMessageUpdate
 {
-	char nspname[PG_NAMEDATALEN];
-	char relname[PG_NAMEDATALEN];
+	LogicalMessageRelation table;
 	LogicalMessageTupleArray old;   /* {"identity": ...} */
 	LogicalMessageTupleArray new;   /* {"columns": ...} */
 } LogicalMessageUpdate;
 
 typedef struct LogicalMessageDelete
 {
-	char nspname[PG_NAMEDATALEN];
-	char relname[PG_NAMEDATALEN];
+	LogicalMessageRelation table;
 	LogicalMessageTupleArray old;   /* {"identity": ...} */
 } LogicalMessageDelete;
 
 typedef struct LogicalMessageTruncate
 {
-	char nspname[PG_NAMEDATALEN];
-	char relname[PG_NAMEDATALEN];
+	LogicalMessageRelation table;
 } LogicalMessageTruncate;
 
 typedef struct LogicalMessageSwitchWAL
@@ -278,7 +281,7 @@ typedef enum
  */
 typedef struct GeneratedColumnsCache
 {
-	char qColumnName[PG_NAMEDATALEN_FQ]; /* key: "schema.table.attname" */
+	char *qColumnName; /* key: "schema.table.attname" */
 
 	UT_hash_handle hh;          /* makes this structure hashable */
 } GeneratedColumnsCache;
@@ -322,6 +325,8 @@ typedef struct StreamContext
 	GeneratedColumnsCache *generatedColumnsCache;
 
 	Queue *transformQueue;
+	PGSQL *transformPGSQL;
+
 	uint32_t WalSegSz;
 	uint32_t timeline;
 
@@ -477,6 +482,7 @@ struct StreamSpecs
 
 	/* receive push json filenames to a queue for transform */
 	Queue transformQueue;
+	PGSQL transformPGSQL;
 
 	/* ld_stream and ld_transform needs their own StreamContext instance */
 	StreamContext private;
@@ -586,6 +592,7 @@ bool stream_compute_pathnames(uint32_t WalSegSz,
 							  char *walFileName,
 							  char *sqlFileName);
 
+bool stream_transform_context_init_pgsql(StreamSpecs *specs);
 bool stream_transform_stream(StreamSpecs *specs);
 bool stream_transform_resume(StreamSpecs *specs);
 bool stream_transform_line(void *ctx, const char *line, bool *stop);
@@ -632,22 +639,13 @@ bool streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 											 LogicalTransactionStatement *stmt);
 
 
-bool GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
-												char **nspname, char **relname);
-
 void FreeLogicalMessage(LogicalMessage *msg);
 void FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt);
 void FreeLogicalTransaction(LogicalTransaction *tx);
 void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
+void FreeLogicalMessageRelation(LogicalMessageRelation *table);
 void FreeLogicalMessageTuple(LogicalMessageTuple *tuple);
 bool AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count);
-
-void PrepareGeneratedColumnsCache(StreamContext *privateContext);
-void IsGeneratedColumn(GeneratedColumnsCache *cache,
-					  const char *schema,
-					  const char *table,
-					  const char *column,
-					  bool *isGenerated);
 
 /* ld_test_decoding.c */
 bool prepareTestDecodingMessage(LogicalStreamContext *context);

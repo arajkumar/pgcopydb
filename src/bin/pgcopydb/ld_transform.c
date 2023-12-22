@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 #include "postgres_fe.h"
+#include "libpq-fe.h"
 #include "access/xlog_internal.h"
 #include "access/xlogdefs.h"
 
@@ -30,6 +31,7 @@
 #include "parsing_utils.h"
 #include "pidfile.h"
 #include "pg_utils.h"
+#include "pgsql.h"
 #include "schema.h"
 #include "signals.h"
 #include "string_utils.h"
@@ -43,10 +45,53 @@ typedef struct TransformStreamCtx
 	uint64_t currentMsgIndex;
 } TransformStreamCtx;
 
+static bool stream_transform_stream_internal(StreamSpecs *specs);
+
+static bool stream_transform_from_queue_internal(StreamSpecs *specs);
+
 static bool canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												   LogicalTransactionStatement *new);
 static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												LogicalTransactionStatement *new);
+
+static bool PrepareGeneratedColumnsCache(StreamContext *privateContext);
+
+static bool IsGeneratedColumn(GeneratedColumnsCache *cache,
+					  char *schema,
+					  char *table,
+					  char *column,
+					  bool *isGenerated);
+
+/*
+ * stream_transform_context_init_pgsql initializes StreamContext's
+ * transformPGSQL and opens a connection to the target. This is required to use
+ * PQescapeIdentifier API of libpq when escaping identifiers
+ */
+bool
+stream_transform_context_init_pgsql(StreamSpecs *specs)
+{
+	StreamContext *privateContext = &(specs->private);
+
+	privateContext->transformPGSQL = &(specs->transformPGSQL);
+
+	/* initialize our connection to the target database */
+	if (!pgsql_init(privateContext->transformPGSQL,
+					specs->connStrings->target_pguri,
+					PGSQL_CONN_TARGET))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!pgsql_open_connection(privateContext->transformPGSQL))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
 
 /*
  * stream_transform_stream transforms a JSON formatted input stream (read line
@@ -55,6 +100,27 @@ static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
  */
 bool
 stream_transform_stream(StreamSpecs *specs)
+{
+	if (!stream_transform_context_init_pgsql(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success = stream_transform_stream_internal(specs);
+
+	pgsql_finish(&(specs->transformPGSQL));
+
+	return success;
+}
+
+
+/*
+ * stream_transform_stream_internal implements the core of
+ * stream_transform_stream
+ */
+static bool
+stream_transform_stream_internal(StreamSpecs *specs)
 {
 	StreamContext *privateContext = &(specs->private);
 
@@ -615,11 +681,6 @@ stream_transform_worker(StreamSpecs *specs)
 bool
 stream_transform_from_queue(StreamSpecs *specs)
 {
-	Queue *transformQueue = &(specs->transformQueue);
-
-	int errors = 0;
-	bool stop = false;
-
 	if (!stream_init_context(specs))
 	{
 		/* errors have already been logged */
@@ -627,6 +688,32 @@ stream_transform_from_queue(StreamSpecs *specs)
 	}
 
 	PrepareGeneratedColumnsCache(&(specs->private));
+
+	if (!stream_transform_context_init_pgsql(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success = stream_transform_from_queue_internal(specs);
+
+	pgsql_finish(&(specs->transformPGSQL));
+
+	return success;
+}
+
+
+/*
+ * stream_transform_from_queue_internal implements the core of
+ * stream_transform_from_queue
+ */
+static bool
+stream_transform_from_queue_internal(StreamSpecs *specs)
+{
+	Queue *transformQueue = &(specs->transformQueue);
+
+	int errors = 0;
+	bool stop = false;
 
 	while (!stop)
 	{
@@ -1399,8 +1486,8 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	LogicalMessageInsert *newInsert = &new->stmt.insert;
 
 	/* Last and current statements must target same relation */
-	if (!streq(lastInsert->nspname, newInsert->nspname) ||
-		!streq(lastInsert->relname, newInsert->relname))
+	if (!streq(lastInsert->table.nspname, newInsert->table.nspname) ||
+		!streq(lastInsert->table.relname, newInsert->table.relname))
 	{
 		return false;
 	}
@@ -1476,24 +1563,6 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 		return false;
 	}
 
-	/* TODO: Refactor using inheritance info from pg_catalog.pg_inherits */
-	char *nspname, *relname;
-	if (GetRelationFromLogicalTransactionStatement(stmt, &nspname, &relname))
-	{
-		/* Map if the relation is chunk */
-		if (timescale_is_chunk(nspname, relname))
-		{
-			if (stmt->action == STREAM_ACTION_TRUNCATE)
-			{
-				log_warn("Ignore TRUNCATE on timescale chunk %s.%s",
-						 nspname, relname);
-				FreeLogicalTransactionStatement(stmt);
-				return true;
-			}
-		}
-	}
-
-
 	if (txn->first == NULL)
 	{
 		txn->first = stmt;
@@ -1539,50 +1608,6 @@ FreeLogicalMessage(LogicalMessage *msg)
 	{
 		FreeLogicalTransaction(&(msg->command.tx));
 	}
-}
-
-
-bool
-GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
-										   char **nspname, char **relname)
-{
-	switch (stmt->action)
-	{
-		case STREAM_ACTION_INSERT:
-		{
-			*nspname = stmt->stmt.insert.nspname;
-			*relname = stmt->stmt.insert.relname;
-			break;
-		}
-
-		case STREAM_ACTION_UPDATE:
-		{
-			*nspname = stmt->stmt.update.nspname;
-			*relname = stmt->stmt.update.relname;
-			break;
-		}
-
-		case STREAM_ACTION_DELETE:
-		{
-			*nspname = stmt->stmt.delete.nspname;
-			*relname = stmt->stmt.delete.relname;
-			break;
-		}
-
-		case STREAM_ACTION_TRUNCATE:
-		{
-			*nspname = stmt->stmt.truncate.nspname;
-			*relname = stmt->stmt.truncate.relname;
-			break;
-		}
-
-		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
-		default:
-		{
-			return false;
-		}
-	}
-	return true;
 }
 
 
@@ -1635,12 +1660,70 @@ FreeLogicalTransaction(LogicalTransaction *tx)
 
 	for (; currentStmt != NULL;)
 	{
+		switch (currentStmt->action)
+		{
+			case STREAM_ACTION_INSERT:
+			{
+				FreeLogicalMessageRelation(&(currentStmt->stmt.insert.table));
+				FreeLogicalMessageTupleArray(&(currentStmt->stmt.insert.new));
+				break;
+			}
+
+			case STREAM_ACTION_UPDATE:
+			{
+				FreeLogicalMessageRelation(&(currentStmt->stmt.update.table));
+				FreeLogicalMessageTupleArray(&(currentStmt->stmt.update.old));
+				FreeLogicalMessageTupleArray(&(currentStmt->stmt.update.new));
+				break;
+			}
+
+			case STREAM_ACTION_DELETE:
+			{
+				FreeLogicalMessageRelation(&(currentStmt->stmt.delete.table));
+				FreeLogicalMessageTupleArray(&(currentStmt->stmt.delete.old));
+				break;
+			}
+
+			case STREAM_ACTION_TRUNCATE:
+			{
+				FreeLogicalMessageRelation(&(currentStmt->stmt.truncate.table));
+				break;
+			}
+
+			/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
+			default:
+			{
+				break;
+			}
+		}
+
 		LogicalTransactionStatement *stmt = currentStmt;
 		currentStmt = currentStmt->next;
 		FreeLogicalTransactionStatement(stmt);
 	}
 
 	tx->first = NULL;
+}
+
+
+/*
+ * FreeLogicalMessageRelation frees the malloc'ated memory areas of
+ * LogicalMessageRelation.
+ */
+void
+FreeLogicalMessageRelation(LogicalMessageRelation *table)
+{
+	if (table->pqMemory)
+	{
+		/* use PQfreemem for memory allocated by PQescapeIdentifer */
+		PQfreemem(table->nspname);
+		PQfreemem(table->relname);
+	}
+	else
+	{
+		free(table->nspname);
+		free(table->relname);
+	}
 }
 
 
@@ -2158,8 +2241,8 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert, GeneratedColumnsCac
 		 * First, the PREPARE part.
 		 */
 		appendPQExpBuffer(buf, "INSERT INTO %s.%s ",
-						  insert->nspname,
-						  insert->relname);
+						  insert->table.nspname,
+						  insert->table.relname);
 
 		/* loop over column names and add them to the out stream */
 		appendPQExpBuffer(buf, "%s", "(");
@@ -2172,8 +2255,8 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert, GeneratedColumnsCac
 			bool isGeneratedColumn = false;
 
 			IsGeneratedColumn(cache,
-							  insert->nspname,
-							  insert->relname,
+							  insert->table.nspname,
+							  insert->table.relname,
 							  stmt->columns[c],
 							  &isGeneratedColumn);
 			if (isGeneratedColumn)
@@ -2233,8 +2316,8 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert, GeneratedColumnsCac
 				bool isGeneratedColumn = false;
 
 				IsGeneratedColumn(cache,
-								  insert->nspname,
-								  insert->relname,
+								  insert->table.nspname,
+								  insert->table.relname,
 								  stmt->columns[v],
 								  &isGeneratedColumn);
 				if (isGeneratedColumn)
@@ -2334,8 +2417,8 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update, GeneratedColumnsCac
 		 * First, the PREPARE part.
 		 */
 		appendPQExpBuffer(buf, "UPDATE %s.%s SET ",
-						  update->nspname,
-						  update->relname);
+						  update->table.nspname,
+						  update->table.relname);
 		int pos = 0;
 
 		for (int r = 0; r < new->values.count; r++)
@@ -2502,8 +2585,8 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 		 * First, the PREPARE part.
 		 */
 		appendPQExpBuffer(buf, "DELETE FROM %s.%s WHERE ",
-						  delete->nspname,
-						  delete->relname);
+						  delete->table.nspname,
+						  delete->table.relname);
 
 		int pos = 0;
 
@@ -2575,7 +2658,10 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 bool
 stream_write_truncate(FILE *out, LogicalMessageTruncate *truncate)
 {
-	FFORMAT(out, "TRUNCATE ONLY %s.%s\n", truncate->nspname, truncate->relname);
+	FFORMAT(out,
+			"TRUNCATE ONLY %s.%s\n",
+			truncate->table.nspname,
+			truncate->table.relname);
 
 	return true;
 }
@@ -2785,40 +2871,91 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 
 
 /*
+ * CreateFQColumnName creates a fully qualified column name in the form
+ * schema.table.column and escapes the identifiers if they are not already
+ * quoted.
+ */
+static
+bool CreateFQColumnName(PQExpBuffer buf, char *schema, char *table, char *column)
+{
+
+	char *components[] = { schema, table, column };
+
+	for (int i = 0; i < sizeof(components) / sizeof(components[0]); i++)
+	{
+		if (i > 0)
+		{
+			appendPQExpBufferStr(buf, ".");
+		}
+
+		if (components[i][0] == '"')
+		{
+			appendPQExpBuffer(buf, "%s", components[i]);
+		}
+		else
+		{
+			appendPQExpBuffer(buf, "\"%s\"", components[i]);
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * IsGeneratedColumn checks if a column is generated in a table by looking up
  * the cache.
  */
-void IsGeneratedColumn(GeneratedColumnsCache *cache,
-					  const char *schema,
-					  const char *table,
-					  const char *column,
+static bool
+IsGeneratedColumn(GeneratedColumnsCache *cache,
+					  char *schema,
+					  char *table,
+					  char *column,
 					  bool *isGenerated)
 {
 	*isGenerated = false;
 
+	/*
+	 * If the cache is NULL, then we don't have any generated columns to
+	 * lookup.
+	 */
 	if (cache == NULL)
 	{
-		return;
+		return true;
 	}
 
 	GeneratedColumnsCache *item = NULL;
 
-	char qColumnName[PG_NAMEDATALEN_FQ_ATT] = { 0 };
+	PQExpBuffer buf = createPQExpBuffer();
 
-	/* TODO: escape schema, table, and column */
-	sformat(qColumnName, sizeof(qColumnName), "%s.%s.%s", schema, table, column);
+	(void) CreateFQColumnName(buf, schema, table, column);
 
-	HASH_FIND_STR(cache, qColumnName, item);
+	if (PQExpBufferBroken(buf))
+	{
+		log_error("Failed to escape fully qualified column name: Out of Memory");
+		destroyPQExpBuffer(buf);
+		return false;
+	}
+
+	HASH_FIND_STR(cache, buf->data, item);
 
 	*isGenerated = (item != NULL);
 
-	log_debug("IsColumnGenerated: %s.%s.%s is %s",
-			  schema, table, column,
-			  *isGenerated ? "generated" : "not generated");
+	log_debug("IsColumnGenerated: %s is %s",
+			  buf->data, *isGenerated ? "generated" : "not generated");
+
+	destroyPQExpBuffer(buf);
+
+	return true;
 }
 
 
-void PrepareGeneratedColumnsCache(StreamContext *privateContext)
+/*
+ * PrepareGeneratedColumnsCache fills-in the cache with the tables having
+ * generated columns.
+ */
+static bool
+PrepareGeneratedColumnsCache(StreamContext *privateContext)
 {
 	SourceTableArray *tables = &(privateContext->catalog->sourceTableArray);
 
@@ -2840,18 +2977,42 @@ void PrepareGeneratedColumnsCache(StreamContext *privateContext)
 				if (item == NULL)
 				{
 					log_error(ALLOCATION_FAILED_ERROR);
-					return;
+					return false;
 				}
 
-				sformat(item->qColumnName, sizeof(item->qColumnName), "%s.%s.%s",
-						table->nspname, table->relname, attribute->attname);
+				PQExpBuffer buf = createPQExpBuffer();
+
+				(void) CreateFQColumnName(buf,
+										  table->nspname,
+										  table->relname,
+										  attribute->attname);
+
+				if (PQExpBufferBroken(buf))
+				{
+					log_error("Failed to escape fully qualified column name: Out of Memory");
+					destroyPQExpBuffer(buf);
+					return false;
+				}
+
+				item->qColumnName = strdup(buf->data);
+
+				if (item->qColumnName == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					destroyPQExpBuffer(buf);
+					return false;
+				}
 
 				HASH_ADD_STR(privateContext->generatedColumnsCache,
 							 qColumnName,
 							 item);
+
+				destroyPQExpBuffer(buf);
 			}
 
 		}
 
 	}
+
+	return true;
 }

@@ -243,6 +243,8 @@ typedef struct GUC
 
 bool pgsql_init(PGSQL *pgsql, char *url, ConnectionType connectionType);
 
+PGconn * pgsql_open_connection(PGSQL *pgsql);
+
 void pgsql_set_retry_policy(ConnectionRetryPolicy *retryPolicy,
 							int maxT,
 							int maxR,
@@ -582,5 +584,5 @@ bool pgsql_fetch_sync_sentinel_apply(PGSQL *pgsql,
 									 bool *retry,
 									 CopyDBSentinel *sentinel);
 
-
+char * pgsql_escape_identifier(PGSQL *pgsql, char *src);
 #endif /* PGSQL_H */
