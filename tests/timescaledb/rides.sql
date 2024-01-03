@@ -26,7 +26,7 @@ CREATE TABLE "rides"(
     improvement_surcharge NUMERIC,
     total_amount NUMERIC
 );
-SELECT create_hypertable('rides', 'pickup_datetime', 'payment_type', 2, create_default_indexes=>FALSE);
+SELECT create_hypertable('rides', 'pickup_datetime', 'payment_type', 2, create_default_indexes=>FALSE, chunk_time_interval=> '1h'::interval);
 CREATE INDEX ON rides (vendor_id, pickup_datetime desc);
 CREATE INDEX ON rides (pickup_datetime desc, vendor_id);
 CREATE INDEX ON rides (rate_code, pickup_datetime DESC);
@@ -55,5 +55,14 @@ INSERT INTO rates(rate_code, description) VALUES
 (4, 'Nassau or Westchester'),
 (5, 'negotiated fare'),
 (6, 'group ride');
+
+CREATE TABLE IF NOT EXISTS "metrics"(
+    id SERIAL,
+    "time" timestamp with time zone NOT NULL,
+    name TEXT NOT NULL,
+    value NUMERIC NOT NULL
+);
+
+SELECT create_hypertable('metrics', 'time', create_default_indexes=>FALSE, chunk_time_interval=> '1h'::interval);
 
 COMMIT;

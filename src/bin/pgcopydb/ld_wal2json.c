@@ -97,6 +97,24 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 		metadata->xid = (uint32_t) xid;
 	}
 
+	if (metadata->action == STREAM_ACTION_INSERT ||
+		metadata->action == STREAM_ACTION_UPDATE ||
+		metadata->action == STREAM_ACTION_DELETE ||
+		metadata->action == STREAM_ACTION_TRUNCATE)
+	{
+		const char *nspname = json_object_get_string(jsobj, "schema");
+		const char *relname = json_object_get_string(jsobj, "table");
+
+		if (!timescale_allow_statement(nspname, relname))
+		{
+			log_warn("Filtering out message action %s for %s.%s",
+					  StreamActionToString(metadata->action),
+					  nspname, relname);
+
+			metadata->filterOut = true;
+		}
+	}
+
 	json_value_free(json);
 
 	return true;

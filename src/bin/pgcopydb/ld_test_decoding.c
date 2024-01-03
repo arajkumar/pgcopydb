@@ -30,6 +30,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 typedef struct TestDecodingHeader
@@ -176,6 +177,15 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 			log_debug("Filtering out message for schema \"%s\": %s",
 					  header.nspname,
 					  context->buffer);
+			metadata->filterOut = true;
+		}
+
+		if (!timescale_allow_statement(header.nspname, header.relname))
+		{
+			log_warn("Filtering out message action %s for %s.%s",
+					  StreamActionToString(header.action),
+					  header.nspname, header.relname);
+
 			metadata->filterOut = true;
 		}
 

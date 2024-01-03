@@ -1456,21 +1456,31 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 		return false;
 	}
 
+	/* TODO: Refactor using inheritance info from pg_catalog.pg_inherits */
 	char *nspname, *relname;
 	if (GetRelationFromLogicalTransactionStatement(stmt, &nspname, &relname))
 	{
-		/* Skip catalog table */
-		if (!timescale_allow_statement(nspname, relname))
-		{
-			log_trace("Ignore catalog %s.%s", nspname, relname);
-			FreeLogicalTransactionStatement(stmt);
-			return true;
-		}
-
 		/* Map if the relation is chunk */
 		if (timescale_is_chunk(nspname, relname))
 		{
-			timescale_chunk_to_hypertable(nspname, relname, nspname, relname);
+			if (stmt->action == STREAM_ACTION_TRUNCATE)
+			{
+				log_warn("Ignore TRUNCATE on timescale chunk %s.%s",
+						  nspname, relname);
+				FreeLogicalTransactionStatement(stmt);
+				return true;
+			}
+
+			if (!timescale_chunk_to_hypertable(nspname,
+											   relname,
+											   nspname,
+											   relname))
+			{
+				log_error("Failed to map chunk %s.%s to hypertable",
+						  nspname, relname);
+				FreeLogicalTransactionStatement(stmt);
+				return false;
+			}
 		}
 	}
 
