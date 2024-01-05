@@ -15,6 +15,8 @@
 #include "signals.h"
 
 
+static bool copydb_copy_ext_sequence(PGSQL *src, PGSQL *dst, char *qname);
+
 /*
  * copydb_start_extension_process an auxilliary process that copies the
  * extension configuration table data from the source database into the target
@@ -72,6 +74,31 @@ copydb_start_extension_data_process(CopyDataSpec *specs)
 	return true;
 }
 
+/*
+ * copydb_copy_ext_sequence copies sequence values from the source extension
+ * configuration table into the target extension.
+ */
+static bool
+copydb_copy_ext_sequence(PGSQL *src, PGSQL *dst, char *qname)
+{
+	SourceSequence seq = { 0 };
+
+	strlcpy(seq.qname, qname, sizeof(seq.qname));
+
+	if (!schema_get_sequence_value(src, &seq))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!schema_set_sequence_value(dst, &seq))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * copydb_copy_extensions copies extensions from the source instance into the
@@ -154,26 +181,65 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 						config->nspname,
 						config->relname);
 
-				char *sqlTemplate = "(SELECT * FROM %s %s)";
-
-				size_t sqlLen =
-					strlen(sqlTemplate) +
-					strlen(qname) +
-					strlen(config->condition) +
-					1;
-
-				char *sql = (char *) calloc(sqlLen, sizeof(char));
-
-				sformat(sql, sqlLen, sqlTemplate, qname, config->condition);
-
-				bool truncate = false;
 				PGSQL *src = &(copySpecs->sourceSnapshot.pgsql);
-				uint64_t bytesTransmitted = 0;
-
-				if (!pg_copy(src, &dst, sql, qname, truncate, &bytesTransmitted))
+				switch (config->relkind)
 				{
-					/* errors have already been logged */
-					return false;
+					case 'r':
+					{
+						char *sqlTemplate = "(SELECT * FROM %s %s)";
+
+						size_t sqlLen =
+							strlen(sqlTemplate) +
+							strlen(qname) +
+							strlen(config->condition) +
+							1;
+
+						char *sql = (char *) calloc(sqlLen, sizeof(char));
+
+						sformat(sql, sqlLen, sqlTemplate, qname, config->condition);
+
+						bool truncate = false;
+						uint64_t bytesTransmitted = 0;
+
+						if (!pg_copy(src, &dst, sql, qname, truncate, &bytesTransmitted))
+						{
+							/* errors have already been logged */
+							return false;
+						}
+						break;
+					}
+					case 'S':
+					{
+						log_info("COPY extension \"%s\" "
+								"configuration sequence %s",
+								ext->extname,
+								qname);
+
+						if (!copydb_copy_ext_sequence(src,
+									&dst,
+									qname))
+						{
+							/* errors have already been logged */
+							return false;
+						}
+
+						break;
+					}
+					default:
+					{
+						/*
+						 * According to the PostgreSQL documentation, extension
+						 * configuration tables can only be of type table or
+						 * sequence.
+						 * https://www.postgresql.org/docs/current/extend-extensions.html#EXTEND-EXTENSIONS-CONFIG-TABLES
+						 */
+						log_error("Unexpected configuration type '%c' found "
+								  "for extension \"%s\" configuration table %s",
+								  (char) config->relkind,
+								  ext->extname,
+								  qname);
+						return false;
+					}
 				}
 			}
 		}
