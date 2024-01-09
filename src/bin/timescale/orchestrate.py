@@ -576,25 +576,52 @@ sed -i -E \
 
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts():
-    print(f"Creating a dump at {env['PGCOPYDB_DIR']}/dump ...")
-    start = time.time()
-
+    print("Timescale pre-restore ...")
     run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
 
-    pgdump_command = f"pg_dump -d $PGCOPYDB_SOURCE_PGURI --jobs 8 --no-owner --no-privileges --no-tablespaces --quote-all-identifiers --format d --file $PGCOPYDB_DIR/dump --exclude-table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
-    run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pg_dump_existing_data")
-    time_taken = (time.time() - start) / 60
-    print(f"Completed in {time_taken:.1f}m")
+    with timeit():
+        copy_extensions = " ".join([
+                "pgcopydb",
+                "copy",
+                "extensions",
+                "--dir",
+                "$PGCOPYDB_DIR/copy_extension",
+                "--snapshot",
+                "$(cat ${PGCOPYDB_DIR}/snapshot)",
+                "--restart",
+                ])
+        run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
 
-    print(f"Restoring from {env['PGCOPYDB_DIR']}/dump ...")
-    start = time.time()
+    print("Timescale post-restore ...")
+    with timeit():
+        run_sql(execute_on_target=True,
+                sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
 
-    pgrestore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --no-owner --no-privileges --no-tablespaces -v --format d $PGCOPYDB_DIR/dump"
-    run_cmd(pgrestore_command, f"{env['PGCOPYDB_DIR']}/logs/pg_restore_existing_data", ignore_non_zero_code=True)
-    time_taken = (time.time() - start) / 60
-    print(f"Completed in {time_taken:.1f}m")
-    run_sql(execute_on_target=True,
-            sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
+    with timeit():
+        print("Copying table data ...")
+        clone_table_data = " ".join([
+            "pgcopydb",
+            "clone",
+            "--skip-extensions",
+            # todo: remove this once we remove explit vacuum calls
+            "--skip-vacuum",
+            "--no-acl",
+            "--no-owner",
+            "--drop-if-exists",
+            # enables same table concurrency by splitting tables into smaller
+            # chunks
+            "--split-tables-larger-than='10 GB'",
+            "--table-jobs=8",
+            "--index-jobs=8",
+            "--dir",
+            "$PGCOPYDB_DIR/table-data-copy",
+            "--restart",
+            "--snapshot",
+            "$(cat ${PGCOPYDB_DIR}/snapshot)",
+            "--notice",
+            ])
+
+        run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/clone-table-data")
 
 @telemetry_command("wait_for_DBs_to_sync")
 def wait_for_DBs_to_sync():
