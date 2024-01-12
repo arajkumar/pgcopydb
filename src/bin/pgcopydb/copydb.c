@@ -22,6 +22,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "runprogram.h"
 
 
 /* Postgres 9.5 does not have idle_in_transaction_session_timeout */
@@ -977,7 +978,7 @@ copydb_cleanup_sysv_resources(SysVResArray *array)
 	return true;
 }
 
-bool copydb_run_hooks(const char *dir, const char *name, ...)
+bool copydb_run_hook(const char *dir, const char *name, ...)
 {
 	char program[MAXPGPATH] = { 0 };
 
@@ -985,7 +986,7 @@ bool copydb_run_hooks(const char *dir, const char *name, ...)
 
 	va_list args;
 
-	va_start(args, fmt);
+	va_start(args, name);
 	Program prog = run_program(program, args);
 	va_end(args);
 

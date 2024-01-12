@@ -322,7 +322,7 @@ bool copydb_unlink_sysv_queue(SysVResArray *array, Queue *queue);
 
 bool copydb_cleanup_sysv_resources(SysVResArray *array);
 
-bool copydb_run_hooks(const char *dir, const char *name, ...);
+bool copydb_run_hook(const char *dir, const char *name, ...);
 
 /* catalog.c */
 bool catalog_init_from_specs(CopyDataSpec *copySpecs);

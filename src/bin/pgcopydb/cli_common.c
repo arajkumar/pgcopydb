@@ -777,8 +777,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "debug", no_argument, NULL, 'd' },
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
-		{ "hook-pre-copy", required_argument, NULL, 'k' },
-		{ "hook-post-copy", required_argument, NULL, 'K' },
+		{ "hooks-dir", required_argument, NULL, 'k' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
@@ -866,25 +865,13 @@ cli_copy_db_getopts(int argc, char **argv)
 
 			case 'k':
 			{
-				if (!file_exists(optarg))
+				if (!directory_exists(optarg))
 				{
-					log_fatal("hook-pre-copy not found: \"%s\"", optarg);
+					log_fatal("hooks-dir not found: \"%s\"", optarg);
 					++errors;
 				}
-				strlcpy(options.hookPreCopy, optarg, MAXPGPATH);
-				log_trace("--hook-pre-copy %s", options.hookPreCopy);
-				break;
-			}
-
-			case 'K':
-			{
-				if (!file_exists(optarg))
-				{
-					log_fatal("hook-post-copy not found: \"%s\"", optarg);
-					++errors;
-				}
-				strlcpy(options.hookPostCopy, optarg, MAXPGPATH);
-				log_trace("--hook-post-copy %s", options.hookPostCopy);
+				strlcpy(options.hooksDir, optarg, MAXPGPATH);
+				log_trace("--hooks-dir %s", options.hooksDir);
 				break;
 			}
 

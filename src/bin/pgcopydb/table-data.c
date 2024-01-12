@@ -916,16 +916,47 @@ copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 		return true;
 	}
 
+
 	/*
 	 * 1. Now COPY the TABLE DATA from the source to the destination.
 	 */
 	if (!table->excludeData)
 	{
+		bool run_pre_table_copy = table->partition.partCount == 0 ||
+			table->partition.partNumber == 0;
+		bool run_post_table_copy = table->partition.partCount == 0 ||
+			table->partition.partNumber == table->partition.partCount;
+		if (run_pre_table_copy)
+		{
+			if (!copydb_run_hook(specs->hooksDir,
+								 "pre-table-copy",
+								 tableSpecs->sourceTable->qname,
+								 specs->sourceSnapshot.snapshot))
+			{
+				/* errors have already been logged */
+				FreeCopyTableDataSpec(tableSpecs);
+				return false;
+			}
+		}
+
 		if (!copydb_copy_table(specs, src, dst, tableSpecs))
 		{
 			/* errors have already been logged */
 			FreeCopyTableDataSpec(tableSpecs);
 			return false;
+		}
+
+		if (run_post_table_copy)
+		{
+			if (!copydb_run_hook(specs->hooksDir,
+								 "post-table-copy",
+								 tableSpecs->sourceTable->qname,
+								 specs->sourceSnapshot.snapshot))
+			{
+				/* errors have already been logged */
+				FreeCopyTableDataSpec(tableSpecs);
+				return false;
+			}
 		}
 	}
 
