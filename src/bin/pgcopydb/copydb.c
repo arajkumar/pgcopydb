@@ -984,11 +984,42 @@ bool copydb_run_hook(const char *dir, const char *name, ...)
 
 	sformat(program, MAXPGPATH, "%s/%s", dir, name);
 
-	va_list args;
+	if (!file_exists(program))
+	{
+		log_debug("Skipping %s hook \"%s\": file does not exist",
+				  name, program);
+		return true;
+	}
 
+	log_notice("Running %s hook \"%s\"", name, program);
+
+	char *r_args[PG_CMD_MAX_ARG] = { 0 };
+	int r_argc = 0;
+
+	r_args[r_argc++] = program;
+	r_args[r_argc++] = (char*) name;
+
+	char *arg = NULL;
+	va_list args;
 	va_start(args, name);
-	Program prog = run_program(program, args);
+	while ((arg = va_arg(args, char *)))
+	{
+		if (PG_CMD_MAX_ARG <= r_argc)
+		{
+			log_error("Too many arguments for %s hook \"%s\"",
+					  name, program);
+			return false;
+		}
+		r_args[r_argc++] = arg;
+	}
 	va_end(args);
+
+	r_args[r_argc++] = NULL;
+
+	Program prog = { 0 };
+
+	initialize_program(&prog, r_args, false);
+	execute_subprogram(&prog);
 
 	bool success = prog.returnCode == 0;
 
