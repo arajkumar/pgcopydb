@@ -254,7 +254,10 @@ class Command:
         self.process.terminate()
 
     def terminate_process_including_children(self):
-        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+        try:
+            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
     def kill(self):
         self.process.kill()
@@ -595,7 +598,16 @@ def migrate_existing_data_from_ts():
     print("Timescale post-restore ...")
     with timeit():
         run_sql(execute_on_target=True,
-                sql="begin; select public.timescaledb_post_restore(); select public.alter_job(id::integer, scheduled => false) from _timescaledb_config.bgw_job where application_name like 'Refresh Continuous%'; commit;")
+                sql="""
+                begin;
+                select public.timescaledb_post_restore();
+
+                -- disable all background jobs
+                select public.alter_job(job_id, scheduled => false)
+                from timescaledb_information.jobs
+                where job_id >= 1000;
+                commit;
+                """)
 
     with timeit():
         print("Copying table data ...")
@@ -660,6 +672,14 @@ def wait_for_DBs_to_sync():
 
 @telemetry_command("wait_for_LSN_to_sync")
 def wait_for_LSN_to_sync():
+    run_sql(execute_on_target=False,
+            sql="""
+            select pg_drop_replication_slot(slot_name)
+            from pg_replication_slots
+            where slot_name='switchover';
+            """)
+
+    shutil.rmtree(str(env["PGCOPYDB_SWITCH_OVER_DIR"]), ignore_errors=True)
     switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover"
     switchover_snapshot_proc = Command(command=switchover_snapshot_command, use_shell=True,
                                        log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
@@ -748,9 +768,12 @@ def cleanup_pid_files(work_dir: Path, source_type: DBType):
 @telemetry_command("enable_caggs_policies")
 def enable_caggs_policies():
     run_sql(execute_on_target=True,
-            sql="select alter_job(job_id, scheduled => true) from timescaledb_information.jobs where application_name like 'Refresh Continuous%';")
-    run_sql(execute_on_target=True,
-            sql="select timescaledb_post_restore();")
+            sql="""
+            select public.alter_job(job_id, scheduled => true)
+            from timescaledb_information.jobs
+            where job_id >= 1000;
+            select timescaledb_post_restore();
+            """)
 
 if __name__ == "__main__":
     install_signal_handler()
