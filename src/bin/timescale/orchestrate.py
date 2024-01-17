@@ -26,7 +26,7 @@ from housekeeping import start_housekeeping
 # process.
 IS_TTY = os.isatty(0)
 DELAY_THRESHOLD = 30  # Megabytes.
-SCRIPT_VERSION = "0.0.1"
+SCRIPT_VERSION = "0.0.3"
 
 env = os.environ.copy()
 
