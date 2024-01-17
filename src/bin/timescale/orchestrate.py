@@ -70,7 +70,7 @@ def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) ->
 
 
 def psql(uri: str, sql: str):
-    return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d {uri} -c " {sql} " """
+    return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "{uri}" -c " {sql} " """
 
 
 def run_sql(execute_on_target: bool, sql: str):
