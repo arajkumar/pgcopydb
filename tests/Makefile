@@ -51,6 +51,9 @@ endpos-in-multi-wal-txn: build
 timescaledb: build
 	$(MAKE) -C $@
 
+timescaledb-test-decoding: build
+	$(MAKE) -C $@
+
 build:
 	docker build $(BUILD_ARGS) -t pagila -f Dockerfile.pagila .
 

@@ -694,6 +694,8 @@ copydb_init_specs(CopyDataSpec *specs,
 			.snapshot = { 0 }
 		},
 
+		.catalog = specs->catalog,
+
 		.section = section,
 		.restoreOptions = options->restoreOptions,
 		.roles = options->roles,
@@ -724,7 +726,6 @@ copydb_init_specs(CopyDataSpec *specs,
 		.vacuumQueue = { 0 },
 		.indexQueue = { 0 },
 
-		.catalog = { 0 },
 		.tableSpecsArray = { 0, NULL }
 	};
 
