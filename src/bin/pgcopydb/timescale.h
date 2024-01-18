@@ -25,6 +25,6 @@ bool timescale_is_chunk(const char *nspname_in, const char *relname_in);
 /*
  * Checks whether to ignore the given nspname and relname.
  */
-bool timescale_allow_statement(const char *nspname_in, const char *relname_in);
+bool timescale_allow_relation(const char *nspname_in, const char *relname_in);
 
 #endif /* TIMESCALE_H */
