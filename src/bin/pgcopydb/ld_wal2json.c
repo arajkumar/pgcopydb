@@ -108,8 +108,8 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 		if (!timescale_allow_relation(nspname, relname))
 		{
 			log_warn("Filtering out message action %s for %s.%s",
-					  StreamActionToString(metadata->action),
-					  nspname, relname);
+					 StreamActionToString(metadata->action),
+					 nspname, relname);
 
 			metadata->filterOut = true;
 		}
@@ -157,8 +157,8 @@ parseWal2jsonMessage(StreamContext *privateContext,
 	char chunk_table[PG_NAMEDATALEN] = { 0 };
 	if (timescale_is_chunk(schema, table) &&
 		(metadata->action == STREAM_ACTION_INSERT ||
-		metadata->action == STREAM_ACTION_UPDATE ||
-		metadata->action == STREAM_ACTION_DELETE))
+		 metadata->action == STREAM_ACTION_UPDATE ||
+		 metadata->action == STREAM_ACTION_DELETE))
 	{
 		if (!timescale_chunk_to_hypertable(schema,
 										   table,
@@ -166,7 +166,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 										   chunk_table))
 		{
 			log_error("Failed to map chunk %s.%s to hypertable",
-					schema, table);
+					  schema, table);
 			return false;
 		}
 		schema = chunk_schema;

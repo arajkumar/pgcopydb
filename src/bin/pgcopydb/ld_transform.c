@@ -1466,7 +1466,7 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 			if (stmt->action == STREAM_ACTION_TRUNCATE)
 			{
 				log_warn("Ignore TRUNCATE on timescale chunk %s.%s",
-						  nspname, relname);
+						 nspname, relname);
 				FreeLogicalTransactionStatement(stmt);
 				return true;
 			}

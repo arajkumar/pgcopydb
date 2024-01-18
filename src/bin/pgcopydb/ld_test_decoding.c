@@ -183,8 +183,8 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 		if (!timescale_allow_relation(header.nspname, header.relname))
 		{
 			log_warn("Filtering out message action %s for %s.%s",
-					  StreamActionToString(header.action),
-					  header.nspname, header.relname);
+					 StreamActionToString(header.action),
+					 header.nspname, header.relname);
 
 			metadata->filterOut = true;
 		}
@@ -385,12 +385,12 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 		header->action != STREAM_ACTION_TRUNCATE)
 	{
 		if (!timescale_chunk_to_hypertable(header->nspname,
-					header->relname,
-					header->nspname,
-					header->relname))
+										   header->relname,
+										   header->nspname,
+										   header->relname))
 		{
 			log_error("Failed to map chunk %s.%s to hypertable",
-					header->nspname, header->relname);
+					  header->nspname, header->relname);
 			return false;
 		}
 	}
