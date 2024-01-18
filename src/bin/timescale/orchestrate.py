@@ -620,9 +620,6 @@ def migrate_existing_data_from_ts():
             "--no-acl",
             "--no-owner",
             "--drop-if-exists",
-            # enables same table concurrency by splitting tables into smaller
-            # chunks
-            "--split-tables-larger-than='10 GB'",
             "--table-jobs=8",
             "--index-jobs=8",
             "--dir",
