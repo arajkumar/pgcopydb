@@ -448,6 +448,22 @@ def migrate_existing_data_from_pg(target_type: DBType):
                                    ])
         run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_dump")
 
+    print(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+    with timeit():
+        pgdump_command = " ".join(["pg_dump",
+                                   "-d",
+                                   "$PGCOPYDB_SOURCE_PGURI",
+                                   "--format=plain",
+                                   "--quote-all-identifiers",
+                                   "--no-tablespaces",
+                                   "--no-owner",
+                                   "--no-privileges",
+                                   "--section=post-data",
+                                   "--file=$PGCOPYDB_DIR/post-data-dump.sql",
+                                   "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
+                                   ])
+        run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_dump")
+
     print("Restoring pre-data ...")
     with timeit():
         psql_command = " ".join(["psql",
@@ -495,22 +511,6 @@ Once you are done"""
     print("Copying table data ...")
     with timeit():
         run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
-
-    print(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-    with timeit():
-        pgdump_command = " ".join(["pg_dump",
-                                   "-d",
-                                   "$PGCOPYDB_SOURCE_PGURI",
-                                   "--format=plain",
-                                   "--quote-all-identifiers",
-                                   "--no-tablespaces",
-                                   "--no-owner",
-                                   "--no-privileges",
-                                   "--section=post-data",
-                                   "--file=$PGCOPYDB_DIR/post-data-dump.sql",
-                                   "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
-                                   ])
-        run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_dump")
 
     print("Restoring post-data ...")
     with timeit() as t:
