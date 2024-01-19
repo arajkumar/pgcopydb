@@ -2,7 +2,7 @@
 
 The live migration docker repository:
 
-https://hub.docker.com/r/timescaledev/live-migration
+https://hub.docker.com/r/timescale/live-migration
 
 When new commits are made to the `team-data-ingest` branch, a new image will be
 built and pushed to the `edge` tag.
@@ -19,7 +19,7 @@ To run the live-migration:
 docker run --rm -it \
   -e PGCOPYDB_SOURCE_PGURI=$SOURCE  \
   -e PGCOPYDB_TARGET_PGURI=$TARGET \
-  timescaledev/live-migration:edge
+  timescale/live-migration:edge
 ```
 
 To persist the CDC replicated files to support resuming:
@@ -29,7 +29,7 @@ docker run --rm -it \
   -e PGCOPYDB_SOURCE_PGURI=$SOURCE  \
   -e PGCOPYDB_TARGET_PGURI=$TARGET \
   -v {path/on/host}:/opt/timescale/ts_cdc
-  timescaledev/live-migration:edge
+  timescale/live-migration:edge
 ```
 
 To use with docker-compose:
@@ -78,7 +78,7 @@ services:
       start_period: 10s
       start_interval: 10s
   live:
-    image: timescaledev/live-migration:edge
+    image: timescale/live-migration:edge
     networks:
       - ts_ex_app
     environment:
@@ -92,3 +92,20 @@ services:
     volumes:
       - "/Users/adn/dev/timescale/pgcopydb/src/bin/timescale/:/opt/timescale"
 ```
+
+## Release
+
+1. Update SCRIPT_VERSION to the new version(e.g. 0.0.1).
+2. Create a [pull request (PR)](https://github.com/timescale/pgcopydb/pull/29) and ensure it is successfully merged.
+3. Create and push a release tag using the following commands:
+	```sh
+	git tag -a v0.0.1 -m "Release v0.0.1"
+	git push <remote_name> v0.0.1
+	```
+	After the release tag is pushed to the fork, [GitHub Actions](https://github.com/timescale/pgcopydb/blob/main/.github/workflows/docker-publish-ts.yml) will automatically build and publish a Docker image to the docker.io/timescale/live-migration repository.
+
+> [!IMPORTANT]
+> In case of changes to flags, environment variables, or console messages, ensure that the following are updated to reflect changes:
+> 1. Docs: live migration - https://www.timescale.com/blog/how-to-migrate-from-aws-rds-for-postgresql-to-timescale/
+> 2. Blog: AWS RDS for PostgreSQL to Timescale - https://www.timescale.com/blog/how-to-migrate-from-aws-rds-for-postgresql-to-timescale/
+> 3. Blog: PostgreSQL Database to Timescale With (Almost) Zero Downtime - https://www.timescale.com/blog/migrating-a-terabyte-scale-postgresql-database-to-timescale-with-zero-downtime/
