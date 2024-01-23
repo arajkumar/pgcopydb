@@ -370,11 +370,13 @@ SetColumnNamesAndValues(LogicalMessageTuple *tuple,
 
 			case JSONNumber:
 			{
-				double x = json_value_get_number(jsval);
+				const char *x = json_value_get_number_as_string(jsval);
 
-				valueColumn->oid = FLOAT8OID;
-				valueColumn->val.float8 = x;
+				valueColumn->oid = TEXTOID;
+				valueColumn->val.str = strdup(x);
 				valueColumn->isNull = false;
+				valueColumn->isQuoted = false;
+
 				break;
 			}
 
