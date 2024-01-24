@@ -337,7 +337,8 @@ def pgcopydb_init_env(source_type: DBType):
         env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
         env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
 
-    env["PGCOPYDB_OUTPUT_PLUGIN"] = "test_decoding"
+    if "PGCOPYDB_OUTPUT_PLUGIN" not in env:
+        env["PGCOPYDB_OUTPUT_PLUGIN"] = "wal2json"
 
     return work_dir
 
