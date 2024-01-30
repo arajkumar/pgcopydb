@@ -105,11 +105,11 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 		const char *nspname = json_object_get_string(jsobj, "schema");
 		const char *relname = json_object_get_string(jsobj, "table");
 
-		if (!timescale_allow_statement(nspname, relname))
+		if (!timescale_allow_relation(nspname, relname))
 		{
 			log_warn("Filtering out message action %s for %s.%s",
-					  StreamActionToString(metadata->action),
-					  nspname, relname);
+					 StreamActionToString(metadata->action),
+					 nspname, relname);
 
 			metadata->filterOut = true;
 		}
@@ -151,6 +151,26 @@ parseWal2jsonMessage(StreamContext *privateContext,
 				  "schema or table property: %s",
 				  message);
 		return false;
+	}
+
+	char chunk_schema[PG_NAMEDATALEN] = { 0 };
+	char chunk_table[PG_NAMEDATALEN] = { 0 };
+	if (timescale_is_chunk(schema, table) &&
+		(metadata->action == STREAM_ACTION_INSERT ||
+		 metadata->action == STREAM_ACTION_UPDATE ||
+		 metadata->action == STREAM_ACTION_DELETE))
+	{
+		if (!timescale_chunk_to_hypertable(schema,
+										   table,
+										   chunk_schema,
+										   chunk_table))
+		{
+			log_error("Failed to map chunk %s.%s to hypertable",
+					  schema, table);
+			return false;
+		}
+		schema = chunk_schema;
+		table = chunk_table;
 	}
 
 	switch (metadata->action)

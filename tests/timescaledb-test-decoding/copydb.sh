@@ -24,7 +24,7 @@ copy="\COPY rides FROM nyc_data_rides.10k.csv CSV"
 psql -d ${PGCOPYDB_SOURCE_PGURI} -1 -c "${copy}"
 
 # take a snapshot using role tsdb on source database
-coproc ( pgcopydb snapshot --follow --plugin wal2json )
+coproc ( pgcopydb snapshot --follow --plugin test_decoding )
 
 # wait for snapshot to be created
 while [ ! -f /tmp/pgcopydb/snapshot ]; do sleep 1; done
@@ -40,22 +40,12 @@ EOF
 
 psql ${PGCOPYDB_TARGET_PGURI_SU} -f /usr/src/pgcopydb/tsdb_grants.sql
 
-# copy the extensions separately, needs superuser (both on source and target)
-pg_dump -d "$PGCOPYDB_SOURCE_PGURI_SU" \
-  --format=plain \
-  --quote-all-identifiers \
-  --no-tablespaces \
-  --no-owner \
-  --no-privileges \
-  --extension='timescaledb' \
-  --exclude-schema='public' \
-  --exclude-table='_timescaledb_internal.*' \
-  --data-only \
-  --file=/tmp/ext-dump.sql
+psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
+    -c 'select public.timescaledb_pre_restore();'
+
+pgcopydb copy extensions --source ${PGCOPYDB_SOURCE_PGURI_SU} --target ${PGCOPYDB_TARGET_PGURI_SU} --resume
 
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
-    -c 'select public.timescaledb_pre_restore();' \
-    -f /tmp/ext-dump.sql \
     -f - <<'EOF'
 begin;
 select public.timescaledb_post_restore();
@@ -110,9 +100,6 @@ pgcopydb stream sentinel set endpos --current
 
 pgcopydb follow -vv --resume
 
-kill -TERM ${COPROC_PID}
-wait ${COPROC_PID}
-
 s=/tmp/fares-src.out
 t=/tmp/fares-tgt.out
 psql -o $s -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/fares.sql
@@ -120,16 +107,57 @@ psql -o $t -d ${PGCOPYDB_TARGET_PGURI} -f /usr/src/pgcopydb/fares.sql
 
 diff $s $t
 
-# check replication of numeric data without precision loss.
+# check that source chunks are truncated
 sql="select count(*) from metrics"
 test 2 -eq `psql -AtqX -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}"`
 sql="select count(*) from show_chunks('metrics')"
 test 2 -eq `psql -AtqX -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}"`
 
-# now check that the data is there and truncate is ignored.
+# now check that the truncation on target is ignored.
 sql="select count(*) from metrics"
 test 3 -eq `psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}"`
 sql="select count(*) from show_chunks('metrics')"
 test 3 -eq `psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}"`
+
+truncate_sql="delete from metrics"
+psql -d ${PGCOPYDB_SOURCE_PGURI} -c "${truncate_sql}"
+psql -d ${PGCOPYDB_TARGET_PGURI} -c "${truncate_sql}"
+
+function run_cdc() {
+    pgcopydb stream sentinel set endpos --current
+    pgcopydb follow -vv --resume
+}
+
+function diff_cdc() {
+    s=/tmp/metrics-src.out
+    t=/tmp/metrics-tgt.out
+    numeric_sql="select * from metrics order by time, id"
+    psql -o $s -d ${PGCOPYDB_SOURCE_PGURI} -c "${numeric_sql}"
+    psql -o $t -d ${PGCOPYDB_TARGET_PGURI} -c "${numeric_sql}"
+
+    diff -urN $s $t
+}
+
+# test with default replica identity i.e primary key
+for sql in `ls /usr/src/pgcopydb/tests/*/*.sql`; do
+    psql -d ${PGCOPYDB_SOURCE_PGURI} -f $sql
+    run_cdc
+    diff_cdc
+done
+
+# test with replica identity as full
+truncate_sql="delete from metrics"
+psql -d ${PGCOPYDB_SOURCE_PGURI} -c "${truncate_sql}"
+psql -d ${PGCOPYDB_TARGET_PGURI} -c "${truncate_sql}"
+
+psql -d ${PGCOPYDB_SOURCE_PGURI} -c 'ALTER TABLE metrics REPLICA IDENTITY FULL'
+for sql in `ls /usr/src/pgcopydb/tests/*/*.sql`; do
+    psql -d ${PGCOPYDB_SOURCE_PGURI} -f $sql
+    run_cdc
+    diff_cdc
+done
+
+kill -TERM ${COPROC_PID}
+wait ${COPROC_PID}
 
 pgcopydb stream cleanup

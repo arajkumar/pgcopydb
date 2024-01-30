@@ -1466,20 +1466,9 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 			if (stmt->action == STREAM_ACTION_TRUNCATE)
 			{
 				log_warn("Ignore TRUNCATE on timescale chunk %s.%s",
-						  nspname, relname);
+						 nspname, relname);
 				FreeLogicalTransactionStatement(stmt);
 				return true;
-			}
-
-			if (!timescale_chunk_to_hypertable(nspname,
-											   relname,
-											   nspname,
-											   relname))
-			{
-				log_error("Failed to map chunk %s.%s to hypertable",
-						  nspname, relname);
-				FreeLogicalTransactionStatement(stmt);
-				return false;
 			}
 		}
 	}

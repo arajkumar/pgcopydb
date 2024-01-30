@@ -302,7 +302,7 @@ def extract_lsn_and_snapshot(log_line: str):
     """
     This function takes a log_line from pgcopydb snapshot and returns a LSN and snapshot ID.
     Example:
-    11:35:31.327 40612 INFO   Created logical replication slot "switchover" with plugin "wal2json" at D2/CD013570 and exported snapshot 0000000E-0001B0E1-1
+    11:35:31.327 40612 INFO   Created logical replication slot "switchover" with plugin "test_decoding" at D2/CD013570 and exported snapshot 0000000E-0001B0E1-1
 
     Output => D2/CD013570, 0000000E-0001B0E1-1
     """
@@ -336,6 +336,9 @@ def pgcopydb_init_env(source_type: DBType):
         switch_over_dir = (work_dir / "switch_over").absolute()
         env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
         env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
+
+    if "PGCOPYDB_OUTPUT_PLUGIN" not in env:
+        env["PGCOPYDB_OUTPUT_PLUGIN"] = "wal2json"
 
     return work_dir
 
@@ -401,16 +404,22 @@ def create_snapshot_and_follow(resume: bool = False):
     # hence creation of snapshot is not needed.
     if not resume:
         print("Creating snapshot ...")
-        snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR --plugin wal2json"
+        snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR"
         snapshot_proc = Command(command=snapshot_command, use_shell=True,
                                 log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
 
         time.sleep(10)
 
-    print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc ...")
-    follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
+    print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc using {env['PGCOPYDB_OUTPUT_PLUGIN']} ...")
+
+    follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
     if resume:
-        follow_command += " --resume"
+        # CDC with test_decoding uses a snapshot to retrieve catalog tables.
+        # While resuming, we can't guarantee the availability of the initial
+        # snapshot, but using --not-consistent to create a
+        # temporary snapshot is acceptable, as it's only used for catalog access.
+        follow_command += " --resume --not-consistent"
+
     follow_proc = Command(command=follow_command, use_shell=True,
                           log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
     return (snapshot_proc, follow_proc)
@@ -624,7 +633,7 @@ def wait_for_DBs_to_sync():
 
 @telemetry_command("wait_for_LSN_to_sync")
 def wait_for_LSN_to_sync():
-    switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --plugin wal2json --slot-name switchover"
+    switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover"
     switchover_snapshot_proc = Command(command=switchover_snapshot_command, use_shell=True,
                                        log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
     switchover_snapshot_log = f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot_stderr.log"
@@ -645,7 +654,7 @@ def wait_for_LSN_to_sync():
     run_cmd(f"pgcopydb stream sentinel set endpos {end_pos_lsn}")
 
     print(f"Streaming upto {end_pos_lsn} (Last LSN) ...")
-    endpos_follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR --plugin wal2json --resume"
+    endpos_follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR --resume --not-consistent"
     endpos_follow_proc = Command(endpos_follow_command, use_shell=True,
                                  log_path=f"{env['PGCOPYDB_DIR']}/logs/endpos_follow")
 
