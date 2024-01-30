@@ -29,6 +29,7 @@ services:
       PGCOPYDB_TARGET_PGURI: postgres://tsdbadmin:own3d@target/tsdb
       PGCOPYDB_TABLE_JOBS: 4
       PGCOPYDB_INDEX_JOBS: 2
+    command: bash
     depends_on:
       - source
       - target

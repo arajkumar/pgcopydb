@@ -1011,6 +1011,7 @@ prepareUpdateTuppleArrays(StreamContext *privateContext,
 
 	int columnCount = cols->values.array[0].cols;
 	bool *pkeyArray = (bool *) calloc(columnCount, sizeof(bool));
+	bool *attrIsGeneratedArray = (bool *) calloc(columnCount, sizeof(bool));
 
 	int oldCount = 0;
 	int newCount = 0;
@@ -1027,6 +1028,7 @@ prepareUpdateTuppleArrays(StreamContext *privateContext,
 			if (streq(attributes->array[i].attname, colname))
 			{
 				pkeyArray[c] = attributes->array[i].attisprimary;
+				attrIsGeneratedArray[c] = attributes->array[i].attisgenerated;
 				found = true;
 				break;
 			}
@@ -1096,6 +1098,12 @@ prepareUpdateTuppleArrays(StreamContext *privateContext,
 					  "is %d",
 					  cols->values.count);
 			return false;
+		}
+
+		if (attrIsGeneratedArray[c])
+		{
+			log_debug("Skipping generated column %s", colname);
+			continue;
 		}
 
 		if (pkeyArray[c])

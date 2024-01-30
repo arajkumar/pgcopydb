@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS "metrics"(
     id BIGINT,
     "time" timestamp with time zone NOT NULL,
     name TEXT NOT NULL,
-    value NUMERIC NOT NULL
+    value NUMERIC NOT NULL,
+    valuegen TEXT GENERATED ALWAYS AS (md5(name)) STORED
+
 );
 
 ALTER TABLE "metrics" ADD PRIMARY KEY (id, time);
