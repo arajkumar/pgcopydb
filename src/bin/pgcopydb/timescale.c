@@ -138,7 +138,8 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 
 
 bool
-timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in, char *nspname_out,
+timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
+							  char *nspname_out,
 							  char *relname_out)
 {
 	if (!isTimescale)
@@ -219,6 +220,7 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 		}
 	}
 
+	/* Disallow caggs chunks, it will refreshed directly on the target */
 	if (timescale_is_chunk(nspname_in, relname_in))
 	{
 		/* Get hypertable name for the chunk */
@@ -227,7 +229,8 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 		if (!timescale_chunk_to_hypertable(nspname_in, relname_in, hypertable_nspname,
 										   hypertable_relname))
 		{
-			log_error("Failed to get hypertable name for chunk %s.%s", nspname_in, relname_in);
+			log_error("Failed to get hypertable name for chunk %s.%s", nspname_in,
+					  relname_in);
 			return false;
 		}
 
