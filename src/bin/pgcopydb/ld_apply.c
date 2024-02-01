@@ -34,15 +34,20 @@
 GUC applySettingsSync[] = {
 	COMMON_GUC_SETTINGS,
 	{ "synchronous_commit", "on" },
-	{ "session_replication_role", "'replica'" },
+	/* caggs invalidation triggers are normal triggers won't be called
+	 * for REPLICA session.
+	 * { "session_replication_role", "'replica'" },
+	 */
 	{ NULL, NULL },
 };
 
 GUC applySettings[] = {
 	COMMON_GUC_SETTINGS,
 	{ "synchronous_commit", "off" },
-
-	{ "session_replication_role", "'replica'" },
+	/* caggs invalidation triggers are normal triggers won't be called
+	 * for REPLICA session.
+	 * { "session_replication_role", "'replica'" },
+	 */
 	{ NULL, NULL },
 };
 

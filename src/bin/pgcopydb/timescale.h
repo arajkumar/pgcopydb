@@ -14,7 +14,7 @@ bool timescale_init(PGSQL *pgsql, char *pguri);
  * Transforms if the given nspname and relname to hypertable it targets
  * the timescale chunk.
  */
-bool timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nspname_out,
+bool timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in, char *nspname_out,
 								   char *relname_out);
 
 /*

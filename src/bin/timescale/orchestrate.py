@@ -301,26 +301,6 @@ def install_signal_handler():
     signal.signal(signal.SIGINT, handler)
     signal.signal(signal.SIGTERM, handler)
 
-def extract_lsn_and_snapshot(log_line: str):
-    """
-    This function takes a log_line from pgcopydb snapshot and returns a LSN and snapshot ID.
-    Example:
-    11:35:31.327 40612 INFO   Created logical replication slot "switchover" with plugin "test_decoding" at D2/CD013570 and exported snapshot 0000000E-0001B0E1-1
-
-    Output => D2/CD013570, 0000000E-0001B0E1-1
-    """
-    lsn_pattern = r"at\s([A-F0-9/]+)"
-    snapshot_pattern = r"snapshot\s([A-F0-9/-]+)"
-
-    lsn_match = re.search(lsn_pattern, log_line)
-    snapshot_match = re.search(snapshot_pattern, log_line)
-
-    lsn = lsn_match.group(1) if lsn_match else None
-    snapshot_id = snapshot_match.group(1) if snapshot_match else None
-
-    return lsn, snapshot_id
-
-
 def pgcopydb_init_env(source_type: DBType):
     global env
 
@@ -335,10 +315,6 @@ def pgcopydb_init_env(source_type: DBType):
             raise ValueError(f"${key} not found")
 
     env["PGCOPYDB_DIR"] = str(work_dir.absolute())
-    if source_type == DBType.TIMESCALEDB:
-        switch_over_dir = (work_dir / "switch_over").absolute()
-        env["PGCOPYDB_SWITCH_OVER_DIR"] = str(switch_over_dir)
-        env["PGCOPYDB_METADATA_DIR"] = str((switch_over_dir / "caggs_metadata").absolute())
 
     if "PGCOPYDB_OUTPUT_PLUGIN" not in env:
         env["PGCOPYDB_OUTPUT_PLUGIN"] = "wal2json"
@@ -348,9 +324,6 @@ def pgcopydb_init_env(source_type: DBType):
 def create_dirs(work_dir: Path, source_type: DBType):
     global env
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)
-    if source_type == DBType.TIMESCALEDB:
-        os.makedirs(env["PGCOPYDB_METADATA_DIR"], exist_ok=True)
-
     # This is needed because cleanup doesn't support --dir
     pgcopydb_dir = Path(tempfile.gettempdir()) / "pgcopydb"
     pgcopydb_dir.mkdir(parents=True, exist_ok=True)
@@ -381,21 +354,12 @@ def source_has_incomplete_migration():
 def is_initial_data_copy_complete():
     return os.path.exists(f"{env['PGCOPYDB_DIR']}/run/restore-post.done")
 
-def is_caggs_metadata_copy_complete():
-    return os.path.exists(f"{env['PGCOPYDB_DIR']}/run/caggs-restore-post.done")
-
-def mark_caggs_metadata_copy_complete():
-    Path(f"{env['PGCOPYDB_DIR']}/run/caggs-restore-post.done").touch()
-
 def mark_initial_data_copy_complete():
     Path(f"{env['PGCOPYDB_DIR']}/run/restore-post.done").touch()
 
 @telemetry_command("cleanup")
 def cleanup(source_type: DBType):
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
-    if source_type == DBType.TIMESCALEDB:
-        run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover")
-        shutil.rmtree(str(env["PGCOPYDB_SWITCH_OVER_DIR"]), ignore_errors=True)
 
     shutil.rmtree(str(env["PGCOPYDB_DIR"]), ignore_errors=True)
 
@@ -599,14 +563,7 @@ def migrate_existing_data_from_ts():
     with timeit():
         run_sql(execute_on_target=True,
                 sql="""
-                begin;
                 select public.timescaledb_post_restore();
-
-                -- disable all background jobs
-                select public.alter_job(job_id, scheduled => false)
-                from timescaledb_information.jobs
-                where job_id >= 1000;
-                commit;
                 """)
 
     with timeit():
@@ -667,86 +624,9 @@ def wait_for_DBs_to_sync():
             break
         time.sleep(10)
 
-@telemetry_command("wait_for_LSN_to_sync")
-def wait_for_LSN_to_sync():
-    run_sql(execute_on_target=False,
-            sql="""
-            select pg_drop_replication_slot(slot_name)
-            from pg_replication_slots
-            where slot_name='switchover';
-            """)
-
-    shutil.rmtree(str(env["PGCOPYDB_SWITCH_OVER_DIR"]), ignore_errors=True)
-    switchover_snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_SWITCH_OVER_DIR --slot-name switchover"
-    switchover_snapshot_proc = Command(command=switchover_snapshot_command, use_shell=True,
-                                       log_path=f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot")
-    switchover_snapshot_log = f"{env['PGCOPYDB_DIR']}/logs/switchover_snapshot_stderr.log"
-
-    time.sleep(10)  # Wait for snapshot to create.
-
-    end_pos_lsn = ""
-    with open(switchover_snapshot_log, 'r') as file:
-        line_count = 0
-        for line in file:
-            line_count += 1
-            if line_count == 2:
-                log_line = line.strip()
-                end_pos_lsn, _ = extract_lsn_and_snapshot(log_line)
-                break
-
-    print(f"Last LSN (Log Sequence Number) to be streamed => {end_pos_lsn}")
-    run_cmd(f"pgcopydb stream sentinel set endpos {end_pos_lsn}")
-
-    print(f"Streaming upto {end_pos_lsn} (Last LSN) ...")
-    endpos_follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR --resume --not-consistent"
-    endpos_follow_proc = Command(endpos_follow_command, use_shell=True,
-                                 log_path=f"{env['PGCOPYDB_DIR']}/logs/endpos_follow")
-
-    endpos_follow_log = f"{env['PGCOPYDB_DIR']}/logs/endpos_follow_stderr.log"
-
-    def is_endpos_streamed(log_line: str):
-        pattern_1 = r"Streamed up to write_lsn [A-F0-9/]+, flush_lsn [A-F0-9/]+, stopping"
-        pattern_2 = r"Follow mode is now done, reached replay_lsn [A-F0-9/]+ with endpos [A-F0-9/]+"
-        return bool(re.search(pattern_1, log_line)) or bool(re.search(pattern_2, log_line))
-
-    while True:
-        time.sleep(5)
-        file = open(endpos_follow_log, 'r')
-        done = False
-        for line in file:
-            if is_endpos_streamed(line.strip()):
-                print("End position LSN has been streamed successfully")
-                done = True
-                break
-        if done:
-            break
-
-    # todo: we can remove the pattern matching the log file
-    # and wait for the endpos_follow_proc to complete.
-    endpos_follow_proc.terminate_process_including_children()
-    return switchover_snapshot_proc
-
-
 @telemetry_command("copy_sequences")
 def copy_sequences():
     run_cmd("pgcopydb copy sequences --resume --not-consistent", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
-
-
-@telemetry_command("migrate_caggs_metadata")
-def migrate_caggs_metadata():
-    print(f"Dumping metadata from Source DB to {env['PGCOPYDB_METADATA_DIR']} ...")
-    metadata_pg_dump_command = f"pg_dump -d $PGCOPYDB_SOURCE_PGURI --no-owner --no-privileges --no-tablespaces --quote-all-identifiers --format d --file $PGCOPYDB_METADATA_DIR --table _timescaledb_catalog.continuous_agg*  -v --snapshot $(cat {env['PGCOPYDB_SWITCH_OVER_DIR']}/snapshot)"
-    start = time.time()
-    run_cmd(metadata_pg_dump_command, f"{env['PGCOPYDB_DIR']}/logs/pg_dump_metadata")
-    time_taken = (time.time() - start) / 60
-    print(f"Completed in {time_taken:.1f}m")
-
-    print(f"Restoring metadata from {env['PGCOPYDB_METADATA_DIR']} to Target DB ...")
-    metadata_pg_restore_command = "pg_restore -d $PGCOPYDB_TARGET_PGURI --no-owner --no-privileges --no-tablespaces --data-only --format d $PGCOPYDB_METADATA_DIR"
-    start = time.time()
-    run_cmd(metadata_pg_restore_command, f"{env['PGCOPYDB_DIR']}/logs/pg_restore_metadata")
-    time_taken = (time.time() - start) / 60
-    print(f"Completed in {time_taken:.1f}m")
 
 
 def cleanup_pid_files(work_dir: Path, source_type: DBType):
@@ -756,21 +636,6 @@ def cleanup_pid_files(work_dir: Path, source_type: DBType):
 
     (work_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
     (work_dir / "pgcopydb.pid").unlink(missing_ok=True)
-
-    if source_type == DBType.TIMESCALEDB:
-        switchover_dir = Path(env["PGCOPYDB_SWITCH_OVER_DIR"])
-        (switchover_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
-        (switchover_dir / "pgcopydb.pid").unlink(missing_ok=True)
-
-@telemetry_command("enable_caggs_policies")
-def enable_caggs_policies():
-    run_sql(execute_on_target=True,
-            sql="""
-            select public.alter_job(job_id, scheduled => true)
-            from timescaledb_information.jobs
-            where job_id >= 1000;
-            select timescaledb_post_restore();
-            """)
 
 if __name__ == "__main__":
     install_signal_handler()
@@ -854,40 +719,14 @@ if __name__ == "__main__":
 
     wait_for_DBs_to_sync()
 
-    if source_type == DBType.POSTGRES:
-        print("Stopping live-replay ...")
-        run_cmd("pgcopydb stream sentinel set endpos --current")
+    print("Stopping live-replay ...")
+    run_cmd("pgcopydb stream sentinel set endpos --current")
 
-        print("Waiting for live-replay to complete ...")
-        follow_proc.wait()
-    else:
-        print("Waiting for live-replay to stop ...")
-        follow_proc.terminate_process_including_children()
-        print("Stopped")
-
-    # At this moment, user has finished verifying data integrity. He is ready
-    # to resume the migration process and move into the switch-over phase.
-    # Note, the traffic remains halted ATM.
-
-    if source_type == DBType.TIMESCALEDB:
-        print("Syncing last LSN in Source DB to Target DB ...")
-        switchover_snapshot_proc = wait_for_LSN_to_sync()
+    print("Waiting for live-replay to complete ...")
+    follow_proc.wait()
 
     print("Copying sequences ...")
     copy_sequences()
-
-    if source_type == DBType.TIMESCALEDB:
-        if is_caggs_metadata_copy_complete():
-            print("Skipping caggs metadata migration ...")
-        else:
-            print("Migrating caggs metadata ...")
-            migrate_caggs_metadata()
-            mark_caggs_metadata_copy_complete()
-
-        switchover_snapshot_proc.terminate()
-
-        print("Enabling continuous aggregates refresh policies ...")
-        enable_caggs_policies()
 
     print("Cleaning up ...")
     cleanup(source_type)

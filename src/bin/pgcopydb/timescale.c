@@ -18,8 +18,8 @@ typedef struct ChunkHypertableMap
 static ChunkHypertableMap *chunkHypertableMap = NULL;
 
 /*
- * parseSentinel parses the result from a PostgreSQL query that fetches the
- * sentinel values for startpos, endpos, and apply.
+ * parseHypertableDetails parses the result from a PostgreSQL query that
+ * fetches the hypertable & chunk details.
  */
 static void
 parseHypertableDetails(void *ctx, PGresult *res)
@@ -138,7 +138,7 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 
 
 bool
-timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nspname_out,
+timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in, char *nspname_out,
 							  char *relname_out)
 {
 	if (!isTimescale)
@@ -216,6 +216,25 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 			{
 				return false; /* Found in denylist, so disallowed */
 			}
+		}
+	}
+
+	if (timescale_is_chunk(nspname_in, relname_in))
+	{
+		/* Get hypertable name for the chunk */
+		char hypertable_nspname[NAMEDATALEN] = { 0 };
+		char hypertable_relname[NAMEDATALEN] = { 0 };
+		if (!timescale_chunk_to_hypertable(nspname_in, relname_in, hypertable_nspname,
+										   hypertable_relname))
+		{
+			log_error("Failed to get hypertable name for chunk %s.%s", nspname_in, relname_in);
+			return false;
+		}
+
+		if (streq(hypertable_nspname, "_timescaledb_internal") &&
+			strstr(hypertable_relname, "_materialized_hypertable_"))
+		{
+			return false; /* Disallow caggs chunks */
 		}
 	}
 
