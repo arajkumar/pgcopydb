@@ -52,6 +52,36 @@ class RedactedException(Exception):
         self.redacted = redacted
 
 
+def print_logs_with_error(log_path: str = "", tail: int = 50):
+    """
+    Print error logs in the provided log_path along with tail
+    of given number of log lines at all levels.
+    """
+    proc = subprocess.run(f"cat {log_path} | grep -i 'error\|warn'",
+                                    shell=True,
+                                    env=env,
+                                    stderr=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    text=True)
+    r = str(proc.stdout)
+    if r != "":
+        print(f"\n\n---------LOGS WITH ERROR FROM '{log_path}'---------")
+        print(r)
+        print("------------------END------------------")
+
+    proc = subprocess.run(f"tail -n {tail} {log_path}",
+                                    shell=True,
+                                    env=env,
+                                    stderr=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    text=True)
+    r = str(proc.stdout)
+    if r != "":
+        print(f"\n---------LAST {tail} LOG LINES FROM '{log_path}'---------")
+        print(r)
+        print("------------------END------------------")
+
+
 def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
     stdout = subprocess.PIPE
     stderr = subprocess.PIPE
@@ -62,6 +92,8 @@ def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) ->
         stderr = open(fname_stderr, "w")
     result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
     if result.returncode != 0 and not ignore_non_zero_code:
+        if log_path != "":
+            print_logs_with_error(log_path=f"{log_path}_stderr.log")
         cmd_name = cmd.split()[0]
         raise RedactedException(
             f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}",
@@ -212,6 +244,7 @@ def telemetry_command(title):
 class Command:
     def __init__(self, command: str = "", env=env, use_shell: bool = False, log_path: str = ""):
         self.command = command
+        self.log_path = log_path
         if log_path == "":
             self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env)
         else:
@@ -229,6 +262,7 @@ class Command:
     def process_wait(self):
         self.process.wait()
         code = self.process.returncode
+        print(f"exit code for '{self.command}' was {code}")
         if code not in {-9, 0, 12}:
             # code -9 is for SIGKILL.
             # We ignore process execution that stops for SIGKILL since these are signals
@@ -239,6 +273,8 @@ class Command:
             #
             # code 12 is received when `pgcopydb follow`'s internal child processes exit due to an external signal.
             # We believe ignoring this code is safe.
+            if self.log_path != "":
+                print_logs_with_error(log_path=f"{self.log_path}_stderr.log")
             cmd_name = self.command.split()[0]
             raise RedactedException(
                 f"command '{self.command}' exited with {self.process.returncode} code stderr={self.process.stderr}",
