@@ -105,7 +105,9 @@ services:
 	After the release tag is pushed to the fork, [GitHub Actions](https://github.com/timescale/pgcopydb/blob/main/.github/workflows/docker-publish-ts.yml) will automatically build and publish a Docker image to the docker.io/timescale/live-migration repository.
 
 > [!IMPORTANT]
-> In case of changes to flags, environment variables, or console messages, ensure that the following are updated to reflect changes:
-> 1. Docs: live migration - https://www.timescale.com/blog/how-to-migrate-from-aws-rds-for-postgresql-to-timescale/
-> 2. Blog: AWS RDS for PostgreSQL to Timescale - https://www.timescale.com/blog/how-to-migrate-from-aws-rds-for-postgresql-to-timescale/
-> 3. Blog: PostgreSQL Database to Timescale With (Almost) Zero Downtime - https://www.timescale.com/blog/migrating-a-terabyte-scale-postgresql-database-to-timescale-with-zero-downtime/
+> In case of changes to version, flags, environment variables, or console messages, ensure that the following are updated to reflect changes:
+> 1. Docs: Postgres to Timescale migration - https://docs.timescale.com/migrate/latest/live-migration/live-migration-from-postgres/
+> 2. Docs: TimescaleDB to Timescale migration - https://docs.timescale.com/migrate/latest/live-migration/live-migration-from-timescaledb/
+> 3. Web Console: https://github.com/timescale/web-cloud/blob/867adad25646ded38574c0aa16fc4e4a604bd9f8/src/pages/project/service/instructions/codeExamples.ts#L65
+> 4. Blog: AWS RDS for PostgreSQL to Timescale - https://www.timescale.com/blog/how-to-migrate-from-aws-rds-for-postgresql-to-timescale/
+> 5. Blog: PostgreSQL Database to Timescale With (Almost) Zero Downtime - https://www.timescale.com/blog/migrating-a-terabyte-scale-postgresql-database-to-timescale-with-zero-downtime/
