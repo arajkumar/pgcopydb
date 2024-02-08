@@ -563,7 +563,14 @@ def migrate_existing_data_from_ts():
     with timeit():
         run_sql(execute_on_target=True,
                 sql="""
+                begin;
                 select public.timescaledb_post_restore();
+
+                -- disable all background jobs
+                select public.alter_job(job_id, scheduled => false)
+                from timescaledb_information.jobs
+                where job_id >= 1000;
+                commit;
                 """)
 
     with timeit():
@@ -628,6 +635,15 @@ def wait_for_DBs_to_sync():
 def copy_sequences():
     run_cmd("pgcopydb copy sequences --resume --not-consistent", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
 
+@telemetry_command("enable_user_background_jobs")
+def enable_user_background_jobs():
+    run_sql(execute_on_target=True,
+            sql="""
+            select public.alter_job(job_id, scheduled => true)
+            from timescaledb_information.jobs
+            where job_id >= 1000;
+            select timescaledb_post_restore();
+            """)
 
 def cleanup_pid_files(work_dir: Path, source_type: DBType):
     global env
@@ -727,6 +743,10 @@ if __name__ == "__main__":
 
     print("Copying sequences ...")
     copy_sequences()
+
+    if source_type == DBType.TIMESCALEDB:
+        print("Enabling background jobs ...")
+        enable_user_background_jobs()
 
     print("Cleaning up ...")
     cleanup(source_type)

@@ -220,26 +220,5 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 		}
 	}
 
-	/* Disallow caggs chunks, it will refreshed directly on the target */
-	if (timescale_is_chunk(nspname_in, relname_in))
-	{
-		/* Get hypertable name for the chunk */
-		char hypertable_nspname[NAMEDATALEN] = { 0 };
-		char hypertable_relname[NAMEDATALEN] = { 0 };
-		if (!timescale_chunk_to_hypertable(nspname_in, relname_in, hypertable_nspname,
-										   hypertable_relname))
-		{
-			log_error("Failed to get hypertable name for chunk %s.%s", nspname_in,
-					  relname_in);
-			return false;
-		}
-
-		if (streq(hypertable_nspname, "_timescaledb_internal") &&
-			strstr(hypertable_relname, "_materialized_hypertable_"))
-		{
-			return false; /* Disallow caggs chunks */
-		}
-	}
-
 	return true; /* Not found in denylist, allowed */
 }
