@@ -645,6 +645,30 @@ def enable_user_background_jobs():
             select timescaledb_post_restore();
             """)
 
+def get_caggs_count():
+    return int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select count(*) from timescaledb_information.continuous_aggregates;")))
+
+@telemetry_command("set_replica_identity_for_caggs")
+def set_replica_identity_for_caggs(replica_identity: str = "DEFAULT"):
+    sql = f"""
+DO \$\$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT materialization_hypertable_schema, materialization_hypertable_name
+             FROM timescaledb_information.continuous_aggregates
+    LOOP
+        EXECUTE 'ALTER TABLE ' ||
+                quote_ident(r.materialization_hypertable_schema) || '.' ||
+                quote_ident(r.materialization_hypertable_name) ||
+                ' REPLICA IDENTITY {replica_identity}';
+    END LOOP;
+END;
+\$\$;
+    """
+    run_sql(execute_on_target=False,
+            sql=sql)
+
 def cleanup_pid_files(work_dir: Path, source_type: DBType):
     global env
 
@@ -688,6 +712,10 @@ if __name__ == "__main__":
 
     skip_initial_data_copy = False
 
+    caggs_count = 0
+    if source_type == DBType.TIMESCALEDB:
+        caggs_count = get_caggs_count()
+
     if source_has_incomplete_migration():
         if is_initial_data_copy_complete():
             skip_initial_data_copy = True
@@ -722,6 +750,9 @@ if __name__ == "__main__":
         if source_type == DBType.POSTGRES:
             migrate_existing_data_from_pg(target_type)
         else:
+            if caggs_count > 0:
+                print(f"Setting replica identity to FULL for {caggs_count} caggs ...")
+                set_replica_identity_for_caggs('FULL')
             migrate_existing_data_from_ts()
 
         mark_initial_data_copy_complete()
@@ -747,6 +778,9 @@ if __name__ == "__main__":
     if source_type == DBType.TIMESCALEDB:
         print("Enabling background jobs ...")
         enable_user_background_jobs()
+        print("Setting replica identity back to DEFAULT for caggs ...")
+        if caggs_count > 0:
+            set_replica_identity_for_caggs('DEFAULT')
 
     print("Cleaning up ...")
     cleanup(source_type)
