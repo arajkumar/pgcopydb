@@ -543,36 +543,6 @@ sed -i -E \
 
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts():
-    print("Timescale pre-restore ...")
-    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
-
-    with timeit():
-        copy_extensions = " ".join([
-                "pgcopydb",
-                "copy",
-                "extensions",
-                "--dir",
-                "$PGCOPYDB_DIR/copy_extension",
-                "--snapshot",
-                "$(cat ${PGCOPYDB_DIR}/snapshot)",
-                "--restart",
-                ])
-        run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
-
-    print("Timescale post-restore ...")
-    with timeit():
-        run_sql(execute_on_target=True,
-                sql="""
-                begin;
-                select public.timescaledb_post_restore();
-
-                -- disable all background jobs
-                select public.alter_job(job_id, scheduled => false)
-                from timescaledb_information.jobs
-                where job_id >= 1000;
-                commit;
-                """)
-
     with timeit():
         print("Copying table data ...")
         clone_table_data = " ".join([
@@ -648,6 +618,89 @@ def enable_user_background_jobs():
 def get_caggs_count():
     return int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select count(*) from timescaledb_information.continuous_aggregates;")))
 
+def get_extension_config_tables():
+    sql = """
+with extconfig as (
+select e.oid, extname, extnamespace::regnamespace, extrelocatable,
+     array_length(e.extconfig, 1) as count,
+     extconfig.n,
+     extconfig.extconfig,
+     format('%I', n.nspname) as nspname,
+     format('%I', c.relname) as relname,
+     extcondition[extconfig.n],
+     c.relkind as relkind
+from pg_extension e,
+     unnest(extconfig) with ordinality as extconfig(extconfig, n)
+      left join pg_class c on c.oid = extconfig.extconfig
+      join pg_namespace n on c.relnamespace = n.oid
+where extconfig.extconfig is not null
+
+order by oid, n
+)
+
+select format('%I.%I', nspname, relname) as table_name from extconfig;
+    """
+    ext_config = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql=sql))
+    ext_config = ext_config.strip().split("\n")
+    return ext_config
+
+def copy_ext_config_tables(include_list: list, ignore_list: list, snapshot: bool = True):
+    table_options = []
+    for table in include_list:
+        table_options.append(f"--table={table}")
+
+    for table in ignore_list:
+        table_options.append(f"--exclude-table={table}")
+
+    if snapshot:
+        table_options.append("--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)")
+
+    pg_dump_cmd = " ".join([
+        "pg_dump",
+        "-d",
+        "$PGCOPYDB_SOURCE_PGURI",
+        "--format=plain",
+        "--quote-all-identifiers",
+        "--no-tablespaces",
+        "--no-owner",
+        "--no-privileges",
+        # ext config is always data only
+        "--data-only",
+        "--file=$PGCOPYDB_DIR/extension-config-dump.sql",
+    ] + table_options)
+    run_cmd(pg_dump_cmd, f"{env['PGCOPYDB_DIR']}/logs/extension_config_dump")
+
+    pre_restore_sql = """
+        select timescaledb_pre_restore();
+    """
+    post_restore_sql = """
+        begin;
+        select public.timescaledb_post_restore();
+
+        -- disable all background jobs
+        select public.alter_job(job_id, scheduled => false)
+        from timescaledb_information.jobs
+        where job_id >= 1000;
+        commit;
+    """
+    psql_cmd = " ".join([
+        "psql",
+        "-X",
+        "-d",
+        "$PGCOPYDB_TARGET_PGURI",
+        "--echo-errors",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        f'"{pre_restore_sql}"',
+        "-f",
+        "$PGCOPYDB_DIR/extension-config-dump.sql",
+        "-c",
+        f'"{post_restore_sql}"',
+    ])
+    run_cmd(psql_cmd, f"{env['PGCOPYDB_DIR']}/logs/extension_config_restore")
+
+
 @telemetry_command("set_replica_identity_for_caggs")
 def set_replica_identity_for_caggs(replica_identity: str = "DEFAULT"):
     sql = f"""
@@ -710,11 +763,8 @@ if __name__ == "__main__":
 
     work_dir = pgcopydb_init_env(source_type)
 
-    skip_initial_data_copy = False
 
-    caggs_count = 0
-    if source_type == DBType.TIMESCALEDB:
-        caggs_count = get_caggs_count()
+    skip_initial_data_copy = False
 
     if source_has_incomplete_migration():
         if is_initial_data_copy_complete():
@@ -739,6 +789,19 @@ if __name__ == "__main__":
 
     snapshot_proc, follow_proc = create_snapshot_and_follow(resume=skip_initial_data_copy)
 
+
+    caggs_count = 0
+    caggs_invalidation_logs = []
+    if source_type == DBType.TIMESCALEDB:
+        caggs_count = get_caggs_count()
+        if caggs_count > 0:
+            caggs_invalidation_logs = [
+                "_timescaledb_catalog.continuous_aggs_hypertable_invalidation_log",
+                "_timescaledb_catalog.continuous_aggs_invalidation_threshold",
+                "_timescaledb_catalog.continuous_aggs_materialization_invalidation_log",
+                "_timescaledb_catalog.continuous_aggs_watermark",
+            ]
+
     if skip_initial_data_copy:
         print("Skipping roles & initial data migration during resume ...")
     else:
@@ -746,6 +809,10 @@ if __name__ == "__main__":
         migrate_roles()
 
         print("Migrating existing data from Source DB to Target DB ...")
+
+        ext_config = get_extension_config_tables()
+        print("Copying extension config tables ...")
+        copy_ext_config_tables(ext_config, caggs_invalidation_logs)
 
         if source_type == DBType.POSTGRES:
             migrate_existing_data_from_pg(target_type)
@@ -781,6 +848,8 @@ if __name__ == "__main__":
         print("Setting replica identity back to DEFAULT for caggs ...")
         if caggs_count > 0:
             set_replica_identity_for_caggs('DEFAULT')
+            print("Copying caggs invalidation logs & watermark ...")
+            copy_ext_config_tables(caggs_invalidation_logs, [], snapshot=False)
 
     print("Cleaning up ...")
     cleanup(source_type)
