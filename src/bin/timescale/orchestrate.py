@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# This script orchestrates CDC based migration process from TimescaleDB to Timescale.
+# This script orchestrates CDC based migration process using pgcopydb.
+
 import subprocess
 import os
 import time
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 from time import perf_counter
 
 from housekeeping import start_housekeeping
+from health_check import health_checker
 
 # If the process is not running on a TTY then reading from stdin will raise and
 # exception. We read from stdin to start the switch-over phase. If it's not a
@@ -42,7 +44,7 @@ class timeit:
 
     def __exit__(self, type, value, traceback):
         self.time = perf_counter() - self.start
-        print(f"Completed in {self.time:.1f}s")
+        print(f"=> Completed in {self.time:.1f}s")
 
 class RedactedException(Exception):
     def __init__(self, err, redacted):
@@ -401,9 +403,13 @@ def create_snapshot_and_follow(resume: bool = False):
     if not resume:
         print("Creating snapshot ...")
         snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR"
-        snapshot_proc = Command(command=snapshot_command, use_shell=True,
-                                log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot")
-
+        log_path = f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot"
+        snapshot_proc = Command(command=snapshot_command, use_shell=True, log_path=log_path)
+        def is_error_func_for_snapshot(log_line: str):
+            if any(word in log_line.lower() for word in ["error", "failed"]):
+                return True
+            return False
+        health_checker.check_log_for_health("snapshot", f"{log_path}_stderr.log", is_error_func_for_snapshot)
         time.sleep(10)
 
     print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc using {env['PGCOPYDB_OUTPUT_PLUGIN']} ...")
@@ -416,8 +422,15 @@ def create_snapshot_and_follow(resume: bool = False):
         # temporary snapshot is acceptable, as it's only used for catalog access.
         follow_command += " --resume --not-consistent"
 
-    follow_proc = Command(command=follow_command, use_shell=True,
-                          log_path=f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow")
+    log_path = f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow"
+    follow_proc = Command(command=follow_command, use_shell=True, log_path=log_path)
+    def is_error_func_for_follow(log_line: str):
+        if "pgcopydb.sentinel" in log_line:
+            return False
+        if "ERROR" in log_line or "free(): double free detected" in log_line:
+            return True
+        return False
+    health_checker.check_log_for_health("follow", f"{log_path}_stderr.log", is_error_func_for_follow)
     return (snapshot_proc, follow_proc)
 
 
@@ -814,6 +827,7 @@ if __name__ == "__main__":
 
     print("Cleaning up ...")
     cleanup()
+    health_checker.stop_all()
     print("Migration successfully completed")
 
     telemetry.complete_success()
