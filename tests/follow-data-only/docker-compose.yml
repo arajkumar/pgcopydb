@@ -49,6 +49,8 @@ services:
       PGCOPYDB_INDEX_JOBS: 2
       TMPDIR: /var/run/pgcopydb
     # share TMPDIR between inject and test services
+    command:
+      - bash
     volumes:
       - ./workdir:/var/run/pgcopydb
     depends_on:

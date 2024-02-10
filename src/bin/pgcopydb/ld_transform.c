@@ -55,6 +55,83 @@ static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												LogicalTransactionStatement *new);
 
 /*
+ * stream_transform_table_with_generated_columns is an iterator callback
+ * function.
+ */
+static bool
+stream_transform_table_with_generated_columns(void *ctx, SourceTable *table)
+{
+	StreamContext *privateContext = (StreamContext *) ctx;
+	DatabaseCatalog *sourceDB = privateContext->sourceDB;
+
+	if (!catalog_s_table_fetch_attrs(sourceDB, table))
+	{
+		log_error("Failed to fetch attributes for table \"%s\".%s",
+				  table->nspname, table->relname);
+		return false;
+	}
+
+	TableWithGeneratedColumns *tableWithGeneratedColumn = (TableWithGeneratedColumns *)
+		calloc(1, sizeof(TableWithGeneratedColumns));
+	if (tableWithGeneratedColumn == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	LogicalTable *logicalTable  = &(tableWithGeneratedColumn->table);
+
+	CopyIdentifierWithoutQuotes(logicalTable->nspname, table->nspname);
+	CopyIdentifierWithoutQuotes(logicalTable->relname, table->relname);
+
+	int generatedColumnsCount = 0;
+
+	for (int i = 0; i < table->attributes.count; i++)
+	{
+		SourceTableAttribute *attr = &(table->attributes.array[i]);
+		if (attr->attisgenerated)
+		{
+			generatedColumnsCount++;
+		}
+	}
+
+	tableWithGeneratedColumn->colcount = generatedColumnsCount;
+
+	char **generatedColumns = (char **) calloc(generatedColumnsCount, sizeof(char *));
+	if (generatedColumns == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	tableWithGeneratedColumn->colnames = generatedColumns;
+
+	int j = 0;
+	for (int i = 0; i < table->attributes.count; i++)
+	{
+		SourceTableAttribute *attr = &(table->attributes.array[i]);
+		if (attr->attisgenerated)
+		{
+			generatedColumns[j] = strdup(attr->attname);
+			if (generatedColumns[j] == NULL)
+			{
+				log_error(ALLOCATION_FAILED_ERROR);
+				return false;
+			}
+
+			j++;
+		}
+	}
+
+	HASH_ADD(hh, privateContext->generatedColumns, table, sizeof(LogicalTable), tableWithGeneratedColumn);
+
+	log_info("Table \"%s\".\"%s\" has %d generated columns",
+			 table->nspname, table->relname, generatedColumnsCount);
+
+	return true;
+}
+
+/*
  * stream_transform_context_init_pgsql initializes StreamContext's
  * transformPGSQL and opens a connection to the target. This is required to use
  * PQescapeIdentifier API of libpq when escaping identifiers
@@ -78,6 +155,16 @@ stream_transform_context_init_pgsql(StreamSpecs *specs)
 	if (!pgsql_open_connection(privateContext->transformPGSQL))
 	{
 		/* errors have already been logged */
+		return false;
+	}
+
+	/* initialize tables with generated columns cache */
+	if (!catalog_iter_s_table_attisgenerated(specs->sourceDB,
+							  privateContext,
+							  &stream_transform_table_with_generated_columns))
+	{
+		log_error("Failed to prepare a generated column cache for our catalog,"
+				  "see above for details");
 		return false;
 	}
 
@@ -2597,4 +2684,18 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 
 	/* makes compiler happy */
 	return false;
+}
+
+void CopyIdentifierWithoutQuotes(char *dest, const char *src)
+{
+	size_t len = strlen(src);
+
+	if (src[0] == '"' && src[len - 1] == '"')
+	{
+		strncpy(dest, src + 1, len - 2);
+	}
+	else
+	{
+		strncpy(dest, src, len);
+	}
 }

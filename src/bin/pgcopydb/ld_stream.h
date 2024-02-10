@@ -275,6 +275,26 @@ typedef enum
 	STREAM_MODE_REPLAY          /* pgcopydb replay */
 } LogicalStreamMode;
 
+typedef struct LogicalTable
+{
+	char nspname[NAMEDATALEN];
+	char relname[NAMEDATALEN];
+} LogicalTable;
+
+/*
+ * Keep track of tables with generated columns to avoid unnecessary lookups
+ * in the catalog.
+ */
+typedef struct TableWithGeneratedColumns
+{
+	LogicalTable table;
+
+	char **colnames;             /* malloc'ed area */
+	int colcount;
+
+	UT_hash_handle hh;          /* makes this structure hashable */
+} TableWithGeneratedColumns;
+
 
 /*
  * StreamContext allows tracking the progress of the ld_stream module and is
@@ -309,6 +329,9 @@ typedef struct StreamContext
 
 	/* transform needs some catalog lookups (pkey, type oid) */
 	DatabaseCatalog *sourceDB;
+
+	/* hash table to keep track of tables with generated columns */
+	TableWithGeneratedColumns *generatedColumns;
 
 	Queue *transformQueue;
 	PGSQL *transformPGSQL;
@@ -523,6 +546,8 @@ bool parseMessageMetadata(LogicalMessageMetadata *metadata,
 						  const char *buffer,
 						  JSON_Value *json,
 						  bool skipAction);
+
+void CopyIdentifierWithoutQuotes(char *dest, const char *src);
 
 bool LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b);
 
