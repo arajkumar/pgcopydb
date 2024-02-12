@@ -39,7 +39,7 @@ static bool SetMessageRelation(JSON_Object *jsobj,
 							   PGSQL *pgsql);
 static
 bool SetColumnNamesAndValues(const LogicalMessageRelation *table,
-						     TableWithGeneratedColumns *generatedColumns,
+							 TableWithGeneratedColumns *generatedColumns,
 							 LogicalMessageTuple *tuple,
 							 const char *message,
 							 JSON_Array *jscols,
@@ -338,12 +338,11 @@ SetMessageRelation(JSON_Object *jsobj,
 
 static bool
 GetGeneratedColumns(const LogicalMessageRelation *table,
-			        TableWithGeneratedColumns *generatedColumns,
+					TableWithGeneratedColumns *generatedColumns,
 					JSON_Array *jscols,
 					bool **generatedColumnsArray,
 					int *generatedColumnsCount)
 {
-
 	log_info("GetGeneratedColumns for table!!!");
 
 	LogicalTable genTable = { 0 };
@@ -407,6 +406,7 @@ GetGeneratedColumns(const LogicalMessageRelation *table,
 
 	return true;
 }
+
 
 /*
  * SetColumnNames parses the "columns" (or "identity") JSON object from a

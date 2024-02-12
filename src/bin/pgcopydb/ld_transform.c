@@ -61,8 +61,9 @@ static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 static bool
 stream_transform_table_with_generated_columns(void *ctx, SourceTable *table)
 {
-	StreamContext *privateContext = (StreamContext *) ctx;
-	DatabaseCatalog *sourceDB = privateContext->sourceDB;
+	StreamSpecs *specs = (StreamSpecs *) ctx;
+	StreamContext *privateContext = &(specs->private);
+	DatabaseCatalog *sourceDB = specs->sourceDB;
 
 	if (!catalog_s_table_fetch_attrs(sourceDB, table))
 	{
@@ -72,14 +73,16 @@ stream_transform_table_with_generated_columns(void *ctx, SourceTable *table)
 	}
 
 	TableWithGeneratedColumns *tableWithGeneratedColumn = (TableWithGeneratedColumns *)
-		calloc(1, sizeof(TableWithGeneratedColumns));
+														  calloc(1,
+																 sizeof(
+																	 TableWithGeneratedColumns));
 	if (tableWithGeneratedColumn == NULL)
 	{
 		log_error(ALLOCATION_FAILED_ERROR);
 		return false;
 	}
 
-	LogicalTable *logicalTable  = &(tableWithGeneratedColumn->table);
+	LogicalTable *logicalTable = &(tableWithGeneratedColumn->table);
 
 	CopyIdentifierWithoutQuotes(logicalTable->nspname, table->nspname);
 	CopyIdentifierWithoutQuotes(logicalTable->relname, table->relname);
@@ -123,13 +126,21 @@ stream_transform_table_with_generated_columns(void *ctx, SourceTable *table)
 		}
 	}
 
-	HASH_ADD(hh, privateContext->generatedColumns, table, sizeof(LogicalTable), tableWithGeneratedColumn);
+	TableWithGeneratedColumns *genColHashTable = privateContext->generatedColumns;
+	HASH_ADD_KEYPTR(hh,
+					genColHashTable,
+					&(tableWithGeneratedColumn->table),
+					sizeof(LogicalTable),
+					tableWithGeneratedColumn);
+
+	privateContext->generatedColumns = genColHashTable;
 
 	log_info("Table \"%s\".\"%s\" has %d generated columns",
 			 table->nspname, table->relname, generatedColumnsCount);
 
 	return true;
 }
+
 
 /*
  * stream_transform_context_init_pgsql initializes StreamContext's
@@ -159,15 +170,6 @@ stream_transform_context_init_pgsql(StreamSpecs *specs)
 	}
 
 	/* initialize tables with generated columns cache */
-	if (!catalog_iter_s_table_attisgenerated(specs->sourceDB,
-							  privateContext,
-							  &stream_transform_table_with_generated_columns))
-	{
-		log_error("Failed to prepare a generated column cache for our catalog,"
-				  "see above for details");
-		return false;
-	}
-
 	return true;
 }
 
@@ -752,6 +754,16 @@ stream_transform_from_queue(StreamSpecs *specs)
 	if (!stream_transform_context_init_pgsql(specs))
 	{
 		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_iter_s_table_attisgenerated(sourceDB,
+											 specs,
+											 &
+											 stream_transform_table_with_generated_columns))
+	{
+		log_error("Failed to prepare a generated column cache for our catalog,"
+				  "see above for details");
 		return false;
 	}
 
@@ -2686,7 +2698,9 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 	return false;
 }
 
-void CopyIdentifierWithoutQuotes(char *dest, const char *src)
+
+void
+CopyIdentifierWithoutQuotes(char *dest, const char *src)
 {
 	size_t len = strlen(src);
 

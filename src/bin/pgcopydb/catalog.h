@@ -200,8 +200,8 @@ bool catalog_iter_s_table_nopk(DatabaseCatalog *catalog,
 							   SourceTableIterFun *callback);
 
 bool catalog_iter_s_table_attisgenerated(DatabaseCatalog *catalog,
-							   void *context,
-							   SourceTableIterFun *callback);
+										 void *context,
+										 SourceTableIterFun *callback);
 
 typedef struct SourceTableIterator
 {
