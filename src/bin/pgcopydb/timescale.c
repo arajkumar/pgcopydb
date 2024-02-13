@@ -18,8 +18,8 @@ typedef struct ChunkHypertableMap
 static ChunkHypertableMap *chunkHypertableMap = NULL;
 
 /*
- * parseSentinel parses the result from a PostgreSQL query that fetches the
- * sentinel values for startpos, endpos, and apply.
+ * parseHypertableDetails parses the result from a PostgreSQL query that
+ * fetches the hypertable & chunk details.
  */
 static void
 parseHypertableDetails(void *ctx, PGresult *res)
@@ -138,7 +138,8 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 
 
 bool
-timescale_chunk_to_hypertable(char *nspname_in, char *relname_in, char *nspname_out,
+timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
+							  char *nspname_out,
 							  char *relname_out)
 {
 	if (!isTimescale)
