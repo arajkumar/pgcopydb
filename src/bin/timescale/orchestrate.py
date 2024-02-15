@@ -263,7 +263,6 @@ class Command:
     def process_wait(self):
         self.process.wait()
         code = self.process.returncode
-        print(f"exit code for '{self.command}' was {code}")
         if code not in {-9, 0, 12}:
             # code -9 is for SIGKILL.
             # We ignore process execution that stops for SIGKILL since these are signals
