@@ -38,6 +38,7 @@ static CommandLine dump_schema_command =
 		"  --source          Postgres URI to the source database\n"
 		"  --target          Directory where to save the dump files\n"
 		"  --dir             Work directory to use\n"
+		"  --skip-extensions Skip restoring extensions\n" \
 		"  --snapshot        Use snapshot obtained with pg_export_snapshot\n",
 		cli_dump_schema_getopts,
 		cli_dump_schema);
@@ -50,6 +51,7 @@ static CommandLine dump_schema_pre_data_command =
 		"  --source          Postgres URI to the source database\n"
 		"  --target          Directory where to save the dump files\n"
 		"  --dir             Work directory to use\n"
+		"  --skip-extensions Skip restoring extensions\n" \
 		"  --snapshot        Use snapshot obtained with pg_export_snapshot\n",
 		cli_dump_schema_getopts,
 		cli_dump_schema_pre_data);
@@ -109,6 +111,7 @@ cli_dump_schema_getopts(int argc, char **argv)
 		{ "no-role-passwords", no_argument, NULL, 'P' },
 		{ "restart", no_argument, NULL, 'r' },
 		{ "resume", no_argument, NULL, 'R' },
+		{ "skip-extensions", no_argument, NULL, 'e' },
 		{ "not-consistent", no_argument, NULL, 'C' },
 		{ "snapshot", required_argument, NULL, 'N' },
 		{ "version", no_argument, NULL, 'V' },
@@ -186,6 +189,13 @@ cli_dump_schema_getopts(int argc, char **argv)
 			{
 				options.resume = true;
 				log_trace("--resume");
+				break;
+			}
+
+			case 'e':
+			{
+				options.skipExtensions = true;
+				log_trace("--skip-extensions");
 				break;
 			}
 
@@ -410,6 +420,20 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	/*
+	 * Prepare our internal catalogs for storing the source database catalog
+	 * query results.
+	 */
+	copySpecs.section = DATA_SECTION_ALL;
+
+	if (!copydb_fetch_schema_and_prepare_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_SOURCE);
+	}
+
+	copySpecs.section = DATA_SECTION_NONE;
 
 	if (section == PG_DUMP_SECTION_ROLES)
 	{
