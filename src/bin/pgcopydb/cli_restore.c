@@ -613,6 +613,31 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 		}
 	}
 
+	/*
+	 * First, we need to open a snapshot that we're going to re-use in all our
+	 * connections to the source database. When the --snapshot option has been
+	 * used, instead of exporting a new snapshot, we can just re-use it.
+	 */
+	if (!copydb_prepare_snapshot(copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * Prepare our internal catalogs for storing the source database catalog
+	 * query results.
+	 */
+	copySpecs->section = DATA_SECTION_ALL;
+
+	if (!copydb_fetch_schema_and_prepare_specs(copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_TARGET);
+	}
+
+	copySpecs->section = DATA_SECTION_NONE;
+
 	log_info("Using pg_restore for Postgres \"%s\" at \"%s\"",
 			 pgPaths->pg_version,
 			 pgPaths->pg_restore);
