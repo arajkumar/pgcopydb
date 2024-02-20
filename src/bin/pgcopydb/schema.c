@@ -787,9 +787,12 @@ schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 {
 	log_trace("schema_prepare_pgcopydb_table_size");
 
+	SourceFilterType filterType = SOURCE_FILTER_TYPE_NONE;
+
 	switch (filters->type)
 	{
 		case SOURCE_FILTER_TYPE_NONE:
+		case SOURCE_FILTER_TYPE_EXCL_INDEX:
 		{
 			/* skip filters preparing (temp tables) */
 			break;
@@ -806,10 +809,18 @@ schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 						  "see above for details");
 				return false;
 			}
+
+			filterType = filters->type;
+
 			break;
 		}
 
-		/* SOURCE_FILTER_TYPE_EXCL_INDEX etc */
+		/* ignore "exclude-index" here */
+		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
+		{
+			return true;
+		}
+
 		default:
 		{
 			log_error("BUG: schema_list_ordinary_tables called with "
@@ -879,14 +890,14 @@ schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 		appendPQExpBuffer(sql,
 						  "create table if not exists pgcopydb.%s as %s",
 						  tablename,
-						  listSourceTableSizeSQL[filters->type].sql);
+						  listSourceTableSizeSQL[filterType].sql);
 	}
 	else
 	{
 		appendPQExpBuffer(sql,
 						  "create temp table %s  on commit drop as %s",
 						  tablename,
-						  listSourceTableSizeSQL[filters->type].sql);
+						  listSourceTableSizeSQL[filterType].sql);
 	}
 
 	if (PQExpBufferBroken(sql))
@@ -1071,7 +1082,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"					 	  left join information_schema.columns col "
         "                    			on col.column_name = a.attname "
 		"					  			and col.table_name = c.relname "
-		"          			 			and col.table_schema = n.nspname "	
+		"          			 			and col.table_schema = n.nspname "
 		"                   where a.attrelid = c.oid and not a.attisdropped "
 		"                     and a.attnum > 0 "
 		"                order by attnum "
@@ -1265,7 +1276,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"					 	  left join information_schema.columns col "
         "                    			on col.column_name = a.attname "
 		"					  			and col.table_name = c.relname "
-		"          			 			and col.table_schema = n.nspname "	
+		"          			 			and col.table_schema = n.nspname "
 		"                   where a.attrelid = c.oid and not a.attisdropped "
 		"                     and a.attnum > 0 "
 		"                order by attnum "
@@ -1358,7 +1369,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"					 	  left join information_schema.columns col "
         "                    			on col.column_name = a.attname "
 		"					  			and col.table_name = c.relname "
-		"          			 			and col.table_schema = n.nspname "	
+		"          			 			and col.table_schema = n.nspname "
 		"                   where a.attrelid = c.oid and not a.attisdropped "
 		"                     and a.attnum > 0 "
 		"                order by attnum "
@@ -1433,9 +1444,12 @@ schema_list_ordinary_tables(PGSQL *pgsql,
 
 	log_trace("schema_list_ordinary_tables");
 
+	SourceFilterType filterType = SOURCE_FILTER_TYPE_NONE;
+
 	switch (filters->type)
 	{
 		case SOURCE_FILTER_TYPE_NONE:
+		case SOURCE_FILTER_TYPE_EXCL_INDEX:
 		{
 			/* skip filters preparing (temp tables) */
 			break;
@@ -1452,10 +1466,18 @@ schema_list_ordinary_tables(PGSQL *pgsql,
 						  "see above for details");
 				return false;
 			}
+
+			filterType = filters->type;
+
 			break;
 		}
 
-		/* SOURCE_FILTER_TYPE_EXCL_INDEX etc */
+		/* ignore "exclude-index" listing of filtered-out tables */
+		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
+		{
+			return true;
+		}
+
 		default:
 		{
 			log_error("BUG: schema_list_ordinary_tables called with "
@@ -1465,9 +1487,9 @@ schema_list_ordinary_tables(PGSQL *pgsql,
 		}
 	}
 
-	log_debug("listSourceTablesSQL[%s]", filterTypeToString(filters->type));
+	log_debug("listSourceTablesSQL[%s]", filterTypeToString(filterType));
 
-	char *sql = listSourceTablesSQL[filters->type].sql;
+	char *sql = listSourceTablesSQL[filterType].sql;
 
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 								   &context, &getTableArray))
@@ -1785,9 +1807,12 @@ schema_list_ordinary_tables_without_pk(PGSQL *pgsql,
 
 	log_trace("schema_list_ordinary_tables_without_pk");
 
+	SourceFilterType filterType = SOURCE_FILTER_TYPE_NONE;
+
 	switch (filters->type)
 	{
 		case SOURCE_FILTER_TYPE_NONE:
+		case SOURCE_FILTER_TYPE_EXCL_INDEX:
 		{
 			/* skip filters preparing (temp tables) */
 			break;
@@ -1804,10 +1829,18 @@ schema_list_ordinary_tables_without_pk(PGSQL *pgsql,
 						  "see above for details");
 				return false;
 			}
+
+			filterType = filters->type;
+
 			break;
 		}
 
-		/* SOURCE_FILTER_TYPE_EXCL_INDEX etc */
+		/* ignore "exclude-index" listing of filtered-out tables */
+		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
+		{
+			return true;
+		}
+
 		default:
 		{
 			log_error("BUG: schema_list_ordinary_tables_without_pk called with "
@@ -1817,9 +1850,9 @@ schema_list_ordinary_tables_without_pk(PGSQL *pgsql,
 		}
 	}
 
-	log_debug("listSourceTablesNoPKSQL[%s]", filterTypeToString(filters->type));
+	log_debug("listSourceTablesNoPKSQL[%s]", filterTypeToString(filterType));
 
-	char *sql = listSourceTablesNoPKSQL[filters->type].sql;
+	char *sql = listSourceTablesNoPKSQL[filterType].sql;
 
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 								   &context, &getTableArray))
@@ -2235,9 +2268,12 @@ schema_list_sequences(PGSQL *pgsql,
 
 	log_trace("schema_list_sequences");
 
+	SourceFilterType filterType = SOURCE_FILTER_TYPE_NONE;
+
 	switch (filters->type)
 	{
 		case SOURCE_FILTER_TYPE_NONE:
+		case SOURCE_FILTER_TYPE_EXCL_INDEX:
 		{
 			/* skip filters preparing (temp tables) */
 			break;
@@ -2254,10 +2290,18 @@ schema_list_sequences(PGSQL *pgsql,
 						  "see above for details");
 				return false;
 			}
+
+			filterType = filters->type;
+
 			break;
 		}
 
-		/* SOURCE_FILTER_TYPE_EXCL_INDEX etc */
+		/* ignore "exclude-index" listing of filtered-out tables */
+		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
+		{
+			return true;
+		}
+
 		default:
 		{
 			log_error("BUG: schema_list_sequences called with "
@@ -2267,9 +2311,9 @@ schema_list_sequences(PGSQL *pgsql,
 		}
 	}
 
-	log_debug("listSourceSequencesSQL[%s]", filterTypeToString(filters->type));
+	log_debug("listSourceSequencesSQL[%s]", filterTypeToString(filterType));
 
-	char *sql = listSourceSequencesSQL[filters->type].sql;
+	char *sql = listSourceSequencesSQL[filterType].sql;
 
 	/*
 	 * A single sequence can be attached to more than one table, and it could
@@ -3162,6 +3206,13 @@ schema_list_pg_depend(PGSQL *pgsql,
 
 	switch (filters->type)
 	{
+		case SOURCE_FILTER_TYPE_NONE:
+		case SOURCE_FILTER_TYPE_EXCL_INDEX:
+		{
+			/* skip pg_depend computing entirely */
+			return true;
+		}
+
 		case SOURCE_FILTER_TYPE_INCL:
 		case SOURCE_FILTER_TYPE_EXCL:
 		case SOURCE_FILTER_TYPE_LIST_NOT_INCL:
@@ -3176,10 +3227,15 @@ schema_list_pg_depend(PGSQL *pgsql,
 			break;
 		}
 
-		/* SOURCE_FILTER_TYPE_EXCL_INDEX etc */
+		/* ignore "exclude-index" listing of filtered-out tables */
+		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
+		{
+			return true;
+		}
+
 		default:
 		{
-			log_error("BUG: schema_list_ordinary_tables called with "
+			log_error("BUG: schema_list_pg_depend called with "
 					  "filtering type %d",
 					  filters->type);
 			return false;
