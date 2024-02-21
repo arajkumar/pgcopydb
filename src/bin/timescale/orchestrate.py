@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # This script orchestrates CDC based migration process using pgcopydb.
 
+import argparse
 import subprocess
 import os
 import time
@@ -9,7 +10,6 @@ import sys
 import shutil
 import tempfile
 import threading
-import queue
 import uuid
 import json
 
@@ -111,7 +111,7 @@ def run_sql(execute_on_target: bool, sql: str):
     dest = "$PGCOPYDB_SOURCE_PGURI"
     if execute_on_target:
         dest = "$PGCOPYDB_TARGET_PGURI"
-    run_cmd(psql(dest, sql))
+    return run_cmd(psql(dest, sql))
 
 
 class TelemetryDBStats:
@@ -257,7 +257,9 @@ class Command:
             f_stderr = open(fname_stderr, "w")
 
             self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env,
-                                            stdout=f_stdout, stderr=f_stderr)
+                                            stdout=f_stdout, stderr=f_stderr,
+                                            universal_newlines=True,
+                                            bufsize=1)
         self.wait_thread = threading.Thread(target=self.process_wait)
         self.wait_thread.start()
 
@@ -294,7 +296,7 @@ class Command:
         self.process.kill()
 
 
-def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
+def wait_for_keypress(event: threading.Event, key: str):
     """
     waits for the 'key' to be pressed. It returns a keypress_event queue
     that becomes non-empty when the required 'key' is pressed (and ENTER).
@@ -305,52 +307,31 @@ def wait_for_keypress(notify_queue, key: str) -> queue.Queue:
             k = input()
             if k.lower() == key.lower():
                 print(f'Received key press event: "{key}"')
-                notify_queue.put(1)
-                notify_queue.task_done()
-                return
+                event.set()
+                break
+
     key_event = threading.Thread(target=key_e)
+    # we don't want the key_event thread to block the program from exiting.
+    key_event.daemon = True
     key_event.start()
 
 
-def wait_for_sigusr1(notify_queue) -> queue.Queue:
-
+def wait_for_sigusr1(event: threading.Event):
     def handler(signum, frame):
-        print("Received signal")
-        notify_queue.put(1)
-        notify_queue.task_done()
+        print("Received signal: SIGUSR1")
+        event.set()
     signal.signal(signal.SIGUSR1, handler)
 
 
-def install_signal_handler():
-    def handler(signum, frame):
-        print("Received signal")
-        run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
-        # 130 is the exit code for SIGINT
-        # https://tldp.org/LDP/abs/html/exitcodes.html
-        sys.exit(130)
-
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
-
-def pgcopydb_init_env(source_type: DBType):
+def pgcopydb_init_env(args):
     global env
-
-    work_dir = os.getenv("PGCOPYDB_DIR")
-    if work_dir is not None:
-        work_dir = Path(work_dir)
-    else:
-        work_dir = Path(tempfile.gettempdir()) / "pgcopydb"
 
     for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
         if key not in env or env[key] == "" or env[key] is None:
             raise ValueError(f"${key} not found")
 
-    env["PGCOPYDB_DIR"] = str(work_dir.absolute())
-
-    if "PGCOPYDB_OUTPUT_PLUGIN" not in env:
-        env["PGCOPYDB_OUTPUT_PLUGIN"] = "wal2json"
-
-    return work_dir
+    if args.dir:
+        env["PGCOPYDB_DIR"] = str(args.dir.absolute())
 
 def create_dirs(work_dir: Path):
     global env
@@ -377,44 +358,46 @@ def check_timescaledb_version():
     if source_ts_version != target_ts_version:
         raise ValueError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
 
-def source_has_incomplete_migration():
-    r = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI",
-                sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb');"))
+def replication_origin_exists():
+    r = run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI",
+                sql="select exists(select * from pg_replication_origin where roname='pgcopydb')"))
     return r == "t\n"
 
-def is_initial_data_copy_complete():
-    return os.path.exists(f"{env['PGCOPYDB_DIR']}/run/restore-post.done")
+def is_snapshot_valid():
+    try:
+        run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="""
+                     BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+                     SET TRANSACTION SNAPSHOT '$(cat $PGCOPYDB_DIR/snapshot)';
+                     SELECT 1;
+                     ROLLBACK;
+                     """))
+        return True
+    except:
+        return False
 
-def mark_initial_data_copy_complete():
-    Path(f"{env['PGCOPYDB_DIR']}/run/restore-post.done").touch()
+def is_section_migration_complete(section):
+    return os.path.exists(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done")
+
+def mark_section_complete(section):
+    Path(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done").touch()
 
 @telemetry_command("cleanup")
-def cleanup():
-    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR --slot-name pgcopydb")
+def cleanup(args):
+    print("Cleaning up ...")
+    run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
+    print("Done")
 
-    shutil.rmtree(str(env["PGCOPYDB_DIR"]), ignore_errors=True)
+    if args.prune:
+        dir = str(args.dir.absolute())
+        print(f"Pruning {dir}...")
+        shutil.rmtree(dir, ignore_errors=True)
+        print("Done")
 
+@telemetry_command("create_follow")
+def create_follow(resume: bool = False):
+    print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}...")
 
-@telemetry_command("create_snapshot_and_follow")
-def create_snapshot_and_follow(resume: bool = False):
-    snapshot_proc = None
-    # Previous run would have already completed the initial data copy
-    # hence creation of snapshot is not needed.
-    if not resume:
-        print("Creating snapshot ...")
-        snapshot_command = "pgcopydb snapshot --follow --dir $PGCOPYDB_DIR"
-        log_path = f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_snapshot"
-        snapshot_proc = Command(command=snapshot_command, use_shell=True, log_path=log_path)
-        def is_error_func_for_snapshot(log_line: str):
-            if any(word in log_line.lower() for word in ["error", "failed"]):
-                return True
-            return False
-        health_checker.check_log_for_health("snapshot", f"{log_path}_stderr.log", is_error_func_for_snapshot)
-        time.sleep(10)
-
-    print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}/cdc using {env['PGCOPYDB_OUTPUT_PLUGIN']} ...")
-
-    follow_command = f"pgcopydb follow --dir $PGCOPYDB_DIR --snapshot $(cat {env['PGCOPYDB_DIR']}/snapshot)"
+    follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR"
     if resume:
         # CDC with test_decoding uses a snapshot to retrieve catalog tables.
         # While resuming, we can't guarantee the availability of the initial
@@ -431,7 +414,8 @@ def create_snapshot_and_follow(resume: bool = False):
             return True
         return False
     health_checker.check_log_for_health("follow", f"{log_path}_stderr.log", is_error_func_for_follow)
-    return (snapshot_proc, follow_proc)
+
+    return follow_proc
 
 
 def dbname_from_uri(uri: str) -> str:
@@ -448,108 +432,176 @@ def dbname_from_uri(uri: str) -> str:
         return result.path[1:]
 
 
-@telemetry_command("migrate_existing_data_from_pg")
-def migrate_existing_data_from_pg(target_type: DBType):
-    print(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-    with timeit():
-        pgdump_command = " ".join(["pg_dump",
-                                   "-d",
-                                   "$PGCOPYDB_SOURCE_PGURI",
-                                   "--format=plain",
-                                   "--quote-all-identifiers",
-                                   "--no-tablespaces",
-                                   "--no-owner",
-                                   "--no-privileges",
-                                   "--section=pre-data",
-                                   "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
-                                   "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
-                                   ])
-        run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_dump")
-
-    print(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-    with timeit():
-        pgdump_command = " ".join(["pg_dump",
-                                   "-d",
-                                   "$PGCOPYDB_SOURCE_PGURI",
-                                   "--format=plain",
-                                   "--quote-all-identifiers",
-                                   "--no-tablespaces",
-                                   "--no-owner",
-                                   "--no-privileges",
-                                   "--section=post-data",
-                                   "--file=$PGCOPYDB_DIR/post-data-dump.sql",
-                                   "--snapshot=$(cat ${PGCOPYDB_DIR}/snapshot)",
-                                   ])
-        run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_dump")
-
-    print("Restoring pre-data ...")
-    with timeit():
-        log_path = f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore"
-        psql_command = " ".join(["psql",
-                                 "-X",
-                                 "-d",
-                                 "$PGCOPYDB_TARGET_PGURI",
-                                 "--echo-errors",
-                                 "-v",
-                                 "ON_ERROR_STOP=0",
-                                 "-f",
-                                 "$PGCOPYDB_DIR/pre-data-dump.sql",
-                                 ])
-        run_cmd(psql_command, log_path)
-        print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
-
-    if target_type == DBType.TIMESCALEDB:
-        create_hypertable_message = """Now, let's transform your regular tables into hypertables.
+def show_hypertable_creation_prompt():
+    create_hypertable_message = """Now, let's transform your regular tables into hypertables.
 
 Execute the following command for each table you want to convert on the target DB:
-    `SELECT create_hypertable('<table name>', '<time column name>', chunk_time_interval => INTERVAL '<chunk interval>');`
+`SELECT create_hypertable('<table name>', '<time column name>', chunk_time_interval => INTERVAL '<chunk interval>');`
 
-    Refer to https://docs.timescale.com/use-timescale/latest/hypertables/create/#create-hypertables for more details.
+Refer to https://docs.timescale.com/use-timescale/latest/hypertables/create/#create-hypertables for more details.
 
 Once you are done"""
-        key_event_queue = queue.Queue(maxsize=1)
-        wait_for_sigusr1(key_event_queue)
-        if IS_TTY:
-            wait_for_keypress(key_event_queue, key="c")
-        if not IS_TTY and LIVE_MIGRATION_DOCKER:
-            print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>' to continue")
-        elif not IS_TTY:
-            print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}' to continue")
-        else:
-            print(f"{create_hypertable_message}, press 'c' (and ENTER) to continue")
-        key_event_queue.get()
+    event = wait_for_event("c")
+    if not IS_TTY and LIVE_MIGRATION_DOCKER:
+        print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'docker kill --s=SIGUSR1 <container_name>' to continue")
+    elif not IS_TTY:
+        print(f"{create_hypertable_message}, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}' to continue")
+    else:
+        print(f"{create_hypertable_message}, press 'c' (and ENTER) to continue")
+    event.wait()
 
-    copy_table_data = " ".join(["pgcopydb",
-                             "copy",
-                             "table-data",
-                             "--snapshot",
-                             "$(cat ${PGCOPYDB_DIR}/snapshot)",
-                             "--table-jobs",
-                             "8",
-                             "--split-tables-larger-than='10 GB'",
-                             "--restart",
-                             "--dir",
-                             "$PGCOPYDB_DIR/copy_table_data",
-                             ])
-    print("Copying table data ...")
-    with timeit():
-        run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
 
-    print("Restoring post-data ...")
-    with timeit():
-        log_path = f"{env['PGCOPYDB_DIR']}/logs/post_data_restore"
-        psql_command = " ".join(["psql",
-                                 "-X",
-                                 "-d",
-                                 "$PGCOPYDB_TARGET_PGURI",
-                                 "--echo-errors",
-                                 "-v",
-                                 "ON_ERROR_STOP=0",
-                                 "-f",
-                                 "$PGCOPYDB_DIR/post-data-dump.sql",
+@telemetry_command("migrate_existing_data_from_pg")
+def migrate_existing_data_from_pg(target_type: DBType):
+    # TODO: Switch to the following simplified commands once we
+    # figure out how to deal with incompatible indexes.
+    # pgcopydb dump schema
+    # pgcopydb restore pre-data --skip-extensions --no-acl --no-owner
+    # <-- create hypertables -->
+    # pgcopydb clone --skip-extensions --no-acl --no-owner
+    if not is_section_migration_complete("pre-data-dump"):
+        print(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+        with timeit():
+            pgdump_command = " ".join(["pg_dump",
+                                       "-d",
+                                       "$PGCOPYDB_SOURCE_PGURI",
+                                       "--format=plain",
+                                       "--quote-all-identifiers",
+                                       "--no-tablespaces",
+                                       "--no-owner",
+                                       "--no-privileges",
+                                       "--section=pre-data",
+                                       "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
+                                       ])
+            run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_dump")
+        mark_section_complete("pre-data-dump")
+
+    if not is_section_migration_complete("post-data-dump"):
+        print(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+        with timeit():
+            pgdump_command = " ".join(["pg_dump",
+                                       "-d",
+                                       "$PGCOPYDB_SOURCE_PGURI",
+                                       "--format=plain",
+                                       "--quote-all-identifiers",
+                                       "--no-tablespaces",
+                                       "--no-owner",
+                                       "--no-privileges",
+                                       "--section=post-data",
+                                       "--file=$PGCOPYDB_DIR/post-data-dump.sql",
+                                       ])
+            run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_dump")
+        mark_section_complete("post-data-dump")
+
+    if not is_section_migration_complete("pre-data-restore"):
+        print("Restoring pre-data ...")
+        with timeit():
+            log_path = f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore"
+            psql_command = " ".join(["psql",
+                                     "-X",
+                                     "-d",
+                                     "$PGCOPYDB_TARGET_PGURI",
+                                     "--echo-errors",
+                                     "-v",
+                                     "ON_ERROR_STOP=0",
+                                     "-f",
+                                     "$PGCOPYDB_DIR/pre-data-dump.sql",
+                                     ])
+            run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore")
+            print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
+        mark_section_complete("pre-data-restore")
+
+    if (target_type == DBType.TIMESCALEDB and
+        not is_section_migration_complete("hypertable-creation")):
+        show_hypertable_creation_prompt()
+        mark_section_complete("hypertable-creation")
+
+    if not is_section_migration_complete("copy-table-data"):
+        print("Copying table data ...")
+        copy_table_data = " ".join(["pgcopydb",
+                                 "copy",
+                                 "table-data",
+                                 "--table-jobs",
+                                 "8",
+                                 "--split-tables-larger-than='1 GB'",
+                                 "--notice",
+                                 "--dir",
+                                 "$PGCOPYDB_DIR/copy_table_data",
+                                 "--snapshot",
+                                 "$(cat $PGCOPYDB_DIR/snapshot)",
                                  ])
-        run_cmd(psql_command, log_path)
-        print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
+        with timeit():
+            run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
+        mark_section_complete("copy-table-data")
+
+    if not is_section_migration_complete("post-data-restore"):
+        print("Restoring post-data ...")
+        with timeit():
+            log_path = f"{env['PGCOPYDB_DIR']}/logs/post_data_restore"
+            psql_command = " ".join(["psql",
+                                     "-X",
+                                     "-d",
+                                     "$PGCOPYDB_TARGET_PGURI",
+                                     "--echo-errors",
+                                     "-v",
+                                     "ON_ERROR_STOP=0",
+                                     "-f",
+                                     "$PGCOPYDB_DIR/post-data-dump.sql",
+                                     ])
+            run_cmd(psql_command, log_path)
+            print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
+        mark_section_complete("post-data-restore")
+
+
+    if not is_section_migration_complete("analyze-db"):
+        print("Perform ANALYZE on target DB tables ...")
+        with timeit():
+            vaccumdb_command = " ".join(["vacuumdb",
+                                        # There won't be anything to
+                                        # vacuum after a fresh restore.
+                                        "--analyze-only",
+                                        "--analyze-in-stages",
+                                        "--echo",
+                                        "--dbname",
+                                        "$PGCOPYDB_TARGET_PGURI",
+                                        "--jobs",
+                                        "8",
+                                        ])
+            run_cmd(vaccumdb_command, f"{env['PGCOPYDB_DIR']}/logs/analyze_db")
+        mark_section_complete("analyze-db")
+
+@telemetry_command("migrate_extensions")
+def migrate_extensions(target_type):
+    if target_type == DBType.TIMESCALEDB:
+        print("Timescale pre-restore ...")
+        run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
+
+    print("Copy extension config tables ...")
+    with timeit():
+        copy_extensions = " ".join([
+            "pgcopydb",
+            "copy",
+            "extensions",
+            "--dir",
+            "$PGCOPYDB_DIR/copy_extensions",
+            "--snapshot",
+            "$(cat $PGCOPYDB_DIR/snapshot)",
+            "--resume",
+            ])
+        run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
+
+    if target_type == DBType.TIMESCALEDB:
+        print("Timescale post-restore ...")
+        run_sql(execute_on_target=True,
+                sql="""
+                begin;
+                select public.timescaledb_post_restore();
+                -- disable all background jobs
+                select public.alter_job(job_id, scheduled => false)
+                from timescaledb_information.jobs
+                where job_id >= 1000;
+                commit;
+                """)
 
 @telemetry_command("migrate_roles")
 def migrate_roles():
@@ -606,93 +658,56 @@ sed -i -E \
 
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts():
-    print("Timescale pre-restore ...")
-    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
-
-    with timeit():
-        copy_extensions = " ".join([
-                "pgcopydb",
-                "copy",
-                "extensions",
-                "--dir",
-                "$PGCOPYDB_DIR/copy_extension",
-                "--snapshot",
-                "$(cat ${PGCOPYDB_DIR}/snapshot)",
-                "--restart",
-                ])
-        run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
-
-    print("Timescale post-restore ...")
-    run_sql(execute_on_target=True,
-            sql="""
-            begin;
-            select public.timescaledb_post_restore();
-
-            -- disable all background jobs
-            select public.alter_job(job_id, scheduled => false)
-            from timescaledb_information.jobs
-            where job_id >= 1000;
-            commit;
-            """)
-
     print("Copying table data ...")
     clone_table_data = " ".join([
         "pgcopydb",
         "clone",
         "--skip-extensions",
-        # todo: remove this once we remove explit vacuum calls
-        "--skip-vacuum",
         "--no-acl",
         "--no-owner",
-        "--drop-if-exists",
         "--table-jobs=8",
         "--index-jobs=8",
-        "--split-tables-larger-than='10 GB'",
+        "--split-tables-larger-than='1 GB'",
         "--dir",
         "$PGCOPYDB_DIR/pgcopydb_clone",
-        "--restart",
         "--snapshot",
-        "$(cat ${PGCOPYDB_DIR}/snapshot)",
+        "$(cat $PGCOPYDB_DIR/snapshot)",
+        "--resume",
         "--notice",
         ])
 
     with timeit():
        run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
 
+def wait_for_event(key):
+    event = threading.Event()
+    wait_for_sigusr1(event)
+    if IS_TTY:
+        wait_for_keypress(event, key)
+
+    return event
+
 @telemetry_command("wait_for_DBs_to_sync")
-def wait_for_DBs_to_sync():
+def wait_for_DBs_to_sync(follow_proc):
     def get_delay():
         delay_bytes = int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) delay from pgcopydb.sentinel;")))
         return int(delay_bytes / (1024 * 1024))
 
-    analyzed = False
-    analyze_cmd = 'psql -A -t -d $PGCOPYDB_TARGET_PGURI -c " analyze verbose; " '
-    key_event_queue = queue.Queue(maxsize=1)
-    wait_for_sigusr1(key_event_queue)
-    if IS_TTY:
-        wait_for_keypress(key_event_queue, key="c")
-
-    while True:
+    event = wait_for_event("c")
+    while not event.is_set() and follow_proc.process.poll() is None:
         delay_mb = get_delay()
         diff = f"[WATCH] Source DB - Target DB => {delay_mb}MB"
-        if not analyzed:
-            print(diff)
+        if not IS_TTY and LIVE_MIGRATION_DOCKER:
+            print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill -s=SIGUSR1 <container_name>"')
+        elif not IS_TTY:
+            print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
         else:
-            if not IS_TTY and LIVE_MIGRATION_DOCKER:
-                print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill -s=SIGUSR1 <container_name>"')
-            elif not IS_TTY:
-                print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
-            else:
-                print(f'{diff}. Press "c" (and ENTER) to proceed')
-        if not analyzed and delay_mb < DELAY_THRESHOLD:
-            print("Starting analyze on Target DB. This might take a long time to complete ...")
-            run_cmd(analyze_cmd, log_path=f"{env['PGCOPYDB_DIR']}/logs/target_analyze")
-            print("Analyze complete")
-            analyzed = True
-            continue
-        if not key_event_queue.empty():
-            break
-        time.sleep(10)
+            print(f'{diff}. Press "c" (and ENTER) to proceed')
+
+        event.wait(timeout=5)
+
+    if follow_proc.process.poll() is not None and follow_proc.process.returncode != 0:
+        raise Exception(f"pgcopydb follow exited with code: {follow_proc.process.returncode}")
 
 @telemetry_command("copy_sequences")
 def copy_sequences():
@@ -732,21 +747,49 @@ END;
     run_sql(execute_on_target=False,
             sql=sql)
 
-def cleanup_pid_files(work_dir: Path, source_type: DBType):
-    global env
+def migrate(args):
+    # Clean up pid files. This might cause issues in docker environment due
+    # deterministic pid values.
+    (args.dir / "pgcopydb.pid").unlink(missing_ok=True)
 
-    print("Cleaning up pid files ...")
+    if not (args.dir / "snapshot").exists():
+        print("You must create a snapshot before starting the migration.")
+        print()
+        print("Run the following command to create a snapshot:")
+        print(docker_command('live-migration-snapshot', 'snapshot'))
+        sys.exit(1)
 
-    (work_dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
-    (work_dir / "pgcopydb.pid").unlink(missing_ok=True)
+    # check whether the snapshot is valid if initial data migration
+    # is not yet complete.
+    if not is_section_migration_complete("initial-data-migration") and not is_snapshot_valid():
+            print("Invalid snapshot found. Snapshot process might have died or failed.")
+            print("Please restart the migration process.")
+            print()
+            print("Run the following command to clean the existing resources:")
+            print(docker_command('live-migration-clean', 'clean', '--prune'))
+            print()
+            print("Run the following command to create a new snapshot:")
+            print(docker_command('live-migration-snapshot', 'snapshot'))
+            sys.exit(1)
 
-if __name__ == "__main__":
-    install_signal_handler()
+    # resume but no previous migration found
+    if not replication_origin_exists() and args.resume:
+        print("No resumable migration found.")
+        print()
+        print("If you want to start the migration:")
+        print(docker_command('live-migration-migrate', 'migrate'))
+        sys.exit(1)
 
-    # The following env vars forces TimescaleDB to be treated as Postgres.
-    # It is useful for testing purposes.
-    force_postgres_source = os.getenv("POSTGRES_SOURCE") == "true"
-    force_postgres_target = os.getenv("POSTGRES_TARGET") == "true"
+    # if replication origin exists, then the previous migration was incomplete
+    if replication_origin_exists() and not args.resume:
+        print("Found an incomplete migration.")
+        print()
+        print("If you want to resume the migration:")
+        print(docker_command('live-migration-migrate', 'migrate', '--resume'))
+        print()
+        print("If you want to start a new migration, you should clean the existing resources:")
+        print(docker_command('live-migration-clean', 'clean', '--prune'))
+        sys.exit(1)
 
     source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
     target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
@@ -754,9 +797,9 @@ if __name__ == "__main__":
     source_type = get_dbtype(source_pg_uri)
     target_type = get_dbtype(target_pg_uri)
 
-    if force_postgres_source:
+    if args.pg_src:
         source_type = DBType.POSTGRES
-    if force_postgres_target:
+    if args.pg_target:
         target_type = DBType.POSTGRES
 
     match (source_type, target_type):
@@ -771,10 +814,6 @@ if __name__ == "__main__":
             print("Migration from TimescaleDB to Postgres is not supported")
             sys.exit(1)
 
-    work_dir = pgcopydb_init_env(source_type)
-
-    skip_initial_data_copy = False
-
     caggs_count = 0
     if source_type == DBType.TIMESCALEDB:
         caggs_count = get_caggs_count()
@@ -782,75 +821,231 @@ if __name__ == "__main__":
             print(f"Setting replica identity to FULL for {caggs_count} caggs ...")
             set_replica_identity_for_caggs('FULL')
 
-    if source_has_incomplete_migration():
-        if is_initial_data_copy_complete():
-            skip_initial_data_copy = True
-            run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
+    # reset endpos
+    if args.resume:
+        run_cmd("pgcopydb stream sentinel set endpos 0/0")
 
-            # this is needed for docker environment, where the process
-            # always gets deterministic pid while starting.
-            cleanup_pid_files(work_dir, source_type)
-            print("Resuming migration ...")
-        else:
-            print("Cleaning up incomplete migration artifacts ...")
-            run_cmd("killall -SIGINT pgcopydb", ignore_non_zero_code=True)
-            cleanup()
-            shutil.rmtree(str(work_dir), ignore_errors=True)
-            print("Cleanup the target DB and attempt migration again")
-            sys.exit(1)
+    housekeeping_thread, housekeeping_stop_event = None, None
+    follow_proc = create_follow(resume=args.resume)
+    try:
+        if not args.skip_initial_data:
+            if not is_section_migration_complete("roles"):
+                print("Migrating roles from Source DB to Target DB ...")
+                migrate_roles()
+                mark_section_complete("roles")
+
+            if not is_section_migration_complete("extensions"):
+                print("Migrating extensions from Source DB to Target DB ...")
+                migrate_extensions(target_type)
+                mark_section_complete("extensions")
+
+            if not is_section_migration_complete("initial-data-migration"):
+                print("Migrating existing data from Source DB to Target DB ...")
+                if source_type == DBType.POSTGRES:
+                    migrate_existing_data_from_pg(target_type)
+                else:
+                    migrate_existing_data_from_ts()
+                mark_section_complete("initial-data-migration")
+
+        (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
+
+        print("Applying buffered transactions ...")
+        run_cmd("pgcopydb stream sentinel set apply")
+
+        wait_for_DBs_to_sync(follow_proc)
+
+        run_cmd("pgcopydb stream sentinel set endpos --current")
+
+        print("Waiting for live-replay to complete ...")
+        # TODO: Implement retry for follow.
+        follow_proc.wait()
+        follow_proc = None
+
+        print("Copying sequences ...")
+        copy_sequences()
+
+        if source_type == DBType.TIMESCALEDB:
+            print("Enabling background jobs ...")
+            enable_user_background_jobs()
+            if caggs_count > 0:
+                print("Setting replica identity back to DEFAULT for caggs ...")
+                set_replica_identity_for_caggs('DEFAULT')
+
+    except KeyboardInterrupt:
+        print("Exiting ... (Ctrl+C)")
+    except Exception as e:
+        print("Unexpected exception:", e)
+        telemetry.complete_fail()
     else:
-        shutil.rmtree(str(work_dir), ignore_errors=True)
+        print("Migration successfully completed.")
+        print()
+        print("Run the following command to clean up resources:")
+        print(docker_command('live-migration-clean', 'clean'))
+        telemetry.complete_success()
+    finally:
+        # TODO: Use daemon threads for housekeeping and health_checker.
+        health_checker.stop_all()
+        if housekeeping_stop_event:
+            housekeeping_stop_event.set()
+        if housekeeping_thread and housekeeping_thread.is_alive():
+            housekeeping_thread.join()
+        # cleanup all subprocesses created by pgcopydb follow
+        if follow_proc and follow_proc.process.poll() is None:
+            os.killpg(os.getpgid(follow_proc.process.pid), signal.SIGINT)
+            follow_proc.wait()
+        print("All processes have exited successfully.")
 
-    create_dirs(work_dir)
+def main():
+    parser = argparse.ArgumentParser(description='''Live migration moves your PostgreSQL/TimescaleDB to Timescale Cloud with minimal downtime.''', add_help=False)
+    parser.add_argument('-h', '--help', action='help',
+                        help='Show this help message and exit')
 
-    snapshot_proc, follow_proc = create_snapshot_and_follow(resume=skip_initial_data_copy)
+    parser.add_argument('-v', '--version', action='version',
+                        version=SCRIPT_VERSION,
+                        help='Show the version of live-migration tool')
 
-    if skip_initial_data_copy:
-        print("Skipping roles & initial data migration during resume ...")
+    subparsers = parser.add_subparsers(dest='command',
+                                       help='Subcommand help',
+                                       title='Subcommands')
+
+    common = argparse.ArgumentParser(add_help=False)
+    def _dir_default():
+        dir = os.environ.get('PGCOPYDB_DIR', '')
+        if not dir:
+            dir = f'{tempfile.gettempdir()}/pgcopydb'
+        return Path(dir)
+    common.add_argument('-h', '--help', action='help',
+                        help='Show this help message and exit')
+
+    common.add_argument('--dir', type=Path,
+                        help='Working directory',
+                        default=_dir_default())
+
+    # snapshot
+    parser_snapshot = subparsers.add_parser('snapshot',
+                                            help='Create a snapshot',
+                                            parents=[common],
+                                            add_help=False)
+    parser_snapshot.add_argument('--plugin', type=str,
+                                 help='Output plugin (Default: wal2json)',
+                                 default='wal2json',
+                                 choices=['wal2json', 'test_decoding'])
+
+    parser_clean = subparsers.add_parser('clean', help='Clean up resources',
+                                         parents=[common],
+                                         add_help=False)
+    parser_clean.add_argument('--prune', action='store_true', help='Prune the working directory')
+
+    # migrate
+    parser_migrate = subparsers.add_parser('migrate',
+                                           help='Start the migration',
+                                           parents=[common],
+                                           add_help=False)
+    parser_migrate.add_argument('--resume', action='store_true', help='Resume the migration')
+    # internal: for testing purposes only
+    parser_migrate.add_argument('--pg-src',
+                                action='store_true',
+                                help=argparse.SUPPRESS,
+                                default=(os.environ.get('POSTGRES_SOURCE') == "true"))
+
+    # internal: for testing purposes only
+    parser_migrate.add_argument('--pg-target',
+                                action='store_true',
+                                help=argparse.SUPPRESS,
+                                default=(os.environ.get('POSTGRES_TARGET') == "true"))
+    # TODO: Remove this once we know the existing customers who are still
+    # using the old migration image < v0.0.5.
+    parser_migrate.add_argument('--skip-initial-data',
+                                action='store_true',
+                                help=('Skip initial data migration. '
+                                      'This is provided for backward '
+                                      'compatibility with the old migration '
+                                      'process which did not support granular '
+                                      'resume over the section.'))
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    pgcopydb_init_env(args)
+    create_dirs(args.dir)
+
+    match args.command:
+        case 'snapshot':
+            snapshot(args)
+        case 'clean':
+            clean(args)
+        case 'migrate':
+            migrate(args)
+
+def docker_command(name, *args):
+    if LIVE_MIGRATION_DOCKER:
+        return rf"""
+    docker run -it --rm --name {name} \
+    -e PGCOPYDB_SOURCE_PGURI=$SOURCE \
+    -e PGCOPYDB_TARGET_PGURI=$TARGET \
+    -v ~/live-migration:{env['PGCOPYDB_DIR']} \
+    timescale/live-migration:v{SCRIPT_VERSION} \
+    {" ".join(args)}
+""".rstrip()
     else:
-        print("Migrating roles from Source DB to Target DB ...")
-        migrate_roles()
+        return sys.argv[0]
 
-        print("Migrating existing data from Source DB to Target DB ...")
+def snapshot(args):
+    if (args.dir / "snapshot").exists():
+        print("Snapshot file already exists.")
+        print("Snapshot process is either running or not cleaned up properly.")
+        print("Run the following command to clean up resources:")
+        print(docker_command('live-migration-clean', 'clean', '--prune'))
+        sys.exit(1)
 
-        if source_type == DBType.POSTGRES:
-            migrate_existing_data_from_pg(target_type)
-        else:
-            migrate_existing_data_from_ts()
+    print("Creating snapshot ...")
+    # Clean up pid files. This might cause issues in docker environment due
+    # deterministic pid values.
+    (args.dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
 
-        mark_initial_data_copy_complete()
+    dir = str(args.dir.absolute())
+    snapshot_command = [
+        "pgcopydb",
+        "snapshot",
+        "--follow",
+        "--plugin",
+        args.plugin,
+        "--dir",
+        dir,
+    ]
 
-        snapshot_proc.terminate()
+    process = subprocess.Popen(snapshot_command,
+                               stdout=subprocess.PIPE,
+                               text=True)
+    snapshot_id = ''
+    while process.poll() is None and snapshot_id == '':
+        snapshot_id = process.stdout.readline().strip()
 
-    (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
+    if snapshot_id != '':
+        print(f"Snapshot {snapshot_id} created successfully.")
+        print()
+        print("You can now start the migration process by running the following command:")
+        print(docker_command("live-migration-migrate", "migrate"))
 
-    print("Applying buffered transactions ...")
-    run_cmd("pgcopydb stream sentinel set apply")
+        # TODO: Terminate the snapshot once the migration switches to
+        # live replication.
+        try:
+            process.wait()
+        except KeyboardInterrupt:
+            process.terminate()
+            process.wait()
+    else:
+        print("Snapshot creation failed.")
+        print("You may need to cleanup and retry the snapshot creation.")
+        print("Run the following command to clean up resources:")
+        print(docker_command('live-migration-clean', 'clean', '--prune'))
+        sys.exit(process.returncode)
 
-    wait_for_DBs_to_sync()
+def clean(args):
+    cleanup(args)
 
-    print("Stopping live-replay ...")
-    run_cmd("pgcopydb stream sentinel set endpos --current")
-
-    print("Waiting for live-replay to complete ...")
-    follow_proc.wait()
-
-    print("Copying sequences ...")
-    copy_sequences()
-
-    if source_type == DBType.TIMESCALEDB:
-        print("Enabling background jobs ...")
-        enable_user_background_jobs()
-        print("Setting replica identity back to DEFAULT for caggs ...")
-        if caggs_count > 0:
-            set_replica_identity_for_caggs('DEFAULT')
-
-    print("Cleaning up ...")
-    cleanup()
-    health_checker.stop_all()
-    print("Migration successfully completed")
-
-    telemetry.complete_success()
-    housekeeping_stop_event.set()
-    housekeeping_thread.join()
-    sys.exit(0)
+if __name__ == "__main__":
+    main()
