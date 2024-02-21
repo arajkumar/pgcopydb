@@ -326,6 +326,7 @@ cli_create_snapshot(int argc, char **argv)
 	}
 
 	fformat(stdout, "%s\n", copySpecs.sourceSnapshot.snapshot);
+	fflush(stdout);
 
 	for (;;)
 	{
