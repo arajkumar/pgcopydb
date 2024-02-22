@@ -208,6 +208,13 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 			/* rate limit to 1 update per second */
 			else if (1 < (now - context->sentinelSyncTime))
 			{
+				bool done = false;
+				if (!pgsql_fetch_results(&(context->pgsqlPipeline), &done, NULL, NULL))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
 				if (!stream_apply_send_sync_sentinel(context))
 				{
 					/* errors have already been logged */
@@ -276,6 +283,15 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 		log_info("Replay reached end position %X/%X at %X/%X",
 				 LSN_FORMAT_ARGS(context->endpos),
 				 LSN_FORMAT_ARGS(context->previousLSN));
+	}
+
+	if (*stop)
+	{
+		if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
+		{
+			log_error("Failed to drain the pipeline, see above for details");
+			return false;
+		}
 	}
 
 	return true;

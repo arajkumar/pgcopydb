@@ -53,6 +53,8 @@ static bool computeTxnMetadataFilename(uint32_t xid, const char *dir, char *file
 
 static bool writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir);
 
+static bool setupPipeline(StreamApplyContext *context);
+
 /*
  * stream_apply_catchup catches up with SQL files that have been prepared by
  * either the `pgcopydb stream prefetch` command.
@@ -234,6 +236,12 @@ stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context)
 	if (!setupReplicationOrigin(context, specs->logSQL))
 	{
 		log_error("Failed to setup replication origin on the target database");
+		return false;
+	}
+
+	if (!setupPipeline(context))
+	{
+		log_error("Failed to setup pipeline mode on the target database");
 		return false;
 	}
 
@@ -618,6 +626,21 @@ stream_apply_file(StreamApplyContext *context)
 		}
 	}
 
+	bool done = false;
+
+	while (!done)
+	{
+		/* fetch results until done */
+		if (!pgsql_fetch_results(&(context->pgsqlPipeline), &done, NULL, NULL))
+		{
+			/* errors have already been logged */
+			free(content.buffer);
+			free(content.lines);
+
+			return false;
+		}
+	}
+
 	/* free dynamic memory that's not needed anymore */
 	free(content.buffer);
 	free(content.lines);
@@ -650,7 +673,7 @@ stream_apply_sql(StreamApplyContext *context,
 				 LogicalMessageMetadata *metadata,
 				 const char *sql)
 {
-	PGSQL *pgsql = &(context->pgsql);
+	PGSQL *pgsql = &(context->pgsqlPipeline);
 
 	switch (metadata->action)
 	{
@@ -665,15 +688,6 @@ stream_apply_sql(StreamApplyContext *context,
 			 * .sql file to apply.
 			 */
 			context->switchLSN = metadata->lsn;
-
-			/*
-			 * exit from pipeline before committing.
-			 */
-			if (!pgsql_exit_pipeline_mode(pgsql))
-			{
-				/* errors have already been logged */
-				return false;
-			}
 
 			break;
 		}
@@ -811,15 +825,6 @@ stream_apply_sql(StreamApplyContext *context,
 
 		case STREAM_ACTION_ROLLBACK:
 		{
-			/*
-			 * exit from pipeline before committing.
-			 */
-			if (!pgsql_exit_pipeline_mode(pgsql))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
 			/* Rollback the transaction */
 			if (!pgsql_execute(pgsql, "ROLLBACK"))
 			{
@@ -857,15 +862,6 @@ stream_apply_sql(StreamApplyContext *context,
 							  "see above for details");
 					return false;
 				}
-			}
-
-			/*
-			 * exit from pipeline before committing.
-			 */
-			if (!pgsql_exit_pipeline_mode(pgsql))
-			{
-				/* errors have already been logged */
-				return false;
 			}
 
 			if (!context->reachedStartPos)
@@ -989,15 +985,6 @@ stream_apply_sql(StreamApplyContext *context,
 
 				if (context->transactionInProgress)
 				{
-					/*
-					 * exit from pipeline before committing.
-					 */
-					if (!pgsql_exit_pipeline_mode(pgsql))
-					{
-						/* errors have already been logged */
-						return false;
-					}
-
 					if (!pgsql_execute(pgsql, "ROLLBACK"))
 					{
 						/* errors have already been logged */
@@ -1025,15 +1012,6 @@ stream_apply_sql(StreamApplyContext *context,
 			{
 				context->reachedStartPos =
 					context->previousLSN < metadata->lsn;
-			}
-
-			/*
-			 * exit from pipeline before updating replication origin.
-			 */
-			if (!pgsql_exit_pipeline_mode(pgsql))
-			{
-				/* errors have already been logged */
-				return false;
 			}
 
 			/* in a transaction only the COMMIT LSN is tracked */
@@ -1152,15 +1130,6 @@ stream_apply_sql(StreamApplyContext *context,
 			if (!context->reachedStartPos && !context->continuedTxn)
 			{
 				return true;
-			}
-
-			/*
-			 * ensure that prepare is always executed in pipeline mode.
-			 */
-			if (!pgsql_enter_pipeline_mode(pgsql))
-			{
-				/* errors have already been logged */
-				return false;
 			}
 
 			uint32_t hash = metadata->hash;
@@ -1304,6 +1273,41 @@ stream_apply_sql(StreamApplyContext *context,
 	return true;
 }
 
+
+/*
+ * setupPipeline ensures that the target database connection is
+ * prepared for pipeline mode. We want to have a dedicated connection for
+ * pipeline mode, so that we can control the lifecycle of that connection
+ * separately from the main connection.
+ */
+static bool
+setupPipeline(StreamApplyContext *context)
+{
+	PGSQL *pgsqlPipeline = &(context->pgsqlPipeline);
+
+	if (!pgsql_init(pgsqlPipeline,
+					context->connStrings->target_pguri,
+					PGSQL_CONN_TARGET))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* we're going to send several replication origin commands */
+	pgsqlPipeline->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
+
+	/* we also might want to skip logging any SQL query that we apply */
+	pgsqlPipeline->logSQL = context->logSQL;
+
+	/* ensure that we're in pipeline mode */
+	if (!pgsql_enter_pipeline_mode(pgsqlPipeline))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
 
 /*
  * setupReplicationOrigin ensures that a replication origin has been created on

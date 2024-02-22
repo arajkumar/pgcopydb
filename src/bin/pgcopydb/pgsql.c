@@ -1468,6 +1468,16 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 		return false;
 	}
 
+	bool pipelineMode = PQpipelineStatus(connection) == PQ_PIPELINE_ON;
+
+	/* parseFun is not allowed in pipeline mode */
+	if (pipelineMode && parseFun != NULL)
+	{
+		log_error("BUG: pgsql_execute_with_params called in pipeline mode "
+				  "with a parseFun callback");
+		return false;
+	}
+
 	char *endpoint =
 		pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET";
 
@@ -1495,7 +1505,7 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 
 	int sentQuery = 0;
 
-	if (paramCount == 0)
+	if (paramCount == 0 && !pipelineMode)
 	{
 		sentQuery = PQsendQuery(connection, sql);
 	}
@@ -1509,23 +1519,27 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 	bool done = false;
 	int errors = 0;
 
-	while (!done)
+	/* Don't fetch results in pipeline mode */
+	if (!pipelineMode)
 	{
-		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+		while (!done)
 		{
-			log_error("Postgres query was interrupted: %s", sql);
+			if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+			{
+				log_error("Postgres query was interrupted: %s", sql);
 
-			destroyPQExpBuffer(debugParameters);
-			(void) pgsql_finish(pgsql);
+				destroyPQExpBuffer(debugParameters);
+				(void) pgsql_finish(pgsql);
 
-			return false;
-		}
+				return false;
+			}
 
-		/* this uses select() with a timeout: we're not busy looping */
-		if (!pgsql_fetch_results(pgsql, &done, context, parseFun))
-		{
-			++errors;
-			break;
+			/* this uses select() with a timeout: we're not busy looping */
+			if (!pgsql_fetch_results(pgsql, &done, context, parseFun))
+			{
+				++errors;
+				break;
+			}
 		}
 	}
 
@@ -1550,7 +1564,12 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 	}
 
 	destroyPQExpBuffer(debugParameters);
-	clear_results(pgsql);
+
+	/* Don't clear results in pipeline mode */
+	if (!pipelineMode)
+	{
+		clear_results(pgsql);
+	}
 
 	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
 	{
@@ -1824,26 +1843,95 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 
 
 bool
-pgsql_enter_pipeline_mode(PGSQL *target)
+pgsql_enter_pipeline_mode(PGSQL *pgsql)
 {
-	PGconn *connection = target->connection;
-	PGpipelineStatus status = PQpipelineStatus(connection);
-	if (status == PQ_PIPELINE_ON)
+	PGconn *connection = pgsql_open_connection(pgsql);
+
+	if (connection == NULL)
+	{
+		return false;
+	}
+
+	PGpipelineStatus pipelineStatus = PQpipelineStatus(connection);
+
+	if (pipelineStatus == PQ_PIPELINE_ON)
 	{
 		return true;
 	}
 
-	int ok = PQenterPipelineMode(connection);
-	if (!ok)
+	int status = PQenterPipelineMode(connection);
+
+	if (status != 1)
 	{
-		(void) pgcopy_log_error(target, NULL, "Failed to enter pipeline");
+		(void) pgcopy_log_error(pgsql, NULL, "Failed to enter pipeline");
 		return false;
 	}
 
-	log_trace("Entering pipeline mode");
+	status = PQsetnonblocking(connection, 1 /* 1-non blocking, 0-blocking */);
+
+	if (status != 0)
+	{
+		(void) pgcopy_log_error(pgsql, NULL, "Failed to set non-blocking mode");
+		return false;
+	}
+
+	log_trace("Enabled pipeline mode");
 	return true;
 }
 
+
+bool
+pgsql_drain_pipeline(PGSQL *pgsql)
+{
+	PGconn *connection = pgsql->connection;
+
+	PGpipelineStatus status = PQpipelineStatus(connection);
+	if (status != PQ_PIPELINE_ON)
+	{
+		log_trace("Called when not in pipeline mode");
+		return true;
+	}
+
+	int ok = PQpipelineSync(connection);
+	if (!ok)
+	{
+		(void) pgcopy_log_error(pgsql, NULL, "Failed sync pipeline");
+		return false;
+	}
+
+	int results = 0;
+	while (PQconsumeInput(connection) != 0)
+	{
+		PGresult *res = PQgetResult(connection);
+		if (res == NULL)
+		{
+			continue;
+		}
+
+		results++;
+		ExecStatusType resultStatus = PQresultStatus(res);
+
+		PQclear(res);
+		if (resultStatus == PGRES_PIPELINE_SYNC)
+		{
+			log_trace("Pipeline sync received from result");
+			return true;
+		}
+
+		bool ok =
+			resultStatus == PGRES_SINGLE_TUPLE ||
+			resultStatus == PGRES_TUPLES_OK ||
+			resultStatus == PGRES_COPY_BOTH ||
+			resultStatus == PGRES_COMMAND_OK;
+		if (!ok)
+		{
+			(void) pgcopy_log_error(pgsql, res, "Read after pipeline sync failed");
+			return false;
+		}
+	}
+
+	return false;
+}
 
 bool
 pgsql_exit_pipeline_mode(PGSQL *target)

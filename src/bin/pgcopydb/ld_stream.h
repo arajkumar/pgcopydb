@@ -358,6 +358,9 @@ typedef struct StreamApplyContext
 	/* target connection */
 	PGSQL pgsql;
 
+	/* target connection created in pipeline mode */
+	PGSQL pgsqlPipeline;
+
 	/* source connection to publish sentinel updates */
 	PGSQL src;
 	bool sentinelQueryInProgress;
