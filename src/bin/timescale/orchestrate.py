@@ -27,7 +27,7 @@ from health_check import health_checker
 # process.
 IS_TTY = os.isatty(0)
 DELAY_THRESHOLD = 30  # Megabytes.
-SCRIPT_VERSION = "0.0.5"
+SCRIPT_VERSION = "0.0.6"
 
 env = os.environ.copy()
 
