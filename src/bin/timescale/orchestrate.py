@@ -554,13 +554,27 @@ def migrate_roles():
             raise ValueError("unable to extract dbname from uri")
         roles_file_path = f"{env['PGCOPYDB_DIR']}/roles.sql"
 
-        dump_roles = f"""pg_dumpall -d $PGCOPYDB_SOURCE_PGURI --quote-all-identifiers --roles-only --no-role-passwords -l {source_dbname} --file={roles_file_path}"""
+        dump_roles = " ".join([
+            "pg_dumpall",
+            "-d",
+            "$PGCOPYDB_SOURCE_PGURI",
+            "--quote-all-identifiers",
+            "--roles-only",
+            "--no-role-passwords",
+            "--clean",
+            "--if-exists",
+            "-l",
+            f'"{source_dbname}"',
+            f'--file="{roles_file_path}"',
+        ])
         run_cmd(dump_roles)
 
         # When using MST, Aiven roles modify parameters like "pg_qualstats.enabled" that are not permitted on cloud.
         # Hence, we remove Aiven roles assuming they are not being used for tasks other than ones specific to Aiven/MST.
         filter_stmts = f"""
 sed -i -E \
+-e '/DROP ROLE IF EXISTS "postgres";/d' \
+-e '/DROP ROLE IF EXISTS "tsdbadmin";/d' \
 -e '/CREATE ROLE "postgres";/d' \
 -e '/ALTER ROLE "postgres"/d' \
 -e '/CREATE ROLE "rds/d' \
