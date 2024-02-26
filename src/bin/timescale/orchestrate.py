@@ -53,12 +53,12 @@ class RedactedException(Exception):
         self.redacted = redacted
 
 
-def print_logs_with_error(log_path: str = "", tail: int = 50):
+def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, tail: int = 50):
     """
     Print error logs in the provided log_path along with tail
     of given number of log lines at all levels.
     """
-    proc = subprocess.run(f"cat {log_path} | grep -i 'error\|warn'",
+    proc = subprocess.run(f"cat {log_path} | grep -i 'error\|warn' -A{after} -B{before}",
                                     shell=True,
                                     env=env,
                                     stderr=subprocess.PIPE,
@@ -70,17 +70,18 @@ def print_logs_with_error(log_path: str = "", tail: int = 50):
         print(r)
         print("------------------END------------------")
 
-    proc = subprocess.run(f"tail -n {tail} {log_path}",
-                                    shell=True,
-                                    env=env,
-                                    stderr=subprocess.PIPE,
-                                    stdout=subprocess.PIPE,
-                                    text=True)
-    r = str(proc.stdout)
-    if r != "":
-        print(f"\n---------LAST {tail} LOG LINES FROM '{log_path}'---------")
-        print(r)
-        print("------------------END------------------")
+    if tail > 0:
+        proc = subprocess.run(f"tail -n {tail} {log_path}",
+                                        shell=True,
+                                        env=env,
+                                        stderr=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        text=True)
+        r = str(proc.stdout)
+        if r != "":
+            print(f"\n---------LAST {tail} LOG LINES FROM '{log_path}'---------")
+            print(r)
+            print("------------------END------------------")
 
 
 def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
@@ -483,15 +484,19 @@ def migrate_existing_data_from_pg(target_type: DBType):
 
     print("Restoring pre-data ...")
     with timeit():
+        log_path = f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore"
         psql_command = " ".join(["psql",
                                  "-X",
                                  "-d",
                                  "$PGCOPYDB_TARGET_PGURI",
                                  "--echo-errors",
+                                 "-v",
+                                 "ON_ERROR_STOP=0",
                                  "-f",
                                  "$PGCOPYDB_DIR/pre-data-dump.sql",
                                  ])
-        run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore", ignore_non_zero_code=True)
+        run_cmd(psql_command, log_path)
+        print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
 
     if target_type == DBType.TIMESCALEDB:
         create_hypertable_message = """Now, let's transform your regular tables into hypertables.
@@ -531,18 +536,20 @@ Once you are done"""
         run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
 
     print("Restoring post-data ...")
-    with timeit() as t:
+    with timeit():
+        log_path = f"{env['PGCOPYDB_DIR']}/logs/post_data_restore"
         psql_command = " ".join(["psql",
                                  "-X",
                                  "-d",
                                  "$PGCOPYDB_TARGET_PGURI",
                                  "--echo-errors",
                                  "-v",
-                                 "ON_ERROR_STOP=1",
+                                 "ON_ERROR_STOP=0",
                                  "-f",
                                  "$PGCOPYDB_DIR/post-data-dump.sql",
                                  ])
-        run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_restore", ignore_non_zero_code=True)
+        run_cmd(psql_command, log_path)
+        print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
 
 @telemetry_command("migrate_roles")
 def migrate_roles():
