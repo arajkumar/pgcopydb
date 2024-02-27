@@ -1879,47 +1879,81 @@ pgsql_enter_pipeline_mode(PGSQL *pgsql)
 	return true;
 }
 
-static bool
-getSyncMessage(PGSQL *pgsql, bool *sync)
+bool
+pgsql_drain_pipeline(PGSQL *pgsql)
 {
 	PGconn *conn = pgsql->connection;
+
 	if (conn == NULL)
 	{
-		log_error("BUG: getSyncMessage called with NULL connection");
+		log_error("BUG: pgsql_drain_pipeline called with NULL connection");
 		return false;
 	}
 
-	int r;
-
-	fd_set input_mask;
-	struct timeval timeout;
-	struct timeval *timeoutptr = NULL;
-
-	/* sleep for 1ms to wait for input on the Postgres socket */
-	timeout.tv_sec = 0;
-	timeout.tv_usec = 1000;
-	timeoutptr = &timeout;
-
-	*sync = false;
-
-	FD_ZERO(&input_mask);
-	FD_SET(PQsocket(conn), &input_mask);
-
-	r = select(PQsocket(conn) + 1, &input_mask, NULL, NULL, timeoutptr);
-
-	if (r == 0 || (r < 0 && errno == EINTR))
+	if (PQpipelineStatus(conn) != PQ_PIPELINE_ON)
 	{
-		/* got a timeout or signal. The caller will get back later. */
-		return true;
+		log_error("BUG: Connection is not in pipeline mode");
+		return false;
 	}
-	else if (r < 0)
+
+	if (PQsocket(conn) < 0)
 	{
-		(void) pgsql_stream_log_error(pgsql, NULL, "select failed: %m");
+		(void) pgsql_stream_log_error(pgsql, NULL, "invalid socket");
 
 		clear_results(pgsql);
 		pgsql_finish(pgsql);
 
 		return false;
+	}
+
+	if (PQpipelineSync(conn) != 1)
+	{
+		(void) pgcopy_log_error(pgsql, NULL, "Failed send sync pipeline");
+		return false;
+	}
+
+	int r = 0;
+
+	while (true)
+	{
+		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
+		{
+			log_error("Postgres query was interrupted");
+
+			clear_results(pgsql);
+			pgsql_finish(pgsql);
+
+			return false;
+		}
+
+		fd_set input_mask;
+		struct timeval timeout;
+		struct timeval *timeoutptr = NULL;
+
+		/* sleep for 1ms to wait for input on the Postgres socket */
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 1000;
+		timeoutptr = &timeout;
+
+		FD_ZERO(&input_mask);
+		FD_SET(PQsocket(conn), &input_mask);
+
+		r = select(PQsocket(conn) + 1, &input_mask, NULL, NULL, timeoutptr);
+
+		if (r == 0 || (r < 0 && errno == EINTR))
+		{
+			/* got a timeout or signal. The caller will get back later. */
+			return true;
+		}
+		else if (r < 0)
+		{
+			(void) pgsql_stream_log_error(pgsql, NULL, "select failed: %m");
+
+			clear_results(pgsql);
+			pgsql_finish(pgsql);
+
+			return false;
+		}
 	}
 
 	/* Else there is actually data on the socket */
@@ -1965,65 +1999,8 @@ getSyncMessage(PGSQL *pgsql, bool *sync)
 
 			if (resultStatus == PGRES_PIPELINE_SYNC)
 			{
-				*sync = true;
 				return true;
 			}
-		}
-	}
-
-	return true;
-}
-
-bool
-pgsql_drain_pipeline(PGSQL *pgsql)
-{
-	PGconn *conn = pgsql->connection;
-
-	if (conn == NULL)
-	{
-		log_error("BUG: pgsql_drain_pipeline called with NULL connection");
-		return false;
-	}
-
-	if (PQpipelineStatus(conn) != PQ_PIPELINE_ON)
-	{
-		log_error("BUG: Connection is not in pipeline mode");
-		return false;
-	}
-
-	int status = PQpipelineSync(conn);
-
-	if (status != 1)
-	{
-		(void) pgcopy_log_error(pgsql, NULL, "Failed send sync pipeline");
-		return false;
-	}
-
-	if (PQsocket(conn) < 0)
-	{
-		(void) pgsql_stream_log_error(pgsql, NULL, "invalid socket");
-
-		clear_results(pgsql);
-		pgsql_finish(pgsql);
-
-		return false;
-	}
-
-	bool sync = false;
-	while (!sync)
-	{
-		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
-		{
-			log_error("Pipeline sync interrupted");
-
-			(void) pgsql_finish(pgsql);
-
-			return false;
-		}
-
-		if (!getSyncMessage(pgsql, &sync))
-		{
-			return false;
 		}
 	}
 
