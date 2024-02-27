@@ -1879,53 +1879,150 @@ pgsql_enter_pipeline_mode(PGSQL *pgsql)
 	return true;
 }
 
+static bool
+getSyncMessage(PGSQL *pgsql, bool *sync)
+{
+	PGconn *conn = pgsql->connection;
+	if (conn == NULL)
+	{
+		log_error("BUG: getSyncMessage called with NULL connection");
+		return false;
+	}
+
+	int r;
+
+	fd_set input_mask;
+	struct timeval timeout;
+	struct timeval *timeoutptr = NULL;
+
+	/* sleep for 1ms to wait for input on the Postgres socket */
+	timeout.tv_sec = 0;
+	timeout.tv_usec = 1000;
+	timeoutptr = &timeout;
+
+	*sync = false;
+
+	FD_ZERO(&input_mask);
+	FD_SET(PQsocket(conn), &input_mask);
+
+	r = select(PQsocket(conn) + 1, &input_mask, NULL, NULL, timeoutptr);
+
+	if (r == 0 || (r < 0 && errno == EINTR))
+	{
+		/* got a timeout or signal. The caller will get back later. */
+		return true;
+	}
+	else if (r < 0)
+	{
+		(void) pgsql_stream_log_error(pgsql, NULL, "select failed: %m");
+
+		clear_results(pgsql);
+		pgsql_finish(pgsql);
+
+		return false;
+	}
+
+	/* Else there is actually data on the socket */
+	if (PQconsumeInput(conn) == 0)
+	{
+		(void) pgsql_stream_log_error(
+			pgsql,
+			NULL,
+			"Failed to get async query results");
+		return false;
+	}
+
+	/* Only collect the results when we know the server is ready for it */
+	if (PQisBusy(conn) == 0)
+	{
+		PGresult *result = NULL;
+
+		/*
+		 * When we got clearance that libpq did fetch the Postgres query result
+		 * in its internal buffers, we process the result without checking for
+		 * interrupts.
+		 *
+		 * The reason is that pgcopydb relies internally on signaling sibling
+		 * processes to terminate at several places, including logical
+		 * replication client and operating mode management. It's better for
+		 * the code that we process the already available query result now and
+		 * let the callers check for interrupts (asked_to_stop and friends).
+		 */
+		while ((result = PQgetResult(conn)) != NULL)
+		{
+			/* remember to check PQnotifies after each PQgetResult or PQexec */
+			(void) pgsql_handle_notifications(pgsql);
+
+			if (!is_response_ok(result))
+			{
+				pgsql_execute_log_error(pgsql, result, NULL, NULL, NULL);
+				return false;
+			}
+
+			ExecStatusType resultStatus = PQresultStatus(result);
+
+			PQclear(result);
+
+			if (resultStatus == PGRES_PIPELINE_SYNC)
+			{
+				*sync = true;
+				return true;
+			}
+		}
+	}
+
+	return true;
+}
 
 bool
 pgsql_drain_pipeline(PGSQL *pgsql)
 {
-	PGconn *connection = pgsql->connection;
+	PGconn *conn = pgsql->connection;
 
-	PGpipelineStatus status = PQpipelineStatus(connection);
-	if (status != PQ_PIPELINE_ON)
+	if (conn == NULL)
 	{
-		log_trace("Called when not in pipeline mode");
-		return true;
-	}
-
-	int ok = PQpipelineSync(connection);
-	if (!ok)
-	{
-		(void) pgcopy_log_error(pgsql, NULL, "Failed sync pipeline");
+		log_error("BUG: pgsql_drain_pipeline called with NULL connection");
 		return false;
 	}
 
-	int results = 0;
-	while (PQconsumeInput(connection) != 0)
+	if (PQpipelineStatus(conn) != PQ_PIPELINE_ON)
 	{
-		PGresult *res = PQgetResult(connection);
-		if (res == NULL)
+		log_error("BUG: Connection is not in pipeline mode");
+		return false;
+	}
+
+	int status = PQpipelineSync(conn);
+
+	if (status != 1)
+	{
+		(void) pgcopy_log_error(pgsql, NULL, "Failed send sync pipeline");
+		return false;
+	}
+
+	if (PQsocket(conn) < 0)
+	{
+		(void) pgsql_stream_log_error(pgsql, NULL, "invalid socket");
+
+		clear_results(pgsql);
+		pgsql_finish(pgsql);
+
+		return false;
+	}
+
+	bool sync = false;
+	while (!sync)
+	{
+		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
 		{
-			continue;
+			log_error("Pipeline sync interrupted");
+
+			(void) pgsql_finish(pgsql);
+
+			return false;
 		}
 
-		results++;
-		ExecStatusType resultStatus = PQresultStatus(res);
-
-		PQclear(res);
-		if (resultStatus == PGRES_PIPELINE_SYNC)
+		if (!getSyncMessage(pgsql, &sync))
 		{
-			log_trace("Pipeline sync received from result");
-			return true;
-		}
-
-		bool ok =
-			resultStatus == PGRES_SINGLE_TUPLE ||
-			resultStatus == PGRES_TUPLES_OK ||
-			resultStatus == PGRES_COPY_BOTH ||
-			resultStatus == PGRES_COMMAND_OK;
-		if (!ok)
-		{
-			(void) pgcopy_log_error(pgsql, res, "Read after pipeline sync failed");
 			return false;
 		}
 	}
@@ -1967,7 +2064,8 @@ pgsql_exit_pipeline_mode(PGSQL *target)
 		if (resultStatus == PGRES_PIPELINE_SYNC)
 		{
 			log_trace("Pipeline sync received from result");
-			goto doneConsuming;
+			/* goto doneConsuming; */
+			return true;
 		}
 
 		bool ok =
@@ -1982,14 +2080,14 @@ pgsql_exit_pipeline_mode(PGSQL *target)
 		}
 	}
 
-doneConsuming:
-	ok = PQexitPipelineMode(connection);
-	if (!ok)
-	{
-		(void) pgcopy_log_error(target, NULL, "Failed to exit pipeline");
-		return false;
-	}
-	log_trace("Exit pipeline with %d results", results);
+/* doneConsuming: */
+	/* ok = PQexitPipelineMode(connection); */
+	/* if (!ok) */
+	/* { */
+	/* 	(void) pgcopy_log_error(target, NULL, "Failed to exit pipeline"); */
+	/* 	return false; */
+	/* } */
+	/* log_trace("Exit pipeline with %d results", results); */
 	return true;
 }
 

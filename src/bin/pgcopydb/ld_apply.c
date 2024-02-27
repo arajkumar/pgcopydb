@@ -53,7 +53,7 @@ static bool computeTxnMetadataFilename(uint32_t xid, const char *dir, char *file
 
 static bool writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir);
 
-static bool setupPipeline(StreamApplyContext *context);
+static bool setupConnection(StreamApplyContext *context);
 
 /*
  * stream_apply_catchup catches up with SQL files that have been prepared by
@@ -239,7 +239,7 @@ stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context)
 		return false;
 	}
 
-	if (!setupPipeline(context))
+	if (!setupConnection(context))
 	{
 		log_error("Failed to setup pipeline mode on the target database");
 		return false;
@@ -604,6 +604,8 @@ stream_apply_file(StreamApplyContext *context)
 		}
 	}
 
+	uint64_t last = 0;
+
 	/* replay the SQL commands from the SQL file */
 	for (int i = 0; i < content.count && !context->reachedEndPos; i++)
 	{
@@ -626,20 +628,19 @@ stream_apply_file(StreamApplyContext *context)
 		}
 	}
 
-	bool done = false;
-
-	while (!done)
+	/* fetch results until done */
+	log_info("Catchup pipeline sync begin");
+	if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 	{
-		/* fetch results until done */
-		if (!pgsql_fetch_results(&(context->pgsqlPipeline), &done, NULL, NULL))
-		{
-			/* errors have already been logged */
-			free(content.buffer);
-			free(content.lines);
+		/* errors have already been logged */
+		free(content.buffer);
+		free(content.lines);
 
-			return false;
-		}
+		return false;
 	}
+	log_info("Catchup pipeline sync at %X/%X",
+			 LSN_FORMAT_ARGS(context->previousLSN));
+
 
 	/* free dynamic memory that's not needed anymore */
 	free(content.buffer);
@@ -948,7 +949,7 @@ stream_apply_sql(StreamApplyContext *context,
 			 * An idle source producing only KEEPALIVE should move the
 			 * replay_lsn forward.
 			 */
-			if (!stream_apply_track_insert_lsn(context, metadata->lsn))
+			if (false && !stream_apply_track_insert_lsn(context, metadata->lsn))
 			{
 				log_error("Failed to track target LSN position, "
 						  "see above for details");
@@ -1109,7 +1110,7 @@ stream_apply_sql(StreamApplyContext *context,
 				break;
 			}
 
-			if (!stream_apply_track_insert_lsn(context, metadata->lsn))
+			if (false && !stream_apply_track_insert_lsn(context, metadata->lsn))
 			{
 				log_error("Failed to track target LSN position, "
 						  "see above for details");
@@ -1281,11 +1282,11 @@ stream_apply_sql(StreamApplyContext *context,
  * separately from the main connection.
  */
 static bool
-setupPipeline(StreamApplyContext *context)
+setupConnection(StreamApplyContext *context)
 {
-	PGSQL *pgsqlPipeline = &(context->pgsqlPipeline);
+	PGSQL *pgsql = &(context->pgsql);
 
-	if (!pgsql_init(pgsqlPipeline,
+	if (!pgsql_init(pgsql,
 					context->connStrings->target_pguri,
 					PGSQL_CONN_TARGET))
 	{
@@ -1294,20 +1295,14 @@ setupPipeline(StreamApplyContext *context)
 	}
 
 	/* we're going to send several replication origin commands */
-	pgsqlPipeline->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
+	pgsql->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
 
 	/* we also might want to skip logging any SQL query that we apply */
-	pgsqlPipeline->logSQL = context->logSQL;
-
-	/* ensure that we're in pipeline mode */
-	if (!pgsql_enter_pipeline_mode(pgsqlPipeline))
-	{
-		/* errors have already been logged */
-		return false;
-	}
+	pgsql->logSQL = context->logSQL;
 
 	return true;
 }
+
 
 /*
  * setupReplicationOrigin ensures that a replication origin has been created on
@@ -1320,7 +1315,7 @@ setupPipeline(StreamApplyContext *context)
 bool
 setupReplicationOrigin(StreamApplyContext *context, bool logSQL)
 {
-	PGSQL *pgsql = &(context->pgsql);
+	PGSQL *pgsql = &(context->pgsqlPipeline);
 	char *nodeName = context->origin;
 
 	if (!pgsql_init(pgsql, context->connStrings->target_pguri, PGSQL_CONN_TARGET))
@@ -1411,6 +1406,13 @@ setupReplicationOrigin(StreamApplyContext *context, bool logSQL)
 			  context->sqlFileName);
 
 	if (!pgsql_replication_origin_session_setup(pgsql, nodeName))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* ensure that we're in pipeline mode */
+	if (!pgsql_enter_pipeline_mode(pgsql))
 	{
 		/* errors have already been logged */
 		return false;

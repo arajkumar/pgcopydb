@@ -360,6 +360,7 @@ typedef struct StreamApplyContext
 
 	/* target connection created in pipeline mode */
 	PGSQL pgsqlPipeline;
+	uint64_t pipelineSyncTime;
 
 	/* source connection to publish sentinel updates */
 	PGSQL src;

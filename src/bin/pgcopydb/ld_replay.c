@@ -205,21 +205,30 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 				}
 			}
 
-			/* rate limit to 1 update per second */
-			else if (1 < (now - context->sentinelSyncTime))
+			/* rate limit to 5 update per second */
+			else if (5 < (now - context->sentinelSyncTime))
 			{
-				bool done = false;
-				if (!pgsql_fetch_results(&(context->pgsqlPipeline), &done, NULL, NULL))
-				{
-					/* errors have already been logged */
-					return false;
-				}
-
 				if (!stream_apply_send_sync_sentinel(context))
 				{
 					/* errors have already been logged */
 					return false;
 				}
+			}
+
+			if (10 < (now - context->pipelineSyncTime))
+			{
+				bool done = false;
+				log_info("Replay pipeline sync begin");
+				if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+				log_info("Replay pipeline sync at %X/%X done %d",
+						 LSN_FORMAT_ARGS(context->previousLSN),
+						 done);
+
+				context->pipelineSyncTime = now;
 			}
 			break;
 		}
