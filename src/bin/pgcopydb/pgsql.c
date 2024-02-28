@@ -1912,13 +1912,11 @@ pgsql_drain_pipeline(PGSQL *pgsql)
 		return false;
 	}
 
-	int r = 0;
-
 	while (true)
 	{
 		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
 		{
-			log_error("Postgres query was interrupted");
+			log_error("Pipeline sync was interrupted");
 
 			clear_results(pgsql);
 			pgsql_finish(pgsql);
@@ -1930,20 +1928,20 @@ pgsql_drain_pipeline(PGSQL *pgsql)
 		struct timeval timeout;
 		struct timeval *timeoutptr = NULL;
 
-		/* sleep for 1ms to wait for input on the Postgres socket */
+		/* sleep for 10ms to wait for input on the Postgres socket */
 		timeout.tv_sec = 0;
-		timeout.tv_usec = 1000;
+		timeout.tv_usec = 10000;
 		timeoutptr = &timeout;
 
 		FD_ZERO(&input_mask);
 		FD_SET(PQsocket(conn), &input_mask);
 
-		r = select(PQsocket(conn) + 1, &input_mask, NULL, NULL, timeoutptr);
+		int r = select(PQsocket(conn) + 1, &input_mask, NULL, NULL, timeoutptr);
 
 		if (r == 0 || (r < 0 && errno == EINTR))
 		{
 			/* got a timeout or signal. The caller will get back later. */
-			return true;
+			continue;
 		}
 		else if (r < 0)
 		{
@@ -1954,56 +1952,53 @@ pgsql_drain_pipeline(PGSQL *pgsql)
 
 			return false;
 		}
-	}
 
-	/* Else there is actually data on the socket */
-	if (PQconsumeInput(conn) == 0)
-	{
-		(void) pgsql_stream_log_error(
-			pgsql,
-			NULL,
-			"Failed to get async query results");
-		return false;
-	}
-
-	/* Only collect the results when we know the server is ready for it */
-	if (PQisBusy(conn) == 0)
-	{
-		PGresult *result = NULL;
-
-		/*
-		 * When we got clearance that libpq did fetch the Postgres query result
-		 * in its internal buffers, we process the result without checking for
-		 * interrupts.
-		 *
-		 * The reason is that pgcopydb relies internally on signaling sibling
-		 * processes to terminate at several places, including logical
-		 * replication client and operating mode management. It's better for
-		 * the code that we process the already available query result now and
-		 * let the callers check for interrupts (asked_to_stop and friends).
-		 */
-		while ((result = PQgetResult(conn)) != NULL)
+		/* Else there is actually data on the socket */
+		if (PQconsumeInput(conn) == 0)
 		{
-			/* remember to check PQnotifies after each PQgetResult or PQexec */
-			(void) pgsql_handle_notifications(pgsql);
+			(void) pgsql_stream_log_error(
+					pgsql,
+					NULL,
+					"could not receive data from WAL stream");
+			return false;
+		}
 
-			if (!is_response_ok(result))
+		int results = 0;
+		while (!PQisBusy(conn))
+		{
+			PGresult *res = PQgetResult(conn);
+			if (res == NULL)
 			{
-				pgsql_execute_log_error(pgsql, result, NULL, NULL, NULL);
-				return false;
+				/*
+				 * NULL represents a end of result for a single query, but we are
+				 * in pipeline mode and we can have multiple results.
+				 *
+				 * We need to continue consuming until we get a SYNC message.
+				 */
+				continue;
 			}
 
-			ExecStatusType resultStatus = PQresultStatus(result);
+			results++;
 
-			PQclear(result);
+			ExecStatusType resultStatus = PQresultStatus(res);
+
+			PQclear(res);
 
 			if (resultStatus == PGRES_PIPELINE_SYNC)
 			{
+				log_info("Received pipeline. Total results: %d", results);
 				return true;
+			}
+
+			if (!is_response_ok(res))
+			{
+				(void) pgcopy_log_error(pgsql, res, "Read after pipeline sync failed");
+				return false;
 			}
 		}
 	}
 
+	log_error("Failed to drain pipeline");
 	return false;
 }
 
