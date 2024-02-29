@@ -217,7 +217,6 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 
 			if (10 < (now - context->pipelineSyncTime))
 			{
-				bool done = false;
 				log_info("Replay pipeline sync begin");
 				if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 				{
@@ -225,8 +224,7 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 					return false;
 				}
 				log_info("Replay pipeline sync at %X/%X done %d",
-						 LSN_FORMAT_ARGS(context->previousLSN),
-						 done);
+						 LSN_FORMAT_ARGS(context->previousLSN));
 
 				context->pipelineSyncTime = now;
 			}

@@ -604,8 +604,7 @@ stream_apply_file(StreamApplyContext *context)
 		}
 	}
 
-	int stmtInBatch = 0;
-	int stmtBatchSize = 1000;
+	uint32_t last = 0;
 
 	/* replay the SQL commands from the SQL file */
 	for (int i = 0; i < content.count && !context->reachedEndPos; i++)
@@ -628,13 +627,12 @@ stream_apply_file(StreamApplyContext *context)
 			return false;
 		}
 
-		stmtInBatch++;
 		/* Sync at COMMIT if statement batch size is reached */
 		if (metadata->action == STREAM_ACTION_COMMIT &&
-			stmtInBatch > stmtBatchSize)
+			(time(NULL) - last >= 10))
 		{
 			/* fetch results until done */
-			log_trace("Pipeline sync for %d statements", stmtInBatch);
+			log_trace("Pipeline sync begin");
 
 			if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 			{
@@ -647,26 +645,24 @@ stream_apply_file(StreamApplyContext *context)
 
 			log_trace("Pipeline sync completed until %X/%X",
 					LSN_FORMAT_ARGS(context->previousLSN));
-			stmtInBatch = 0;
+			last = time(NULL);
+
 		}
 	}
 
-	if (stmtInBatch > 0)
+	log_trace("Pipeline sync begin");
+
+	if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 	{
-		log_trace("Pipeline sync for %d statements", stmtInBatch);
+		/* errors have already been logged */
+		free(content.buffer);
+		free(content.lines);
 
-		if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
-		{
-			/* errors have already been logged */
-			free(content.buffer);
-			free(content.lines);
-
-			return false;
-		}
-
-		log_trace("Pipeline sync completed until %X/%X",
-				LSN_FORMAT_ARGS(context->previousLSN));
+		return false;
 	}
+
+	log_trace("Pipeline sync completed until %X/%X",
+			LSN_FORMAT_ARGS(context->previousLSN));
 
 
 	/* free dynamic memory that's not needed anymore */
