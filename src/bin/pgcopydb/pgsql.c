@@ -1986,7 +1986,7 @@ pgsql_drain_pipeline(PGSQL *pgsql)
 
 			if (resultStatus == PGRES_PIPELINE_SYNC)
 			{
-				log_info("Received pipeline. Total results: %d", results);
+				log_debug("Received pipeline. Total results: %d", results);
 				return true;
 			}
 
@@ -2001,68 +2001,6 @@ pgsql_drain_pipeline(PGSQL *pgsql)
 	log_error("Failed to drain pipeline");
 	return false;
 }
-
-bool
-pgsql_exit_pipeline_mode(PGSQL *target)
-{
-	PGconn *connection = target->connection;
-
-	PGpipelineStatus status = PQpipelineStatus(connection);
-	if (status != PQ_PIPELINE_ON)
-	{
-		log_trace("Called when not in pipeline mode");
-		return true;
-	}
-
-	int ok = PQpipelineSync(connection);
-	if (!ok)
-	{
-		(void) pgcopy_log_error(target, NULL, "Failed sync pipeline");
-		return false;
-	}
-
-	int results = 0;
-	while (PQconsumeInput(connection) != 0)
-	{
-		PGresult *res = PQgetResult(connection);
-		if (res == NULL)
-		{
-			continue;
-		}
-		results++;
-		ExecStatusType resultStatus = PQresultStatus(res);
-
-		PQclear(res);
-		if (resultStatus == PGRES_PIPELINE_SYNC)
-		{
-			log_trace("Pipeline sync received from result");
-			/* goto doneConsuming; */
-			return true;
-		}
-
-		bool ok =
-			resultStatus == PGRES_SINGLE_TUPLE ||
-			resultStatus == PGRES_TUPLES_OK ||
-			resultStatus == PGRES_COPY_BOTH ||
-			resultStatus == PGRES_COMMAND_OK;
-		if (!ok)
-		{
-			(void) pgcopy_log_error(target, res, "Read after pipeline sync failed");
-			return false;
-		}
-	}
-
-/* doneConsuming: */
-	/* ok = PQexitPipelineMode(connection); */
-	/* if (!ok) */
-	/* { */
-	/* 	(void) pgcopy_log_error(target, NULL, "Failed to exit pipeline"); */
-	/* 	return false; */
-	/* } */
-	/* log_trace("Exit pipeline with %d results", results); */
-	return true;
-}
-
 
 /*
  * pgsql_prepare implements server-side prepared statements by using the

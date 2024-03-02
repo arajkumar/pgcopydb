@@ -628,7 +628,8 @@ stream_apply_file(StreamApplyContext *context)
 		}
 
 		/* Sync at COMMIT if statement batch size is reached */
-		if (metadata->action == STREAM_ACTION_COMMIT &&
+		if ((metadata->action == STREAM_ACTION_COMMIT ||
+			 metadata->action == STREAM_ACTION_KEEPALIVE) &&
 			(time(NULL) - last >= 10))
 		{
 			/* fetch results until done */
