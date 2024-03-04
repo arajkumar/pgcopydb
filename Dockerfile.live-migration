@@ -79,5 +79,5 @@ ENV PGCOPYDB_DIR=/opt/timescale/ts_cdc
 ENV LIVE_MIGRATION_DOCKER=true
 ENV HOUSEKEEPING_INTERVAL=300
 
-ENTRYPOINT ["python3", "-u", "/opt/timescale/orchestrate.py"]
+ENTRYPOINT ["python3", "-u", "/opt/timescale/main.py"]
 CMD ["--help"]
