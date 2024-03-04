@@ -525,6 +525,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
                                  "8",
                                  "--split-tables-larger-than='1 GB'",
                                  "--notice",
+                                 "--skip-vacuum",
                                  "--dir",
                                  "$PGCOPYDB_DIR/copy_table_data",
                                  "--snapshot",
