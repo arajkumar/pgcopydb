@@ -345,12 +345,15 @@ def wait_for_DBs_to_sync(follow_proc):
     while not event.is_set() and follow_proc.process.poll() is None:
         delay_mb = get_delay()
         diff = f"[WATCH] Source DB - Target DB => {delay_mb}MB"
-        if not IS_TTY and LIVE_MIGRATION_DOCKER:
-            print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill -s=SIGUSR1 <container_name>"')
-        elif not IS_TTY:
-            print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
+        if delay_mb < DELAY_THRESHOLD:
+            if not IS_TTY and LIVE_MIGRATION_DOCKER:
+                print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill -s=SIGUSR1 <container_name>"')
+            elif not IS_TTY:
+                print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
+            else:
+                print(f'{diff}. Press "c" (and ENTER) to proceed')
         else:
-            print(f'{diff}. Press "c" (and ENTER) to proceed')
+            print(f"{diff}")
 
         event.wait(timeout=5)
 
