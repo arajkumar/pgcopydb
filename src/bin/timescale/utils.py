@@ -16,7 +16,23 @@ class timeit:
 
     def __exit__(self, type, value, traceback):
         self.time = perf_counter() - self.start
-        print(f"=> Completed in {self.time:.1f}s")
+        print(f"=> Completed in {seconds_to_human(self.time)}")
+
+
+def seconds_to_human(seconds):
+    intervals = [("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)]
+    strings = []
+    for name, interval in intervals:
+        value = int(seconds // interval)
+        format = "d"
+        if interval == 1 and seconds % 1 > 0:
+            # Retain fractional component of seconds
+            format = ".3g"
+            value += seconds % 1
+        if value > 0 or interval == 1:
+            strings.append(f"{value:{format}} {name}{'s' if value > 1 or value < 1 else ''}")
+        seconds -= (value * interval)
+    return " ".join(strings)
 
 
 def create_dirs(work_dir: Path):
