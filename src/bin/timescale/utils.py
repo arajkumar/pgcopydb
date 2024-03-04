@@ -35,6 +35,20 @@ def seconds_to_human(seconds):
     return " ".join(strings)
 
 
+def store_val(name: str, value):
+    with open(f"{env['PGCOPYDB_DIR']}/run/{name}", 'w') as file:
+        file.write(str(value))
+
+
+def get_stored_val(name: str):
+    try:
+        with open(f"{env['PGCOPYDB_DIR']}/run/{name}", 'r') as file:
+            value = file.read()
+        return value
+    except FileNotFoundError:
+        return None
+
+
 def create_dirs(work_dir: Path):
     global env
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)

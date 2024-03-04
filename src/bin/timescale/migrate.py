@@ -4,13 +4,14 @@
 import os
 import signal
 import sys
+import threading
 
 from enum import Enum
 from pathlib import Path
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
-from utils import timeit, print_logs_with_error, docker_command, dbname_from_uri
+from utils import timeit, print_logs_with_error, docker_command, dbname_from_uri, store_val, get_stored_val
 from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
@@ -39,7 +40,6 @@ def is_section_migration_complete(section):
 
 def mark_section_complete(section):
     Path(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done").touch()
-
 
 @telemetry_command("check_source_is_timescaledb")
 def get_dbtype(uri):
@@ -103,6 +103,29 @@ Once you are done"""
     else:
         print(f"{create_hypertable_message}, press 'c' (and ENTER) to continue")
     event.wait()
+
+
+def monitor_db_sizes() -> threading.Event:
+    DB_SIZE_SQL = "select pg_size_pretty(pg_database_size(current_database()))"
+    src_size = get_stored_val("src_existing_data_size")
+    if src_size is None:
+        src_size = run_sql(execute_on_target=False, sql=DB_SIZE_SQL)[:-1]
+        # We save the size of the source database for reuse when running `migrate` with the
+        # --resume option. Without this step, the source size would need to be recalculated
+        # during the `--resume` phase, leading to inaccurate progress.
+        store_val("src_existing_data_size", src_size)
+
+    stop_event = threading.Event()
+    print("[WATCH] Monitoring progress ...")
+    def get_and_print_size():
+        while not stop_event.is_set():
+            tgt_size = run_sql(execute_on_target=True, sql=DB_SIZE_SQL)[:-1]
+            print(f"[WATCH] {tgt_size} copied to Target DB (Source DB is {src_size})")
+            stop_event.wait(timeout=60)
+    t = threading.Thread(target=get_and_print_size)
+    t.daemon = True
+    t.start()
+    return stop_event
 
 
 @telemetry_command("migrate_existing_data_from_pg")
@@ -170,6 +193,8 @@ def migrate_existing_data_from_pg(target_type: DBType):
         show_hypertable_creation_prompt()
         mark_section_complete("hypertable-creation")
 
+    stop_progress = monitor_db_sizes()
+
     if not is_section_migration_complete("copy-table-data"):
         print("Copying table data ...")
         copy_table_data = " ".join(["pgcopydb",
@@ -207,7 +232,6 @@ def migrate_existing_data_from_pg(target_type: DBType):
             print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
         mark_section_complete("post-data-restore")
 
-
     if not is_section_migration_complete("analyze-db"):
         print("Perform ANALYZE on target DB tables ...")
         with timeit():
@@ -224,6 +248,8 @@ def migrate_existing_data_from_pg(target_type: DBType):
                                         ])
             run_cmd(vaccumdb_command, f"{env['PGCOPYDB_DIR']}/logs/analyze_db")
         mark_section_complete("analyze-db")
+    stop_progress.set()
+
 
 @telemetry_command("migrate_extensions")
 def migrate_extensions(target_type):
@@ -335,8 +361,10 @@ def migrate_existing_data_from_ts(args):
 
     clone_table_data = " ".join(clone_table_data)
 
+    stop_progress = monitor_db_sizes()
     with timeit():
        run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
+    stop_progress.set()
 
 
 @telemetry_command("wait_for_DBs_to_sync")

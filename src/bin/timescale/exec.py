@@ -86,22 +86,3 @@ def run_sql(execute_on_target: bool, sql: str):
     if execute_on_target:
         dest = "$PGCOPYDB_TARGET_PGURI"
     return run_cmd(psql(dest, sql))
-
-
-def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
-    stdout = subprocess.PIPE
-    stderr = subprocess.PIPE
-    if log_path != "":
-        fname_stdout = f"{log_path}_stdout.log"
-        stdout = open(fname_stdout, "w")
-        fname_stderr = f"{log_path}_stderr.log"
-        stderr = open(fname_stderr, "w")
-    result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
-    if result.returncode != 0 and not ignore_non_zero_code:
-        if log_path != "":
-            print_logs_with_error(log_path=f"{log_path}_stderr.log")
-        cmd_name = cmd.split()[0]
-        raise RedactedException(
-            f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}",
-            f"{cmd_name} exited with code {result.returncode}")
-    return str(result.stdout)
