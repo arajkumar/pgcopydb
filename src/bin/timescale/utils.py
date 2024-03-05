@@ -49,6 +49,15 @@ def get_stored_val(name: str):
         return None
 
 
+def bytes_to_human(bytes):
+    intervals = [("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10), ("B", 2**0)]
+    for name, size in intervals:
+        value = bytes // size
+        if value > 0:
+            return f"{value}{name}"
+    return "0B"
+
+
 def create_dirs(work_dir: Path):
     global env
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)

@@ -16,8 +16,9 @@ from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql
+from utils import bytes_to_human, seconds_to_human
 
-DELAY_THRESHOLD = 30  # Megabytes.
+REPLICATION_LAG_THRESHOLD_BYTES = 512000  # 500KiB.
 
 class DBType(Enum):
     POSTGRES = 1
@@ -369,25 +370,51 @@ def migrate_existing_data_from_ts(args):
 
 @telemetry_command("wait_for_DBs_to_sync")
 def wait_for_DBs_to_sync(follow_proc):
-    def get_delay():
-        delay_bytes = int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) delay from pgcopydb.sentinel;")))
-        return int(delay_bytes / (1024 * 1024))
+    def get_source_wal_lsn():
+        return run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_current_wal_lsn();")).strip()
+
+    def get_target_replay_lsn():
+        return run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI", sql="select pg_replication_origin_progress('pgcopydb', true);")).strip()
+
+    def get_lsn_diff_bytes(lsn1, lsn2):
+        return int(run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI", sql=f"select pg_wal_lsn_diff('{lsn1}', '{lsn2}');")))
 
     event = wait_for_event("c")
-    while not event.is_set() and follow_proc.process.poll() is None:
-        delay_mb = get_delay()
-        diff = f"[WATCH] Source DB - Target DB => {delay_mb}MB"
-        if delay_mb < DELAY_THRESHOLD:
-            if not IS_TTY and LIVE_MIGRATION_DOCKER:
-                print(f'{diff}. To proceed, send a SIGUSR1 signal with "docker kill -s=SIGUSR1 <container_name>"')
-            elif not IS_TTY:
-                print(f'{diff}. To proceed, send a SIGUSR1 signal with "kill -s=SIGUSR1 {os.getpid()}"')
-            else:
-                print(f'{diff}. Press "c" (and ENTER) to proceed')
-        else:
-            print(f"{diff}")
 
-        event.wait(timeout=5)
+    LSN_UPDATE_INTERVAL_SECONDS=30
+    REPLAY_CATCHUP_WINDOW_SECONDS=10 # if replay will catchup within this time, count it as being complete
+
+    print("[live-replay] Getting replication progress")
+    wal_lsn, replay_lsn = get_source_wal_lsn(), get_target_replay_lsn()
+    event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
+
+    while not event.is_set() and follow_proc.process.poll() is None:
+        prev_wal_lsn, prev_replay_lsn = wal_lsn, replay_lsn
+        wal_lsn, replay_lsn = get_source_wal_lsn(), get_target_replay_lsn()
+        wal_bytes_per_second = get_lsn_diff_bytes(wal_lsn, prev_wal_lsn) / LSN_UPDATE_INTERVAL_SECONDS
+        replay_bytes_per_second = get_lsn_diff_bytes(replay_lsn, prev_replay_lsn) / LSN_UPDATE_INTERVAL_SECONDS
+        wal_replay_lag_bytes = get_lsn_diff_bytes(wal_lsn, replay_lsn)
+
+        stats = f"(source_wal_rate: {bytes_to_human(wal_bytes_per_second)}/s, target_replay_rate: {bytes_to_human(replay_bytes_per_second)}/s, replay_lag: {bytes_to_human(wal_replay_lag_bytes)})"
+
+        net_replay_per_second = replay_bytes_per_second - wal_bytes_per_second
+
+        replay_will_catch_up_soon = wal_replay_lag_bytes < REPLAY_CATCHUP_WINDOW_SECONDS * net_replay_per_second
+
+        if wal_replay_lag_bytes < REPLICATION_LAG_THRESHOLD_BYTES or replay_will_catch_up_soon:
+            print(f"[live-replay] Target has caught up with source {stats}")
+            if not IS_TTY and LIVE_MIGRATION_DOCKER:
+                print(f"              To stop replication, send a SIGUSR1 signal with 'docker kill -s=SIGUSR1 <container_name>'")
+            elif not IS_TTY:
+                print(f"              To stop replication. To proceed, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+            else:
+                print(f"              To stop replication, hit 'c' and then ENTER")
+        elif net_replay_per_second <= 0:
+            print(f"[live-replay] WARN not keeping up with source load {stats}")
+        elif net_replay_per_second > 0:
+            arrival_seconds = wal_replay_lag_bytes / net_replay_per_second
+            print(f"[live-replay] Will complete in {seconds_to_human(arrival_seconds)} {stats}" )
+        event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
 
     if follow_proc.process.poll() is not None and follow_proc.process.returncode != 0:
         raise Exception(f"pgcopydb follow exited with code: {follow_proc.process.returncode}")
