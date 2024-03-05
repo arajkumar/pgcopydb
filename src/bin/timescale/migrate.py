@@ -312,9 +312,9 @@ sed -i -E \
 
 
 @telemetry_command("migrate_existing_data_from_ts")
-def migrate_existing_data_from_ts():
+def migrate_existing_data_from_ts(args):
     print("Copying table data ...")
-    clone_table_data = " ".join([
+    clone_table_data = [
         "pgcopydb",
         "clone",
         "--skip-extensions",
@@ -327,9 +327,13 @@ def migrate_existing_data_from_ts():
         "$PGCOPYDB_DIR/pgcopydb_clone",
         "--snapshot",
         "$(cat $PGCOPYDB_DIR/snapshot)",
-        "--resume",
         "--notice",
-        ])
+        ]
+
+    if args.resume:
+        clone_table_data.append("--resume")
+
+    clone_table_data = " ".join(clone_table_data)
 
     with timeit():
        run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
@@ -409,6 +413,7 @@ def migrate(args):
     # Clean up pid files. This might cause issues in docker environment due
     # deterministic pid values.
     (args.dir / "pgcopydb.pid").unlink(missing_ok=True)
+    (args.dir / "pgcopydb_clone" / "pgcopydb.pid").unlink(missing_ok=True)
 
     if not (args.dir / "snapshot").exists():
         print("You must create a snapshot before starting the migration.")
@@ -502,7 +507,7 @@ def migrate(args):
                 if source_type == DBType.POSTGRES:
                     migrate_existing_data_from_pg(target_type)
                 else:
-                    migrate_existing_data_from_ts()
+                    migrate_existing_data_from_ts(args)
                 mark_section_complete("initial-data-migration")
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)

@@ -33,6 +33,7 @@ def docker_command(name, *args):
             docker run -it --rm --name {name} \
             -e PGCOPYDB_SOURCE_PGURI=$SOURCE \
             -e PGCOPYDB_TARGET_PGURI=$TARGET \
+            --pid=host \
             -v ~/live-migration:{env['PGCOPYDB_DIR']} \
             timescale/live-migration:v{SCRIPT_VERSION} \
             {" ".join(args)}""".rstrip()

@@ -15,83 +15,54 @@ docker buildx  build --tag live-migration  -f Dockerfile.live-migration .
 
 To run the live-migration:
 
-```sh
-docker run --rm -it \
-  -e PGCOPYDB_SOURCE_PGURI=$SOURCE  \
-  -e PGCOPYDB_TARGET_PGURI=$TARGET \
-  timescale/live-migration:edge
-```
+> [!IMPORTANT]
+> Always mount host directory as a docker volume(using -v option) to support
+> resume after interruption.
 
-To persist the CDC replicated files to support resuming:
+1) Create snapshot
 
 ```sh
-docker run --rm -it \
+docker run --rm -it --name live-migration-snapshot \
   -e PGCOPYDB_SOURCE_PGURI=$SOURCE  \
   -e PGCOPYDB_TARGET_PGURI=$TARGET \
-  -v {path/on/host}:/opt/timescale/ts_cdc
-  timescale/live-migration:edge
+  --pid=host \
+  -v ~/live-migration:/opt/timescale/ts_cdc \
+  timescale/live-migration:edge \
+  snapshot
 ```
 
-To use with docker-compose:
+> [!NOTE]
+> The above command would block the terminal, run it either as docker
+> daemon (using -d) or shell background process(using &).
 
-```yaml
-networks:
-  ts_ex_app:
-    driver: bridge
-services:
-  source:
-    image: timescale/timescaledb-ha:pg15.4-ts2.12.2-all
-    ports:
-      - 5432
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=custompassword1
-      - POSTGRES_DB=ts_ex_app_repo
-    networks:
-      - ts_ex_app
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 10s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-      start_interval: 10s
-    command:
-      - "postgres"
-      - "-c"
-      - "wal_level=logical"
-  target:
-    image: timescale/timescaledb-ha:pg15.4-ts2.12.2-all
-    ports:
-      - 5432
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=custompassword1
-      - POSTGRES_DB=ts_ex_app_repo
-    networks:
-      - ts_ex_app
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"]
-      interval: 10s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-      start_interval: 10s
-  live:
-    image: timescale/live-migration:edge
-    networks:
-      - ts_ex_app
-    environment:
-      PGCOPYDB_SOURCE_PGURI: postgresql://postgres:custompassword1@source/ts_ex_app_repo
-      PGCOPYDB_TARGET_PGURI: postgresql://postgres:custompassword1@target/ts_ex_app_repo
-    depends_on:
-      source:
-        condition: service_healthy
-      target:
-        condition: service_healthy
-    volumes:
-      - "/Users/adn/dev/timescale/pgcopydb/src/bin/timescale/:/opt/timescale"
+2) Run migration
+
+```sh
+docker run --rm -it --name live-migration-migrate \
+  -e PGCOPYDB_SOURCE_PGURI=$SOURCE  \
+  -e PGCOPYDB_TARGET_PGURI=$TARGET \
+  --pid=host \
+  -v ~/live-migration:/opt/timescale/ts_cdc \
+  timescale/live-migration:edge \
+  migrate
 ```
+- `--resume` will resume interrupted migration from the last known consistent
+point.
+
+3) Once migration is complete, clean the intermediate files and database
+objects created for migration
+
+```sh
+docker run --rm -it --name live-migration-clean \
+  -e PGCOPYDB_SOURCE_PGURI=$SOURCE  \
+  -e PGCOPYDB_TARGET_PGURI=$TARGET \
+  --pid=host \
+  -v ~/live-migration:/opt/timescale/ts_cdc \
+  timescale/live-migration:edge \
+  clean
+```
+
+- `--prune` will remove all intermediate files freeing up disk space
 
 ## Release
 

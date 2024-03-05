@@ -149,6 +149,26 @@ copydb_process_table_data(CopyDataSpec *specs)
 	}
 
 	/*
+	 * When we interrupt the clone process while indexes are being
+	 * created, it might create the index on target but not update the
+	 * done file. This is a problem because the next time you run
+	 * pgcopydb, it will miss the indexes and never update the restore
+	 * list file causing the indexes to be created again on post-data
+	 * restore which would result in an error.
+	 *
+	 * copydb_copy_all_indexes will attempt with CREATE IF NOT EXISTS
+	 * to create the indexes that are missing and updates the done file
+	 * to reflect that.
+	 */
+	if (errors == 0 &&
+		specs->resume &&
+		!copydb_copy_all_indexes(specs))
+	{
+		/* errors have already been logged */
+		++errors;
+	}
+
+	/*
 	 * Are blobs table data? well pg_dump --section sayth yes.
 	 */
 	if (errors == 0 && !copydb_start_blob_process(specs))

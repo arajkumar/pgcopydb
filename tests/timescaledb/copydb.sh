@@ -41,21 +41,14 @@ EOF
 psql ${PGCOPYDB_TARGET_PGURI_SU} -f /usr/src/pgcopydb/tsdb_grants.sql
 
 # copy the extensions separately, needs superuser (both on source and target)
-pg_dump -d "$PGCOPYDB_SOURCE_PGURI_SU" \
-  --format=plain \
-  --quote-all-identifiers \
-  --no-tablespaces \
-  --no-owner \
-  --no-privileges \
-  --extension='timescaledb' \
-  --exclude-schema='public' \
-  --exclude-table='_timescaledb_internal.*' \
-  --data-only \
-  --file=/tmp/ext-dump.sql
 
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
-    -c 'select public.timescaledb_pre_restore();' \
-    -f /tmp/ext-dump.sql \
+    -c 'select public.timescaledb_pre_restore();'
+
+pgcopydb copy extensions --source ${PGCOPYDB_SOURCE_PGURI_SU} \
+  --target ${PGCOPYDB_TARGET_PGURI_SU} --resume
+
+psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
     -f - <<'EOF'
 begin;
 select public.timescaledb_post_restore();
@@ -71,7 +64,7 @@ EOF
 pgcopydb stream setup
 
 # now clone with superuser privileges, seems to be required for timescaledb
-pgcopydb clone --resume \
+pgcopydb clone \
          --skip-extensions \
          --source ${PGCOPYDB_SOURCE_PGURI_SU} \
          --target ${PGCOPYDB_TARGET_PGURI_SU}
