@@ -53,7 +53,7 @@ static bool computeTxnMetadataFilename(uint32_t xid, const char *dir, char *file
 
 static bool writeTxnCommitMetadata(LogicalMessageMetadata *mesg, const char *dir);
 
-static bool setupConnection(StreamApplyContext *context);
+static bool setupConnection(PGSQL *pgsql, StreamApplyContext *context);
 
 /*
  * stream_apply_catchup catches up with SQL files that have been prepared by
@@ -236,12 +236,6 @@ stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context)
 	if (!setupReplicationOrigin(context, specs->logSQL))
 	{
 		log_error("Failed to setup replication origin on the target database");
-		return false;
-	}
-
-	if (!setupConnection(context))
-	{
-		log_error("Failed to setup pipeline mode on the target database");
 		return false;
 	}
 
@@ -627,14 +621,13 @@ stream_apply_file(StreamApplyContext *context)
 			return false;
 		}
 
-		/* Sync at COMMIT if statement batch size is reached */
 		if ((metadata->action == STREAM_ACTION_COMMIT ||
 			 metadata->action == STREAM_ACTION_KEEPALIVE) &&
 			(time(NULL) - last >= 10))
 		{
-			/* fetch results until done */
 			log_trace("Pipeline sync begin");
 
+			/* fetch results until done */
 			if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 			{
 				/* errors have already been logged */
@@ -646,13 +639,14 @@ stream_apply_file(StreamApplyContext *context)
 
 			log_trace("Pipeline sync completed until %X/%X",
 					LSN_FORMAT_ARGS(context->previousLSN));
-			last = time(NULL);
 
+			last = time(NULL);
 		}
 	}
 
 	log_trace("Pipeline sync begin");
 
+	/* always sync at the end of a file */
 	if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 	{
 		/* errors have already been logged */
@@ -973,7 +967,7 @@ stream_apply_sql(StreamApplyContext *context,
 			 * An idle source producing only KEEPALIVE should move the
 			 * replay_lsn forward.
 			 */
-			if (false && !stream_apply_track_insert_lsn(context, metadata->lsn))
+			if (!stream_apply_track_insert_lsn(context, metadata->lsn))
 			{
 				log_error("Failed to track target LSN position, "
 						  "see above for details");
@@ -1134,7 +1128,7 @@ stream_apply_sql(StreamApplyContext *context,
 				break;
 			}
 
-			if (false && !stream_apply_track_insert_lsn(context, metadata->lsn))
+			if (!stream_apply_track_insert_lsn(context, metadata->lsn))
 			{
 				log_error("Failed to track target LSN position, "
 						  "see above for details");
@@ -1300,16 +1294,14 @@ stream_apply_sql(StreamApplyContext *context,
 
 
 /*
- * setupPipeline ensures that the target database connection is
+ * setupConnection ensures that the target database connection is
  * prepared for pipeline mode. We want to have a dedicated connection for
  * pipeline mode, so that we can control the lifecycle of that connection
  * separately from the main connection.
  */
 static bool
-setupConnection(StreamApplyContext *context)
+setupConnection(PGSQL *pgsql, StreamApplyContext *context)
 {
-	PGSQL *pgsql = &(context->pgsql);
-
 	if (!pgsql_init(pgsql,
 					context->connStrings->target_pguri,
 					PGSQL_CONN_TARGET))
@@ -1342,17 +1334,25 @@ setupReplicationOrigin(StreamApplyContext *context, bool logSQL)
 	PGSQL *pgsql = &(context->pgsqlPipeline);
 	char *nodeName = context->origin;
 
-	if (!pgsql_init(pgsql, context->connStrings->target_pguri, PGSQL_CONN_TARGET))
+	/*
+	 * We want to have a dedicated connection for pipeline mode, so that we can
+	 * control the lifecycle of that connection separately from the other
+	 * connection.
+	 */
+	if (!setupConnection(pgsql, context))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	/* we're going to send several replication origin commands */
-	pgsql->connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
-
-	/* we also might want to skip logging any SQL query that we apply */
-	pgsql->logSQL = logSQL;
+	/*
+	 * Normal connection to find replay_lsn.
+	 */
+	if (!setupConnection(&context->pgsql, context))
+	{
+		log_error("Failed to setup pipeline mode on the target database");
+		return false;
+	}
 
 	uint32_t oid = 0;
 

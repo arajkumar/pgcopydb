@@ -1842,34 +1842,36 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 }
 
 
+/*
+ * pgsql_enter_pipeline_mode enables the pipeline mode in the given PGSQL
+ * connection. It also sets the connection to non-blocking mode.
+ */
 bool
 pgsql_enter_pipeline_mode(PGSQL *pgsql)
 {
-	PGconn *connection = pgsql_open_connection(pgsql);
+	PGconn *conn = pgsql_open_connection(pgsql);
 
-	if (connection == NULL)
+	if (conn == NULL)
 	{
 		return false;
 	}
 
-	PGpipelineStatus pipelineStatus = PQpipelineStatus(connection);
-
-	if (pipelineStatus == PQ_PIPELINE_ON)
+	if (PQpipelineStatus(conn) == PQ_PIPELINE_ON)
 	{
-		return true;
+		log_error("BUG: pgsql_enter_pipeline_mode called with connection "
+				  "already in pipeline mode");
+		return false;
 	}
 
-	int status = PQenterPipelineMode(connection);
-
-	if (status != 1)
+	/* enter pipeline mode */
+	if (PQenterPipelineMode(conn) != 1)
 	{
 		(void) pgcopy_log_error(pgsql, NULL, "Failed to enter pipeline");
 		return false;
 	}
 
-	status = PQsetnonblocking(connection, 1 /* 1-non blocking, 0-blocking */);
-
-	if (status != 0)
+	/* set non-blocking mode */
+	if (PQsetnonblocking(conn, 1) != 0)
 	{
 		(void) pgcopy_log_error(pgsql, NULL, "Failed to set non-blocking mode");
 		return false;
@@ -1879,6 +1881,11 @@ pgsql_enter_pipeline_mode(PGSQL *pgsql)
 	return true;
 }
 
+
+/*
+ * pgsql_drain_pipeline drains the pipeline by sending a SYNC message and
+ * reading until we get a PGRES_PIPELINE_SYNC result.
+ */
 bool
 pgsql_drain_pipeline(PGSQL *pgsql)
 {
@@ -2001,6 +2008,7 @@ pgsql_drain_pipeline(PGSQL *pgsql)
 	log_error("Failed to drain pipeline");
 	return false;
 }
+
 
 /*
  * pgsql_prepare implements server-side prepared statements by using the

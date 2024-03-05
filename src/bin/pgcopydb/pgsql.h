@@ -298,7 +298,6 @@ bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 				   int paramCount, const Oid *paramTypes);
 
 bool pgsql_enter_pipeline_mode(PGSQL *pgsql);
-bool pgsql_exit_pipeline_mode(PGSQL *pgsql);
 bool pgsql_drain_pipeline(PGSQL *pgsql);
 
 bool pgsql_execute_prepared(PGSQL *pgsql, const char *name,

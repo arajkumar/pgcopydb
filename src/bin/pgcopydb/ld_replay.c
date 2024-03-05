@@ -215,15 +215,18 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 				}
 			}
 
+			/* rate limit to 10 pipeline syncs per second */
 			if (10 < (now - context->pipelineSyncTime))
 			{
-				log_info("Replay pipeline sync begin");
+				log_trace("Replay pipeline sync begin");
+
 				if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
 				{
 					/* errors have already been logged */
 					return false;
 				}
-				log_info("Replay pipeline sync at %X/%X done %d",
+
+				log_trace("Replay pipeline sync at %X/%X",
 						 LSN_FORMAT_ARGS(context->previousLSN));
 
 				context->pipelineSyncTime = now;
