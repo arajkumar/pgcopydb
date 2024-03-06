@@ -1897,6 +1897,8 @@ pgsql_pipeline_sync(PGSQL *pgsql)
 		return false;
 	}
 
+	log_trace("Start pipeline sync");
+
 	if (PQpipelineStatus(conn) != PQ_PIPELINE_ON)
 	{
 		log_error("BUG: Connection is not in pipeline mode");
@@ -1919,7 +1921,9 @@ pgsql_pipeline_sync(PGSQL *pgsql)
 		return false;
 	}
 
-	while (true)
+	bool syncReceived = false;
+
+	while (!syncReceived)
 	{
 		if (asked_to_quit || asked_to_stop || asked_to_stop_fast)
 		{
@@ -1971,6 +1975,7 @@ pgsql_pipeline_sync(PGSQL *pgsql)
 		}
 
 		int results = 0;
+
 		while (!PQisBusy(conn))
 		{
 			PGresult *res = PQgetResult(conn);
@@ -1993,8 +1998,11 @@ pgsql_pipeline_sync(PGSQL *pgsql)
 
 			if (resultStatus == PGRES_PIPELINE_SYNC)
 			{
-				log_debug("Received pipeline. Total results: %d", results);
-				return true;
+				syncReceived = true;
+
+				log_trace("Received pipeline sync. Total results: %d", results);
+
+				break;
 			}
 
 			if (!is_response_ok(res))
@@ -2005,8 +2013,9 @@ pgsql_pipeline_sync(PGSQL *pgsql)
 		}
 	}
 
-	log_error("Failed to drain pipeline");
-	return false;
+	log_trace("Endof pipeline sync");
+
+	return true;
 }
 
 
