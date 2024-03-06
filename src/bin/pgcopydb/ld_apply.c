@@ -598,7 +598,7 @@ stream_apply_file(StreamApplyContext *context)
 		}
 	}
 
-	uint32_t last = 0;
+	uint32_t last = time(NULL);
 
 	/* replay the SQL commands from the SQL file */
 	for (int i = 0; i < content.count && !context->reachedEndPos; i++)
@@ -623,12 +623,10 @@ stream_apply_file(StreamApplyContext *context)
 
 		if ((metadata->action == STREAM_ACTION_COMMIT ||
 			 metadata->action == STREAM_ACTION_KEEPALIVE) &&
-			(time(NULL) - last >= 10))
+			(10 < (time(NULL) - last)))
 		{
-			log_trace("Pipeline sync begin");
-
 			/* fetch results until done */
-			if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
+			if (!pgsql_pipeline_sync(&(context->pgsqlPipeline)))
 			{
 				/* errors have already been logged */
 				free(content.buffer);
@@ -637,17 +635,12 @@ stream_apply_file(StreamApplyContext *context)
 				return false;
 			}
 
-			log_trace("Pipeline sync completed until %X/%X",
-					LSN_FORMAT_ARGS(context->previousLSN));
-
 			last = time(NULL);
 		}
 	}
 
-	log_trace("Pipeline sync begin");
-
 	/* always sync at the end of a file */
-	if (!pgsql_drain_pipeline(&(context->pgsqlPipeline)))
+	if (!pgsql_pipeline_sync(&(context->pgsqlPipeline)))
 	{
 		/* errors have already been logged */
 		free(content.buffer);
@@ -655,9 +648,6 @@ stream_apply_file(StreamApplyContext *context)
 
 		return false;
 	}
-
-	log_trace("Pipeline sync completed until %X/%X",
-			LSN_FORMAT_ARGS(context->previousLSN));
 
 
 	/* free dynamic memory that's not needed anymore */
@@ -1436,7 +1426,7 @@ setupReplicationOrigin(StreamApplyContext *context, bool logSQL)
 	}
 
 	/* ensure that we're in pipeline mode */
-	if (!pgsql_enter_pipeline_mode(pgsql))
+	if (!pgsql_pipeline_enter(pgsql))
 	{
 		/* errors have already been logged */
 		return false;

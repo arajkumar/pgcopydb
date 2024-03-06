@@ -164,7 +164,7 @@ set_logger()
 	bool interactive = isatty(fileno(stderr));
 
 	log_use_colors(interactive);
-	log_show_file_line(true);
+	log_show_file_line(!interactive);
 
 	bool logJSON = false;
 	bool logJSONFile = false;

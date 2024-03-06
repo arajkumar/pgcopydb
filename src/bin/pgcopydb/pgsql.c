@@ -1843,11 +1843,11 @@ pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 
 
 /*
- * pgsql_enter_pipeline_mode enables the pipeline mode in the given PGSQL
+ * pgsql_pipeline_enter enables the pipeline mode in the given PGSQL
  * connection. It also sets the connection to non-blocking mode.
  */
 bool
-pgsql_enter_pipeline_mode(PGSQL *pgsql)
+pgsql_pipeline_enter(PGSQL *pgsql)
 {
 	PGconn *conn = pgsql_open_connection(pgsql);
 
@@ -1858,7 +1858,7 @@ pgsql_enter_pipeline_mode(PGSQL *pgsql)
 
 	if (PQpipelineStatus(conn) == PQ_PIPELINE_ON)
 	{
-		log_error("BUG: pgsql_enter_pipeline_mode called with connection "
+		log_error("BUG: pgsql_pipeline_enter called with connection "
 				  "already in pipeline mode");
 		return false;
 	}
@@ -1883,17 +1883,17 @@ pgsql_enter_pipeline_mode(PGSQL *pgsql)
 
 
 /*
- * pgsql_drain_pipeline drains the pipeline by sending a SYNC message and
+ * pgsql_pipeline_sync drains the pipeline by sending a SYNC message and
  * reading until we get a PGRES_PIPELINE_SYNC result.
  */
 bool
-pgsql_drain_pipeline(PGSQL *pgsql)
+pgsql_pipeline_sync(PGSQL *pgsql)
 {
 	PGconn *conn = pgsql->connection;
 
 	if (conn == NULL)
 	{
-		log_error("BUG: pgsql_drain_pipeline called with NULL connection");
+		log_error("BUG: pgsql_pipeline_sync called with NULL connection");
 		return false;
 	}
 

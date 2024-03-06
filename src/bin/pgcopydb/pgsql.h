@@ -297,8 +297,8 @@ bool pgsql_fetch_results(PGSQL *pgsql, bool *done,
 bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 				   int paramCount, const Oid *paramTypes);
 
-bool pgsql_enter_pipeline_mode(PGSQL *pgsql);
-bool pgsql_drain_pipeline(PGSQL *pgsql);
+bool pgsql_pipeline_enter(PGSQL *pgsql);
+bool pgsql_pipeline_sync(PGSQL *pgsql);
 
 bool pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 							int paramCount, const char **paramValues,
