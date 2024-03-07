@@ -102,7 +102,7 @@ stream_apply_catchup(StreamSpecs *specs)
 			log_info("File \"%s\" does not exists yet, exit",
 					 context.sqlFileName);
 
-			(void) pgsql_finish(&(context.pgsql));
+			(void) stream_apply_cleanup(&context);
 			return true;
 		}
 
@@ -112,7 +112,7 @@ stream_apply_catchup(StreamSpecs *specs)
 		if (!stream_apply_file(&context))
 		{
 			/* errors have already been logged */
-			(void) pgsql_finish(&(context.pgsql));
+			(void) stream_apply_cleanup(&context);
 			return false;
 		}
 
@@ -144,7 +144,7 @@ stream_apply_catchup(StreamSpecs *specs)
 		if (!computeSQLFileName(&context))
 		{
 			/* errors have already been logged */
-			(void) pgsql_finish(&(context.pgsql));
+			(void) stream_apply_cleanup(&context);
 			return false;
 		}
 
@@ -160,7 +160,7 @@ stream_apply_catchup(StreamSpecs *specs)
 					 LSN_FORMAT_ARGS(context.previousLSN));
 
 			/* make sure we close the connection on the way out */
-			(void) pgsql_finish(&(context.pgsql));
+			(void) stream_apply_cleanup(&context);
 			return true;
 		}
 
@@ -168,7 +168,7 @@ stream_apply_catchup(StreamSpecs *specs)
 	}
 
 	/* make sure we close the connection on the way out */
-	(void) pgsql_finish(&(context.pgsql));
+	(void) stream_apply_cleanup(&context);
 	return true;
 }
 
@@ -264,6 +264,21 @@ stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context)
 				 process,
 				 LSN_FORMAT_ARGS(context->previousLSN));
 	}
+
+	return true;
+}
+
+
+/*
+ * stream_apply_cleanup cleans up the resources used by the apply process.
+ */
+bool
+stream_apply_cleanup(StreamApplyContext *context)
+{
+	/* make sure we close the connection on the way out */
+	(void) pgsql_finish(&(context->pgsql));
+
+	(void) pgsql_finish(&(context->pgsqlPipeline));
 
 	return true;
 }
@@ -1346,7 +1361,7 @@ setupReplicationOrigin(StreamApplyContext *context, bool logSQL)
 	 */
 	if (!setupConnection(&context->pgsql, context))
 	{
-		log_error("Failed to setup pipeline mode on the target database");
+		log_error("Failed to setup pipeline mode on target connection");
 		return false;
 	}
 
