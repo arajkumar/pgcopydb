@@ -2103,6 +2103,16 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 		return false;
 	}
 
+	bool pipelineMode = PQpipelineStatus(connection) == PQ_PIPELINE_ON;
+
+	/* parseFun is not allowed in pipeline mode */
+	if (pipelineMode && parseFun != NULL)
+	{
+		log_error("BUG: pgsql_execute_prepared called in pipeline mode "
+				  "with a parseFun callback");
+		return false;
+	}
+
 	char *endpoint =
 		pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET";
 
@@ -2129,20 +2139,31 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 		}
 	}
 
-	bool result = PQsendQueryPrepared(connection, name,
-									  paramCount, paramValues,
-									  NULL, NULL, 0);
+	PGresult *result = NULL;
 
-	/* log_info("send query prepared: %d", result); */
-	/* PGresult *result = PQgetResult(connection); */
-	if (!result)
+	bool ok = false;
+
+	if (pipelineMode)
 	{
-		const char *err = PQerrorMessage(connection);
+		ok = PQsendQueryPrepared(connection, name,
+						         paramCount, paramValues,
+				                 NULL, NULL, 0) != 0;
+	}
+	else
+	{
+		result = PQexecPrepared(connection, name,
+				                paramCount, paramValues,
+				                NULL, NULL, 0);
+
+		ok = is_response_ok(result);
+	}
+
+	if (!ok)
+	{
 		char sql[BUFSIZE] = { 0 };
 		sformat(sql, sizeof(sql), "EXECUTE %s;", name);
-		log_info("error: %s", err);
 
-		/* pgsql_execute_log_error(pgsql, result, sql, debugParameters, context); */
+		pgsql_execute_log_error(pgsql, result, sql, debugParameters, context);
 		destroyPQExpBuffer(debugParameters);
 
 		/*
@@ -2159,19 +2180,23 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 
 	if (parseFun != NULL)
 	{
-		/* (*parseFun)(context, result); */
+		(*parseFun)(context, result);
 	}
 
 	destroyPQExpBuffer(debugParameters);
 
-	/* PQclear(result); */
-	/*/ clear_results(pgsql); */
+	if (!pipelineMode)
+	{
+		PQclear(result);
+		clear_results(pgsql);
+	}
+
 	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
 	{
 		(void) pgsql_finish(pgsql);
 	}
 
-	return result;
+	return true;
 }
 
 
