@@ -206,7 +206,7 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 			}
 
 			/* rate limit to 1 update per 5 seconds */
-			else if (5 < (now - context->sentinelSyncTime))
+			else if (1 < (now - context->sentinelSyncTime))
 			{
 				if (!stream_apply_send_sync_sentinel(context))
 				{
@@ -215,8 +215,8 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 				}
 			}
 
-			/* rate limit to 1 pipeline sync per 10 seconds */
-			if (10 < (now - context->pipelineSyncTime))
+			/* rate limit to 1 pipeline sync per seconds */
+			if (1 < (now - context->pipelineSyncTime))
 			{
 				if (!pgsql_pipeline_sync(&(context->pgsqlPipeline)))
 				{

@@ -636,9 +636,10 @@ stream_apply_file(StreamApplyContext *context)
 			return false;
 		}
 
+		/* rate limit to 1 pipeline sync per second */
 		if ((metadata->action == STREAM_ACTION_COMMIT ||
 			 metadata->action == STREAM_ACTION_KEEPALIVE) &&
-			(10 < (time(NULL) - last)))
+			(1 < (time(NULL) - last)))
 		{
 			/* fetch results until done */
 			if (!pgsql_pipeline_sync(&(context->pgsqlPipeline)))
