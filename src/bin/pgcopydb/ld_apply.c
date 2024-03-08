@@ -949,12 +949,6 @@ stream_apply_sql(StreamApplyContext *context,
 				return false;
 			}
 
-			if (!pgsql_pipeline_flush(pgsql))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
 			context->transactionInProgress = false;
 			context->previousLSN = metadata->lsn;
 

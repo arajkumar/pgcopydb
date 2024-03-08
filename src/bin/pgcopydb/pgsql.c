@@ -1883,59 +1883,6 @@ pgsql_pipeline_enter(PGSQL *pgsql)
 
 
 /*
- * pgsql_pipeline_flush flushes libpq's pipeline buffers and sends the
- * pending commands/data to the server. It is always better to call
- * pgsql_pipeline_sync after COMMIT/ROLLBACK to make sure the server has
- * processed all the commands.
- */
-bool
-pgsql_pipeline_flush(PGSQL *pgsql)
-{
-	PGconn *conn = pgsql->connection;
-
-	if (conn == NULL)
-	{
-		log_error("BUG: pgsql_pipeline_flush called with NULL connection");
-		return false;
-	}
-
-	if (PQpipelineStatus(conn) != PQ_PIPELINE_ON)
-	{
-		log_error("BUG: Connection is not in pipeline mode");
-		return false;
-	}
-
-	bool done = false;
-
-	while (!done)
-	{
-		int flushStatus = PQflush(conn);
-
-		if (flushStatus == -1)
-		{
-			(void) pgcopy_log_error(pgsql, NULL, "Failed to flush pipeline");
-			return false;
-		}
-
-		if (flushStatus == 0)
-		{
-			/* we're done flushing */
-			done = true;
-		}
-		else
-		{
-			/* we may need to consume some input */
-			if (!pgsql_fetch_results(pgsql, &done, NULL, NULL))
-			{
-				return false;
-			}
-		}
-	}
-
-	return true;
-}
-
-/*
  * pgsql_pipeline_sync drains the pipeline by sending a SYNC message and
  * reading until we get a PGRES_PIPELINE_SYNC result.
  */
