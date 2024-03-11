@@ -1,19 +1,21 @@
 import shutil
+import logging
 
 from telemetry import telemetry_command
 from exec import run_cmd
 
+logger = logging.getLogger(__name__)
+
+
 @telemetry_command("cleanup")
 def cleanup(args):
-    print("Cleaning up ...")
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
-    print("Done")
+    logger.info("Cleaned logical decoding artifacts from source and target database ...")
 
     if args.prune:
         dir = str(args.dir.absolute())
-        print(f"Pruning {dir}...")
         shutil.rmtree(dir, ignore_errors=True)
-        print("Done")
+        logger.info(f"Pruned {dir}...")
 
 def clean(args):
     cleanup(args)

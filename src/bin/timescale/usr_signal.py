@@ -1,6 +1,10 @@
 import threading
+import logging
 import signal
 import os
+
+logger = logging.getLogger(__name__)
+
 
 def wait_for_keypress(event: threading.Event, key: str):
     """
@@ -12,7 +16,7 @@ def wait_for_keypress(event: threading.Event, key: str):
         while True:
             k = input()
             if k.lower() == key.lower():
-                print(f'Received key press event: "{key}"')
+                logger.info(f'Received key press event: "{key}"')
                 event.set()
                 break
 
@@ -24,7 +28,7 @@ def wait_for_keypress(event: threading.Event, key: str):
 
 def wait_for_sigusr1(event: threading.Event):
     def handler(signum, frame):
-        print("Received signal: SIGUSR1")
+        logger.info("Received signal: SIGUSR1")
         event.set()
     signal.signal(signal.SIGUSR1, handler)
 

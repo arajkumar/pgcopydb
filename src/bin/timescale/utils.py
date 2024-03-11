@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import tempfile
+import logging
 
 from pathlib import Path
 from time import perf_counter
@@ -9,6 +10,8 @@ from urllib.parse import urlparse
 from version import SCRIPT_VERSION
 from environ import LIVE_MIGRATION_DOCKER, env
 
+logger = logging.getLogger(__name__)
+
 class timeit:
     def __enter__(self):
         self.start = perf_counter()
@@ -16,7 +19,7 @@ class timeit:
 
     def __exit__(self, type, value, traceback):
         self.time = perf_counter() - self.start
-        print(f"=> Completed in {seconds_to_human(self.time)}")
+        logger.info(f"=> Completed in {seconds_to_human(self.time)}")
 
 
 def seconds_to_human(seconds):
@@ -109,9 +112,10 @@ def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, t
                                     text=True)
     r = str(proc.stdout)
     if r != "":
-        print(f"\n\n---------LOGS WITH ERROR FROM '{log_path}'---------")
-        print(r)
-        print("------------------END------------------")
+        logger.error(f"---------LOGS WITH ERROR FROM '{log_path}'---------")
+        for l in r.splitlines():
+            logger.error(l)
+        logger.error("------------------END------------------")
 
     if tail > 0:
         proc = subprocess.run(f"tail -n {tail} {log_path}",
@@ -122,6 +126,7 @@ def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, t
                                         text=True)
         r = str(proc.stdout)
         if r != "":
-            print(f"\n---------LAST {tail} LOG LINES FROM '{log_path}'---------")
-            print(r)
-            print("------------------END------------------")
+            logger.info(f"---------LAST {tail} LOG LINES FROM '{log_path}'---------")
+            for l in r.splitlines():
+                logger.info(l)
+            logger.info("------------------END------------------")

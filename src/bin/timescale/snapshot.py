@@ -1,17 +1,21 @@
 import sys
 import subprocess
+import logging
 
 from utils import docker_command
 
+logger = logging.getLogger(__name__)
+
+
 def snapshot(args):
     if (args.dir / "snapshot").exists():
-        print("Snapshot file already exists.")
-        print("Snapshot process is either running or not cleaned up properly.")
+        logger.error("Snapshot file already exists.")
+        logger.error("Snapshot process is either running or not cleaned up properly.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(1)
 
-    print("Creating snapshot ...")
+    logger.info("Creating snapshot ...")
     # Clean up pid files. This might cause issues in docker environment due
     # deterministic pid values.
     (args.dir / "pgcopydb.snapshot.pid").unlink(missing_ok=True)
@@ -35,8 +39,7 @@ def snapshot(args):
         snapshot_id = process.stdout.readline().strip()
 
     if snapshot_id != '':
-        print(f"Snapshot {snapshot_id} created successfully.")
-        print()
+        logger.info(f"Snapshot {snapshot_id} created successfully.")
         print("You can now start the migration process by running the following command:")
         print(docker_command("live-migration-migrate", "migrate"))
 
@@ -48,8 +51,8 @@ def snapshot(args):
             process.terminate()
             process.wait()
     else:
-        print("Snapshot creation failed.")
-        print("You may need to cleanup and retry the snapshot creation.")
+        logger.error("Snapshot creation failed.")
+        logger.error("You may need to cleanup and retry the snapshot creation.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(process.returncode)

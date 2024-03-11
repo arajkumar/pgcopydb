@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import threading
+import logging
 
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,8 @@ from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql
 from utils import bytes_to_human, seconds_to_human
+
+logger = logging.getLogger(__name__)
 
 REPLICATION_LAG_THRESHOLD_BYTES = 512000  # 500KiB.
 
@@ -64,7 +67,7 @@ def check_timescaledb_version():
 
 @telemetry_command("create_follow")
 def create_follow(resume: bool = False):
-    print(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}...")
+    logger.info(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}...")
 
     follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR"
     if resume:
@@ -117,11 +120,11 @@ def monitor_db_sizes() -> threading.Event:
         store_val("src_existing_data_size", src_size)
 
     stop_event = threading.Event()
-    print("[WATCH] Monitoring progress ...")
+    logger.info("Monitoring initial copy progress ...")
     def get_and_print_size():
         while not stop_event.is_set():
             tgt_size = run_sql(execute_on_target=True, sql=DB_SIZE_SQL)[:-1]
-            print(f"[WATCH] {tgt_size} copied to Target DB (Source DB is {src_size})")
+            logger.info(f"{tgt_size} copied to Target DB (Source DB is {src_size})")
             stop_event.wait(timeout=60)
     t = threading.Thread(target=get_and_print_size)
     t.daemon = True
@@ -138,7 +141,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
     # <-- create hypertables -->
     # pgcopydb clone --skip-extensions --no-acl --no-owner
     if not is_section_migration_complete("pre-data-dump"):
-        print(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+        logger.info(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
         with timeit():
             pgdump_command = " ".join(["pg_dump",
                                        "-d",
@@ -155,7 +158,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
         mark_section_complete("pre-data-dump")
 
     if not is_section_migration_complete("post-data-dump"):
-        print(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
+        logger.info(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
         with timeit():
             pgdump_command = " ".join(["pg_dump",
                                        "-d",
@@ -172,7 +175,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
         mark_section_complete("post-data-dump")
 
     if not is_section_migration_complete("pre-data-restore"):
-        print("Restoring pre-data ...")
+        logger.info("Restoring pre-data ...")
         with timeit():
             log_path = f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore"
             psql_command = " ".join(["psql",
@@ -197,7 +200,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
     stop_progress = monitor_db_sizes()
 
     if not is_section_migration_complete("copy-table-data"):
-        print("Copying table data ...")
+        logger.info("Copying table data ...")
         copy_table_data = " ".join(["pgcopydb",
                                  "copy",
                                  "table-data",
@@ -216,7 +219,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
         mark_section_complete("copy-table-data")
 
     if not is_section_migration_complete("post-data-restore"):
-        print("Restoring post-data ...")
+        logger.info("Restoring post-data ...")
         with timeit():
             log_path = f"{env['PGCOPYDB_DIR']}/logs/post_data_restore"
             psql_command = " ".join(["psql",
@@ -234,7 +237,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
         mark_section_complete("post-data-restore")
 
     if not is_section_migration_complete("analyze-db"):
-        print("Perform ANALYZE on target DB tables ...")
+        logger.info("Perform ANALYZE on target DB tables ...")
         with timeit():
             vaccumdb_command = " ".join(["vacuumdb",
                                         # There won't be anything to
@@ -255,10 +258,10 @@ def migrate_existing_data_from_pg(target_type: DBType):
 @telemetry_command("migrate_extensions")
 def migrate_extensions(target_type):
     if target_type == DBType.TIMESCALEDB:
-        print("Timescale pre-restore ...")
+        logger.info("Timescale pre-restore ...")
         run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
 
-    print("Copy extension config tables ...")
+    logger.info("Copy extension config tables ...")
     with timeit():
         copy_extensions = " ".join([
             "pgcopydb",
@@ -273,7 +276,7 @@ def migrate_extensions(target_type):
         run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
 
     if target_type == DBType.TIMESCALEDB:
-        print("Timescale post-restore ...")
+        logger.info("Timescale post-restore ...")
         run_sql(execute_on_target=True,
                 sql="""
                 begin;
@@ -287,7 +290,7 @@ def migrate_extensions(target_type):
 
 @telemetry_command("migrate_roles")
 def migrate_roles():
-    print(f"Dumping roles to {env['PGCOPYDB_DIR']}/roles.sql ...")
+    logger.info(f"Dumping roles to {env['PGCOPYDB_DIR']}/roles.sql ...")
     with timeit():
         source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
         source_dbname = dbname_from_uri(source_pg_uri)
@@ -340,7 +343,7 @@ sed -i -E \
 
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts(args):
-    print("Copying table data ...")
+    logger.info("Copying table data ...")
     clone_table_data = [
         "pgcopydb",
         "clone",
@@ -384,7 +387,7 @@ def wait_for_DBs_to_sync(follow_proc):
     LSN_UPDATE_INTERVAL_SECONDS=30
     REPLAY_CATCHUP_WINDOW_SECONDS=10 # if replay will catchup within this time, count it as being complete
 
-    print("[live-replay] Getting replication progress")
+    logger.info("Getting replication progress")
     wal_lsn, replay_lsn = get_source_wal_lsn(), get_target_replay_lsn()
     event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
 
@@ -402,18 +405,18 @@ def wait_for_DBs_to_sync(follow_proc):
         replay_will_catch_up_soon = wal_replay_lag_bytes < REPLAY_CATCHUP_WINDOW_SECONDS * net_replay_per_second
 
         if wal_replay_lag_bytes < REPLICATION_LAG_THRESHOLD_BYTES or replay_will_catch_up_soon:
-            print(f"[live-replay] Target has caught up with source {stats}")
+            logger.info(f"Target has caught up with source {stats}")
             if not IS_TTY and LIVE_MIGRATION_DOCKER:
-                print(f"              To stop replication, send a SIGUSR1 signal with 'docker kill -s=SIGUSR1 <container_name>'")
+                logger.info(f"\tTo stop replication, send a SIGUSR1 signal with 'docker kill -s=SIGUSR1 <container_name>'")
             elif not IS_TTY:
-                print(f"              To stop replication. To proceed, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
+                logger.info(f"\tTo stop replication. To proceed, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
             else:
-                print(f"              To stop replication, hit 'c' and then ENTER")
+                logger.info(f"\tTo stop replication, hit 'c' and then ENTER")
         elif net_replay_per_second <= 0:
-            print(f"[live-replay] WARN not keeping up with source load {stats}")
+            logger.info(f"WARN live-replay not keeping up with source load {stats}")
         elif net_replay_per_second > 0:
             arrival_seconds = wal_replay_lag_bytes / net_replay_per_second
-            print(f"[live-replay] Will complete in {seconds_to_human(arrival_seconds)} {stats}" )
+            logger.info(f"Live-replay will complete in {seconds_to_human(arrival_seconds)} {stats}" )
         event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
 
     if follow_proc.process.poll() is not None and follow_proc.process.returncode != 0:
@@ -471,8 +474,7 @@ def migrate(args):
     (args.dir / "pgcopydb_clone" / "pgcopydb.pid").unlink(missing_ok=True)
 
     if not (args.dir / "snapshot").exists():
-        print("You must create a snapshot before starting the migration.")
-        print()
+        logger.error("You must create a snapshot before starting the migration.")
         print("Run the following command to create a snapshot:")
         print(docker_command('live-migration-snapshot', 'snapshot'))
         sys.exit(1)
@@ -480,9 +482,8 @@ def migrate(args):
     # check whether the snapshot is valid if initial data migration
     # is not yet complete.
     if not is_section_migration_complete("initial-data-migration") and not is_snapshot_valid():
-            print("Invalid snapshot found. Snapshot process might have died or failed.")
-            print("Please restart the migration process.")
-            print()
+            logger.error("Invalid snapshot found. Snapshot process might have died or failed.")
+            logger.info("Please restart the migration process.")
             print("Run the following command to clean the existing resources:")
             print(docker_command('live-migration-clean', 'clean', '--prune'))
             print()
@@ -492,20 +493,18 @@ def migrate(args):
 
     # resume but no previous migration found
     if not replication_origin_exists() and args.resume:
-        print("No resumable migration found.")
-        print()
-        print("If you want to start the migration:")
+        logger.error("No resumable migration found.")
+        print("To start the migration:")
         print(docker_command('live-migration-migrate', 'migrate'))
         sys.exit(1)
 
     # if replication origin exists, then the previous migration was incomplete
     if replication_origin_exists() and not args.resume:
-        print("Found an incomplete migration.")
-        print()
-        print("If you want to resume the migration:")
+        logger.error("Found an incomplete migration.")
+        print("To resume the migration:")
         print(docker_command('live-migration-migrate', 'migrate', '--resume'))
         print()
-        print("If you want to start a new migration, you should clean the existing resources:")
+        print("To start a new migration, clean up the existing resources:")
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(1)
 
@@ -522,21 +521,21 @@ def migrate(args):
 
     match (source_type, target_type):
         case (DBType.POSTGRES, DBType.POSTGRES):
-            print("Migrating from Postgres to Postgres ...")
+            logger.info("Migrating from Postgres to Postgres ...")
         case (DBType.POSTGRES, DBType.TIMESCALEDB):
-            print("Migrating from Postgres to TimescaleDB ...")
+            logger.info("Migrating from Postgres to TimescaleDB ...")
         case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
-            print("Migrating from TimescaleDB to TimescaleDB ...")
+            logger.info("Migrating from TimescaleDB to TimescaleDB ...")
             check_timescaledb_version()
         case (DBType.TIMESCALEDB, DBType.POSTGRES):
-            print("Migration from TimescaleDB to Postgres is not supported")
+            logger.info("Migration from TimescaleDB to Postgres is not supported")
             sys.exit(1)
 
     caggs_count = 0
     if source_type == DBType.TIMESCALEDB:
         caggs_count = get_caggs_count()
         if caggs_count > 0:
-            print(f"Setting replica identity to FULL for {caggs_count} caggs ...")
+            logger.info(f"Setting replica identity to FULL for {caggs_count} caggs ...")
             set_replica_identity_for_caggs('FULL')
 
     # reset endpos
@@ -548,17 +547,17 @@ def migrate(args):
     try:
         if not args.skip_initial_data:
             if not is_section_migration_complete("roles"):
-                print("Migrating roles from Source DB to Target DB ...")
+                logger.info("Migrating roles from Source DB to Target DB ...")
                 migrate_roles()
                 mark_section_complete("roles")
 
             if not is_section_migration_complete("extensions"):
-                print("Migrating extensions from Source DB to Target DB ...")
+                logger.info("Migrating extensions from Source DB to Target DB ...")
                 migrate_extensions(target_type)
                 mark_section_complete("extensions")
 
             if not is_section_migration_complete("initial-data-migration"):
-                print("Migrating existing data from Source DB to Target DB ...")
+                logger.info("Migrating existing data from Source DB to Target DB ...")
                 if source_type == DBType.POSTGRES:
                     migrate_existing_data_from_pg(target_type)
                 else:
@@ -567,36 +566,35 @@ def migrate(args):
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
-        print("Applying buffered transactions ...")
+        logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply")
 
         wait_for_DBs_to_sync(follow_proc)
 
         run_cmd("pgcopydb stream sentinel set endpos --current")
 
-        print("Waiting for live-replay to complete ...")
+        logger.info("Waiting for live-replay to complete ...")
         # TODO: Implement retry for follow.
         follow_proc.wait()
         follow_proc = None
 
-        print("Copying sequences ...")
+        logger.info("Copying sequences ...")
         copy_sequences()
 
         if source_type == DBType.TIMESCALEDB:
-            print("Enabling background jobs ...")
+            logger.info("Enabling background jobs ...")
             enable_user_background_jobs()
             if caggs_count > 0:
-                print("Setting replica identity back to DEFAULT for caggs ...")
+                logger.info("Setting replica identity back to DEFAULT for caggs ...")
                 set_replica_identity_for_caggs('DEFAULT')
 
     except KeyboardInterrupt:
-        print("Exiting ... (Ctrl+C)")
+        logger.info("Exiting ... (Ctrl+C)")
     except Exception as e:
-        print("Unexpected exception:", e)
+        logger.info("Unexpected exception:", e)
         telemetry.complete_fail()
     else:
-        print("Migration successfully completed.")
-        print()
+        logger.info("Migration successfully completed.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean'))
         telemetry.complete_success()
@@ -611,4 +609,4 @@ def migrate(args):
         if follow_proc and follow_proc.process.poll() is None:
             os.killpg(os.getpgid(follow_proc.process.pid), signal.SIGINT)
             follow_proc.wait()
-        print("All processes have exited successfully.")
+        logger.info("All processes have exited successfully.")

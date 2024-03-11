@@ -2,6 +2,8 @@ import argparse
 import os
 import tempfile
 import sys
+import logging
+import datetime
 
 from pathlib import Path
 
@@ -11,6 +13,9 @@ from snapshot import snapshot
 from migrate import migrate
 from clean import clean
 from environ import pgcopydb_init_env
+
+logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T",timespec="milliseconds"))
+logging.basicConfig(format='%(asctime)s: %(message)s', level=logging.INFO)
 
 def main():
     parser = argparse.ArgumentParser(description='''Live migration moves your PostgreSQL/TimescaleDB to Timescale Cloud with minimal downtime.''', add_help=False)

@@ -33,13 +33,14 @@ import subprocess
 import time
 import tempfile
 import threading
+import logging
 from pathlib import Path
 
 ORIGIN = 'pgcopydb'
 BUFFER = 3 + 1  # Number of files to buffer from being deleted.
 
 env = os.environ.copy()
-
+logger = logging.getLogger(__name__)
 
 def run_cmd(cmd: str) -> str:
     result = subprocess.run(cmd, shell=True, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -143,7 +144,7 @@ def housekeeping(stop_event=None):
     if not cdc_dir.is_dir():
         raise ValueError(f"cdc directory {cdc_dir} is not valid")
 
-    print(f"Performing housekeeping every {HOUSEKEEPING_INTERVAL}s ...")
+    logger.info(f"Performing housekeeping every {HOUSEKEEPING_INTERVAL}s ...")
     while stop_event is None or not stop_event.is_set():
         lsn_replicated, present_wal_file = get_last_replicated_origin()
 
@@ -162,14 +163,14 @@ def housekeeping(stop_event=None):
                 break
         delete_upto_index = current_wal_file_index - BUFFER
         if delete_upto_index >= 0:
-            print(f"Found {delete_upto_index+1} file(s) to be deleted")
+            logger.debug(f"Found {delete_upto_index+1} file(s) to be deleted")
             for i, f in enumerate(sorted_files):
                 if i <= delete_upto_index and f != filename_no_ext(Path(present_wal_file)):
                     sql_file = cdc_dir / f"{f}.sql"
                     json_file = cdc_dir / f"{f}.json"
-                    print(f"Deleting {sql_file.name} & {json_file.name} ...")
                     delete_file(sql_file)
                     delete_file(json_file)
+                    logger.debug(f"Deleted {f}.{{sql,json}} ...")
 
         state_files = get_txn_state_file_in_dir(cdc_dir)
         count = 0
@@ -179,7 +180,7 @@ def housekeeping(stop_event=None):
                 delete_file(f)
                 count += 1
         if count > 0:
-            print(f"Cleaned up {count} transaction files")
+            logger.info(f"Cleaned up {count} transaction files")
         stop_event.wait(timeout=HOUSEKEEPING_INTERVAL)
 
 

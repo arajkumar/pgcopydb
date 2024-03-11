@@ -1,5 +1,8 @@
 import threading
 import typing
+import logging
+
+logger = logging.getLogger(__name__)
 
 class HealthCheck:
     process_logs = []
@@ -46,18 +49,16 @@ class HealthCheck:
                         continue
                     line_str = line.decode().strip()
                     if is_error_func(line_str):
-                        print(f"[health:{name}] unexpected log from '<container-mount>/logs/{self.get_filename(log_path)}")
-                        print("\t", line_str)
-            print(f"[health:{name}] Stopped")
+                        logger.info(f"unexpected log from '<container-mount>/logs/{self.get_filename(log_path)}")
+                        logger.info(f"\t{line_str}")
 
         thread = threading.Thread(target=checker)
-        print(f"[health:{name}] Starting ...")
         thread.start()
         self.active_threads.append(thread)
         self.stop_events.append(stop_event)
 
     def stop_all(self):
-        print("Stopping health checker ...")
+        logger.info("Stopping all health checkers ...")
         for e in self.stop_events:
             e.set()
         for t in self.active_threads:
