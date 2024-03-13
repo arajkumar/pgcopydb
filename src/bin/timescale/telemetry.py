@@ -117,16 +117,24 @@ telemetry = Telemetry()
 
 
 def telemetry_command(title):
+    """
+    A decorator that wraps a function and records telemetry in the
+    event of an error during the function's runtime.
+    """
     def decorator(func):
+        def filter_invalid_chars(s: str) -> str:
+            # We filter ", ', ` from exceptions to prevent issues when writing telemetry.
+            return s.replace("'", " ").replace('"', " ").replace("`", " ")
+
         def wrapper_func(*args, **kwargs):
             telemetry.start_command(title)
             try:
                 result = func(*args, **kwargs)
             except RedactedException as e:
-                telemetry.register_runtime_error_and_write(e.redacted)
+                telemetry.register_runtime_error_and_write(filter_invalid_chars(e.redacted))
                 raise e
             except ValueError as e:
-                telemetry.register_runtime_error_and_write(e.__str__())
+                telemetry.register_runtime_error_and_write(filter_invalid_chars(e.__str__()))
                 raise e
             except Exception as e:
                 telemetry.complete_fail()

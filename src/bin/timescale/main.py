@@ -15,10 +15,10 @@ from clean import clean
 from environ import pgcopydb_init_env
 
 logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T",timespec="milliseconds"))
-logging.basicConfig(format='%(asctime)s: %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.INFO)
 
 def main():
-    parser = argparse.ArgumentParser(description='''Live migration moves your PostgreSQL/TimescaleDB to Timescale Cloud with minimal downtime.''', add_help=False)
+    parser = argparse.ArgumentParser(description='Live migration moves your PostgreSQL/TimescaleDB to Timescale Cloud with minimal downtime.', add_help=False)
     parser.add_argument('-h', '--help', action='help',
                         help='Show this help message and exit')
 

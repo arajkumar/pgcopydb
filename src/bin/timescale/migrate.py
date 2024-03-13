@@ -53,18 +53,6 @@ def get_dbtype(uri):
     return DBType.POSTGRES
 
 
-@telemetry_command("check_timescaledb_version")
-def check_timescaledb_version():
-    result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
-    source_ts_version = str(result)[:-1]
-
-    result = run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
-    target_ts_version = str(result)[:-1]
-
-    if source_ts_version != target_ts_version:
-        raise ValueError(f"Source TimescaleDB version ({source_ts_version}) does not match Target TimescaleDB version ({target_ts_version})")
-
-
 @telemetry_command("create_follow")
 def create_follow(resume: bool = False):
     logger.info(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}...")
@@ -397,7 +385,7 @@ def wait_for_DBs_to_sync(follow_proc):
             else:
                 logger.info("\tTo stop replication, hit 'c' and then ENTER")
         elif net_replay_per_second <= 0:
-            logger.info(f"WARN live-replay not keeping up with source load {stats}")
+            logger.warn(f"live-replay not keeping up with source load {stats}")
         elif net_replay_per_second > 0:
             arrival_seconds = wal_replay_lag_bytes / net_replay_per_second
             logger.info(f"Live-replay will complete in {seconds_to_human(arrival_seconds)} {stats}" )
@@ -529,7 +517,6 @@ def migrate(args):
             logger.info("Migrating from Postgres to TimescaleDB ...")
         case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
             logger.info("Migrating from TimescaleDB to TimescaleDB ...")
-            check_timescaledb_version()
         case (DBType.TIMESCALEDB, DBType.POSTGRES):
             logger.info("Migration from TimescaleDB to Postgres is not supported")
             sys.exit(1)

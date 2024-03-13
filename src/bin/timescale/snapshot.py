@@ -3,8 +3,20 @@ import subprocess
 import logging
 
 from utils import docker_command
+from usr_signal import wait_for_event
+from validate import validate_dbs, has_tables_without_pkey_replident
 
 logger = logging.getLogger(__name__)
+
+def warn_and_wait_for_pkey_replident(tables: list[str]):
+    logger.warn("The following tables in the Source DB have neither a primary key nor a REPLICA IDENTITY (FULL/INDEX)")
+    logger.warn("UPDATE and DELETE statements on these tables will not be replicated to the Target DB")
+    for table in tables:
+        logger.warn(f"\t- {table}")
+    # Wait for the user to acknowledge the warning mentioned above before proceeding.
+    print("Press 'c' and ENTER to continue")
+    event = wait_for_event("c")
+    event.wait()
 
 
 def snapshot(args):
@@ -14,6 +26,12 @@ def snapshot(args):
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(1)
+
+    validate_dbs()
+
+    tables_without_pkey_replident = has_tables_without_pkey_replident()
+    if len(tables_without_pkey_replident) > 0:
+        warn_and_wait_for_pkey_replident(tables_without_pkey_replident)
 
     logger.info("Creating snapshot ...")
     # Clean up pid files. This might cause issues in docker environment due
