@@ -256,11 +256,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
 
 
 @telemetry_command("migrate_extensions")
-def migrate_extensions(target_type):
-    if target_type == DBType.TIMESCALEDB:
-        logger.info("Timescale pre-restore ...")
-        run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
-
+def migrate_extensions():
     logger.info("Copy extension config tables ...")
     with timeit():
         copy_extensions = " ".join([
@@ -275,18 +271,6 @@ def migrate_extensions(target_type):
             ])
         run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
 
-    if target_type == DBType.TIMESCALEDB:
-        logger.info("Timescale post-restore ...")
-        run_sql(execute_on_target=True,
-                sql="""
-                begin;
-                select public.timescaledb_post_restore();
-                -- disable all background jobs
-                select public.alter_job(job_id, scheduled => false)
-                from timescaledb_information.jobs
-                where job_id >= 1000;
-                commit;
-                """)
 
 @telemetry_command("migrate_roles")
 def migrate_roles():
@@ -343,31 +327,65 @@ sed -i -E \
 
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts(args):
-    logger.info("Copying table data ...")
-    clone_table_data = [
-        "pgcopydb",
-        "clone",
-        "--skip-extensions",
-        "--no-acl",
-        "--no-owner",
-        "--table-jobs=8",
-        "--index-jobs=8",
-        "--split-tables-larger-than='1 GB'",
-        "--dir",
-        "$PGCOPYDB_DIR/pgcopydb_clone",
-        "--snapshot",
-        "$(cat $PGCOPYDB_DIR/snapshot)",
-        "--notice",
-        ]
+    if not is_section_migration_complete("schema-dump"):
+        logger.info(f"Dumping schema ...")
+        with timeit():
+            schema_dump = [
+                "pgcopydb",
+                "dump",
+                "schema",
+                "--skip-extensions",
+                "--snapshot",
+                "$(cat $PGCOPYDB_DIR/snapshot)",
+                "--dir",
+                "$PGCOPYDB_DIR/copy_table_data",
+            ]
+            run_cmd(" ".join(schema_dump), f"{env['PGCOPYDB_DIR']}/logs/schema_dump")
+        mark_section_complete("schema-dump")
 
-    if args.resume:
-        clone_table_data.append("--resume")
-
-    clone_table_data = " ".join(clone_table_data)
+    if not is_section_migration_complete("restore-pre-data"):
+        logger.info(f"Restoring pre-data ...")
+        with timeit():
+            pre_data_restore = [
+                "pgcopydb",
+                "restore",
+                "pre-data",
+                "--skip-extensions",
+                "--no-owner",
+                "--no-acl",
+                "--resume",
+                "--snapshot",
+                "$(cat $PGCOPYDB_DIR/snapshot)",
+                "--dir",
+                "$PGCOPYDB_DIR/copy_table_data"
+            ]
+            run_cmd(" ".join(pre_data_restore), f"{env['PGCOPYDB_DIR']}/logs/schema_dump")
+        mark_section_complete("restore-pre-data")
 
     stop_progress = monitor_db_sizes()
-    with timeit():
-       run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
+
+    if not is_section_migration_complete("copy-table-data"):
+        logger.info("Copying table data ...")
+        clone_table_data = [
+            "pgcopydb",
+            "clone",
+            "--resume",
+            "--skip-extensions",
+            "--no-acl",
+            "--no-owner",
+            "--table-jobs=8",
+            "--index-jobs=8",
+            "--split-tables-larger-than='1 GB'",
+            "--dir",
+            "$PGCOPYDB_DIR/copy_table_data",
+            "--snapshot",
+            "$(cat $PGCOPYDB_DIR/snapshot)",
+            "--notice",
+            ]
+
+        with timeit():
+           run_cmd(" ".join(clone_table_data), f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
+        mark_section_complete("copy-table-data")
     stop_progress.set()
 
 
@@ -467,6 +485,25 @@ def replication_origin_exists():
     return r == "t\n"
 
 
+def timescaledb_pre_restore():
+    logger.info("Timescale pre-restore ...")
+    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
+
+
+def timescaledb_post_restore():
+    logger.info("Timescale post-restore ...")
+    run_sql(execute_on_target=True,
+            sql="""
+            begin;
+            select public.timescaledb_post_restore();
+            -- disable all background jobs
+            select public.alter_job(job_id, scheduled => false)
+            from timescaledb_information.jobs
+            where job_id >= 1000;
+            commit;
+            """)
+
+
 def migrate(args):
     # Clean up pid files. This might cause issues in docker environment due
     # deterministic pid values.
@@ -552,8 +589,10 @@ def migrate(args):
                 mark_section_complete("roles")
 
             if not is_section_migration_complete("extensions"):
+                if source_type == DBType.TIMESCALEDB and target_type == DBType.TIMESCALEDB:
+                    timescaledb_pre_restore()
                 logger.info("Migrating extensions from Source DB to Target DB ...")
-                migrate_extensions(target_type)
+                migrate_extensions()
                 mark_section_complete("extensions")
 
             if not is_section_migration_complete("initial-data-migration"):
@@ -563,6 +602,14 @@ def migrate(args):
                 else:
                     migrate_existing_data_from_ts(args)
                 mark_section_complete("initial-data-migration")
+
+            if (source_type == DBType.TIMESCALEDB and
+               target_type == DBType.TIMESCALEDB and
+               not is_section_migration_complete("timescaledb-post-restore")):
+                # Note: timescaledb_post_restore must come after post-data, otherwise there
+                # are issues restoring indexes and foreign key constraints to chunks.
+                timescaledb_post_restore()
+                mark_section_complete("timescaledb-post-restore")
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
@@ -591,7 +638,7 @@ def migrate(args):
     except KeyboardInterrupt:
         logger.info("Exiting ... (Ctrl+C)")
     except Exception as e:
-        logger.info("Unexpected exception:", e)
+        logger.info(f"Unexpected exception: {e}")
         telemetry.complete_fail()
     else:
         logger.info("Migration successfully completed.")
