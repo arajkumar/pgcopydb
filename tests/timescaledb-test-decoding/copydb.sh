@@ -45,6 +45,14 @@ psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
 
 pgcopydb copy extensions --source ${PGCOPYDB_SOURCE_PGURI_SU} --target ${PGCOPYDB_TARGET_PGURI_SU} --resume
 
+pgcopydb stream setup
+
+# now clone with superuser privileges, seems to be required for timescaledb
+pgcopydb clone --resume \
+         --skip-extensions \
+         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
+         --target ${PGCOPYDB_TARGET_PGURI_SU}
+
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
     -f - <<'EOF'
 begin;
@@ -57,15 +65,6 @@ where id >= 1000
 ;
 commit;
 EOF
-
-pgcopydb stream setup
-
-# now clone with superuser privileges, seems to be required for timescaledb
-pgcopydb clone --resume \
-         --skip-extensions \
-         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
-         --target ${PGCOPYDB_TARGET_PGURI_SU}
-
 
 # Insert some data into metrics hypertable. Since we have 1hr chunk,
 # we will have 3 chunks after this.
