@@ -1092,6 +1092,17 @@ stream_apply_sql(StreamApplyContext *context,
 				return false;
 			}
 
+			/*
+			 * when the source is idle, the replay_lsn won't move forward.
+			 * Emit a message to move LSN forward.
+			 */
+			if (!pgsql_execute(pgsql,
+							   "select pg_logical_emit_message(true, 'pgcopydb', 'keepalive')"))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
 			char lsn[PG_LSN_MAXLENGTH] = { 0 };
 
 			sformat(lsn, sizeof(lsn), "%X/%X",
