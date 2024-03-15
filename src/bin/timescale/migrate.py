@@ -327,65 +327,31 @@ sed -i -E \
 
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts(args):
-    if not is_section_migration_complete("schema-dump"):
-        logger.info(f"Dumping schema ...")
-        with timeit():
-            schema_dump = [
-                "pgcopydb",
-                "dump",
-                "schema",
-                "--skip-extensions",
-                "--snapshot",
-                "$(cat $PGCOPYDB_DIR/snapshot)",
-                "--dir",
-                "$PGCOPYDB_DIR/copy_table_data",
-            ]
-            run_cmd(" ".join(schema_dump), f"{env['PGCOPYDB_DIR']}/logs/schema_dump")
-        mark_section_complete("schema-dump")
+    logger.info("Copying table data ...")
+    clone_table_data = [
+        "pgcopydb",
+        "clone",
+        "--resume",
+        "--skip-extensions",
+        "--no-acl",
+        "--no-owner",
+        "--table-jobs=8",
+        "--index-jobs=8",
+        "--split-tables-larger-than='1 GB'",
+        "--dir",
+        "$PGCOPYDB_DIR/pgcopydb_clone",
+        "--snapshot",
+        "$(cat $PGCOPYDB_DIR/snapshot)",
+        "--notice",
+        ]
 
-    if not is_section_migration_complete("restore-pre-data"):
-        logger.info(f"Restoring pre-data ...")
-        with timeit():
-            pre_data_restore = [
-                "pgcopydb",
-                "restore",
-                "pre-data",
-                "--skip-extensions",
-                "--no-owner",
-                "--no-acl",
-                "--resume",
-                "--snapshot",
-                "$(cat $PGCOPYDB_DIR/snapshot)",
-                "--dir",
-                "$PGCOPYDB_DIR/copy_table_data"
-            ]
-            run_cmd(" ".join(pre_data_restore), f"{env['PGCOPYDB_DIR']}/logs/schema_dump")
-        mark_section_complete("restore-pre-data")
+    clone_table_data = " ".join(clone_table_data)
 
     stop_progress = monitor_db_sizes()
 
-    if not is_section_migration_complete("copy-table-data"):
-        logger.info("Copying table data ...")
-        clone_table_data = [
-            "pgcopydb",
-            "clone",
-            "--resume",
-            "--skip-extensions",
-            "--no-acl",
-            "--no-owner",
-            "--table-jobs=8",
-            "--index-jobs=8",
-            "--split-tables-larger-than='1 GB'",
-            "--dir",
-            "$PGCOPYDB_DIR/copy_table_data",
-            "--snapshot",
-            "$(cat $PGCOPYDB_DIR/snapshot)",
-            "--notice",
-            ]
+    with timeit():
+       run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
 
-        with timeit():
-           run_cmd(" ".join(clone_table_data), f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
-        mark_section_complete("copy-table-data")
     stop_progress.set()
 
 
@@ -425,11 +391,11 @@ def wait_for_DBs_to_sync(follow_proc):
         if wal_replay_lag_bytes < REPLICATION_LAG_THRESHOLD_BYTES or replay_will_catch_up_soon:
             logger.info(f"Target has caught up with source {stats}")
             if not IS_TTY and LIVE_MIGRATION_DOCKER:
-                logger.info(f"\tTo stop replication, send a SIGUSR1 signal with 'docker kill -s=SIGUSR1 <container_name>'")
+                logger.info("\tTo stop replication, send a SIGUSR1 signal with 'docker kill -s=SIGUSR1 <container_name>'")
             elif not IS_TTY:
                 logger.info(f"\tTo stop replication. To proceed, send a SIGUSR1 signal with 'kill -s=SIGUSR1 {os.getpid()}'")
             else:
-                logger.info(f"\tTo stop replication, hit 'c' and then ENTER")
+                logger.info("\tTo stop replication, hit 'c' and then ENTER")
         elif net_replay_per_second <= 0:
             logger.info(f"WARN live-replay not keeping up with source load {stats}")
         elif net_replay_per_second > 0:
@@ -588,8 +554,10 @@ def migrate(args):
                 migrate_roles()
                 mark_section_complete("roles")
 
+            handle_timescaledb_extension = (source_type == DBType.TIMESCALEDB and target_type == DBType.TIMESCALEDB)
+
             if not is_section_migration_complete("extensions"):
-                if source_type == DBType.TIMESCALEDB and target_type == DBType.TIMESCALEDB:
+                if handle_timescaledb_extension:
                     timescaledb_pre_restore()
                 logger.info("Migrating extensions from Source DB to Target DB ...")
                 migrate_extensions()
@@ -603,8 +571,7 @@ def migrate(args):
                     migrate_existing_data_from_ts(args)
                 mark_section_complete("initial-data-migration")
 
-            if (source_type == DBType.TIMESCALEDB and
-               target_type == DBType.TIMESCALEDB and
+            if (handle_timescaledb_extension and
                not is_section_migration_complete("timescaledb-post-restore")):
                 # Note: timescaledb_post_restore must come after post-data, otherwise there
                 # are issues restoring indexes and foreign key constraints to chunks.
