@@ -1,3 +1,4 @@
+import os
 import sys
 import subprocess
 import tempfile
@@ -80,9 +81,11 @@ def docker_command(name, *args):
             timescale/live-migration:v{SCRIPT_VERSION} \
             {" ".join(args)}""".rstrip()
     else:
+        python = os.path.basename(sys.executable)
+        script = sys.argv[0]
+        script_args = " ".join(args)
         return rf"""
-            {sys.argv[0]}
-            {" ".join(args)}""".rstrip()
+                {python } {script} {script_args}""".rstrip()
 
 
 def dbname_from_uri(uri: str) -> str:
@@ -113,8 +116,8 @@ def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, t
     r = str(proc.stdout)
     if r != "":
         logger.error(f"---------LOGS WITH ERROR FROM '{log_path}'---------")
-        for l in r.splitlines():
-            logger.error(l)
+        for line in r.splitlines():
+            logger.error(line)
         logger.error("------------------END------------------")
 
     if tail > 0:
@@ -127,6 +130,6 @@ def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, t
         r = str(proc.stdout)
         if r != "":
             logger.info(f"---------LAST {tail} LOG LINES FROM '{log_path}'---------")
-            for l in r.splitlines():
-                logger.info(l)
+            for line in r.splitlines():
+                logger.info(line)
             logger.info("------------------END------------------")
