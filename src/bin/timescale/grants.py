@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 def dump_grants(pg_uri: str, grants_file: str):
     dump_grants_cmd = [
         "pg_dump",
-        "--section=pre-data",
+        "--schema-only",
         "--format=plain",
         "--snapshot",
         "$(cat $PGCOPYDB_DIR/snapshot)",
@@ -25,7 +25,7 @@ def dump_grants(pg_uri: str, grants_file: str):
 
 
 # This regex is used to filter out the grants from the dump file
-_SELECTED_GRANTS = re.compile(r'(ALTER.*OWNER.*|GRANT|REVOKE)')
+_SELECTED_GRANTS = re.compile(r'(ALTER.*OWNER.*|ALTER DEFAULT PRIVILEGES|GRANT|REVOKE)')
 
 def filter_grants_only(grants_file: str, grants_file_filtered: str):
     logger.info(f"Filtering grants from {grants_file} to {grants_file_filtered}")
