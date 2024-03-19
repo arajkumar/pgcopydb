@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# This script orchestrates CDC based migration process using pgcopydb.
-
 import os
 import signal
 import sys
@@ -18,6 +15,7 @@ from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql
 from utils import bytes_to_human, seconds_to_human
+from grants import dump_grants, filter_grants_only, restore_grants
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +34,7 @@ def is_snapshot_valid():
                      ROLLBACK;
                      """))
         return True
-    except:
+    except Exception:
         return False
 
 def is_section_migration_complete(section):
@@ -131,6 +129,17 @@ def monitor_db_sizes() -> threading.Event:
     t.start()
     return stop_event
 
+
+@telemetry_command("migrate_grants")
+def migrate_grants():
+    grants_file = f"{env['PGCOPYDB_DIR']}/grants_dump.sql"
+    grants_file_filtered = f"{env['PGCOPYDB_DIR']}/grants.sql"
+    src_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
+    target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
+
+    dump_grants(pg_uri=src_pg_uri, grants_file=grants_file)
+    filter_grants_only(grants_file=grants_file, grants_file_filtered=grants_file_filtered)
+    restore_grants(pg_uri=target_pg_uri, grant_file=grants_file_filtered)
 
 @telemetry_command("migrate_existing_data_from_pg")
 def migrate_existing_data_from_pg(target_type: DBType):
@@ -570,6 +579,11 @@ def migrate(args):
                 else:
                     migrate_existing_data_from_ts(args)
                 mark_section_complete("initial-data-migration")
+
+            if not is_section_migration_complete("grants"):
+                logger.info("Migrating grants from Source DB to Target DB ...")
+                migrate_grants()
+                mark_section_complete("grants")
 
             if (handle_timescaledb_extension and
                not is_section_migration_complete("timescaledb-post-restore")):

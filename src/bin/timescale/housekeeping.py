@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-#
 # Housekeeping is a script designed to remove stale WAL and transaction files (.sql & .json)
 # from the `$PGCOPYDB_DIR/cdc` directory. These files have already been applied to the target
 # and hence are no longer needed.
