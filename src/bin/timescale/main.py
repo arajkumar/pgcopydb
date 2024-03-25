@@ -64,6 +64,7 @@ def main():
                                            parents=[common],
                                            add_help=False)
     parser_migrate.add_argument('--resume', action='store_true', help='Resume the migration')
+    parser_migrate.add_argument('--skip-roles', action='store_true', help='Skip roles migration')
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',

@@ -309,8 +309,25 @@ sed -i -E \
 {roles_file_path}"""
         run_cmd(filter_stmts)
 
-        restore_roles = f"""psql -X -d $PGCOPYDB_TARGET_PGURI -v ON_ERROR_STOP=1 --echo-errors -f {roles_file_path}"""
-        run_cmd(restore_roles)
+        restore_roles_cmd = [
+            "psql",
+             "-X",
+             "-d",
+             "$PGCOPYDB_TARGET_PGURI",
+             "-v",
+             # Attempt whatever tsdbadmin can do, but don't fail if it fails.
+             "ON_ERROR_STOP=0",
+             "--echo-errors",
+             "-f",
+             roles_file_path,
+        ]
+
+        restore_roles_cmd = " ".join(restore_roles_cmd)
+        log_path = f"{env['PGCOPYDB_DIR']}/logs/restore_roles"
+
+        run_cmd(restore_roles_cmd, log_path)
+
+        print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
 
 
 @telemetry_command("migrate_existing_data_from_ts")
@@ -535,12 +552,12 @@ def migrate(args):
     housekeeping_thread, housekeeping_stop_event = None, None
     follow_proc = create_follow(resume=args.resume)
     try:
-        if not args.skip_initial_data:
-            if not is_section_migration_complete("roles"):
-                logger.info("Migrating roles from Source DB to Target DB ...")
-                migrate_roles()
-                mark_section_complete("roles")
+        if not is_section_migration_complete("roles") and not args.skip_roles:
+            logger.info("Migrating roles from Source DB to Target DB ...")
+            migrate_roles()
+            mark_section_complete("roles")
 
+        if not args.skip_initial_data:
             handle_timescaledb_extension = (source_type == DBType.TIMESCALEDB and target_type == DBType.TIMESCALEDB)
 
             if not is_section_migration_complete("extensions"):
