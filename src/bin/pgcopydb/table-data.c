@@ -149,26 +149,6 @@ copydb_process_table_data(CopyDataSpec *specs)
 	}
 
 	/*
-	 * When we interrupt the clone process while indexes are being
-	 * created, it might create the index on target but not update the
-	 * done file. This is a problem because the next time you run
-	 * pgcopydb, it will miss the indexes and never update the restore
-	 * list file causing the indexes to be created again on post-data
-	 * restore which would result in an error.
-	 *
-	 * copydb_copy_all_indexes will attempt with CREATE IF NOT EXISTS
-	 * to create the indexes that are missing and updates the done file
-	 * to reflect that.
-	 */
-	if (errors == 0 &&
-		specs->resume &&
-		!copydb_copy_all_indexes(specs))
-	{
-		/* errors have already been logged */
-		++errors;
-	}
-
-	/*
 	 * Are blobs table data? well pg_dump --section sayth yes.
 	 */
 	if (errors == 0 && !copydb_start_blob_process(specs))
@@ -674,30 +654,36 @@ copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 		return false;
 	}
 
+	/*
+	 * Skip only table-data copy when it it has been done already on a previous
+	 * run. We still need to process the indexes, constraints, and vacuum.
+	 * So, signal the index and vacuum workers as usual.
+	 */
 	if (isDone)
 	{
 		log_info("Skipping table %s (%u), already done on a previous run",
 				 tableSpecs.sourceTable->qname,
 				 tableSpecs.sourceTable->oid);
-		return true;
 	}
-
-	/*
-	 * 1. Now COPY the TABLE DATA from the source to the destination.
-	 */
-	if (!table->excludeData)
+	else
 	{
-		if (!copydb_copy_table(specs, src, dst, &tableSpecs))
+		/*
+		 * 1. Now COPY the TABLE DATA from the source to the destination.
+		 */
+		if (!table->excludeData)
+		{
+			if (!copydb_copy_table(specs, src, dst, &tableSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+		}
+
+		if (!copydb_mark_table_as_done(specs, &tableSpecs))
 		{
 			/* errors have already been logged */
 			return false;
 		}
-	}
-
-	if (!copydb_mark_table_as_done(specs, &tableSpecs))
-	{
-		/* errors have already been logged */
-		return false;
 	}
 
 	/*

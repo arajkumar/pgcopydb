@@ -36,7 +36,7 @@ def is_snapshot_valid():
                      ROLLBACK;
                      """))
         return True
-    except:
+    except Exception:
         return False
 
 def is_section_migration_complete(section):
@@ -336,7 +336,6 @@ def migrate_existing_data_from_ts(args):
     clone_table_data = [
         "pgcopydb",
         "clone",
-        "--resume",
         "--skip-extensions",
         "--no-acl",
         "--no-owner",
@@ -349,6 +348,9 @@ def migrate_existing_data_from_ts(args):
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
         ]
+
+    if args.resume:
+        clone_table_data.append("--resume")
 
     clone_table_data = " ".join(clone_table_data)
 
