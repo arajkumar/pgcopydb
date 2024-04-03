@@ -2,6 +2,7 @@
 
 [![Documentation Status](https://readthedocs.org/projects/pgcopydb/badge/?version=latest)](https://pgcopydb.readthedocs.io/en/latest/?badge=latest)
 
+
 ## Introduction
 
 pgcopydb is a tool that automates running `pg_dump | pg_restore` between two
