@@ -355,8 +355,11 @@ typedef struct StreamApplyContext
 {
 	CDCPaths paths;
 
-	/* target connection */
-	PGSQL pgsql;
+	/* target connection to find current wal_lsn for replay_lsn mapping */
+	PGSQL controlPgConn;
+
+	/* target connection created in pipeline mode responsible for apply */
+	PGSQL applyPgConn;
 
 	/* source connection to publish sentinel updates */
 	PGSQL src;
@@ -645,6 +648,8 @@ bool parseWal2jsonMessage(StreamContext *privateContext,
 bool stream_apply_catchup(StreamSpecs *specs);
 
 bool stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context);
+
+bool stream_apply_cleanup(StreamApplyContext *context);
 
 bool stream_apply_wait_for_sentinel(StreamSpecs *specs,
 									StreamApplyContext *context);
