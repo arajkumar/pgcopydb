@@ -12,20 +12,15 @@ from pathlib import Path
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
-from utils import timeit, print_logs_with_error, docker_command, dbname_from_uri, store_val, get_stored_val
+from utils import timeit, docker_command, dbname_from_uri, store_val, get_stored_val, bytes_to_human, seconds_to_human, DBType, get_dbtype
 from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
-from exec import Command, run_cmd, run_sql, psql
-from utils import bytes_to_human, seconds_to_human
+from exec import Command, run_cmd, run_sql, psql, print_logs_with_error
 
 logger = logging.getLogger(__name__)
 
 REPLICATION_LAG_THRESHOLD_BYTES = 512000  # 500KiB.
-
-class DBType(Enum):
-    POSTGRES = 1
-    TIMESCALEDB = 2
 
 def is_snapshot_valid():
     try:
@@ -44,13 +39,6 @@ def is_section_migration_complete(section):
 
 def mark_section_complete(section):
     Path(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done").touch()
-
-@telemetry_command("check_source_is_timescaledb")
-def get_dbtype(uri):
-    result = run_cmd(psql(uri=uri, sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
-    if result == "t\n":
-        return DBType.TIMESCALEDB
-    return DBType.POSTGRES
 
 
 @telemetry_command("create_follow")

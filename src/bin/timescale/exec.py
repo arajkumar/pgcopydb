@@ -1,12 +1,47 @@
 import subprocess
 import threading
+import logging
 
-from utils import print_logs_with_error
 from environ import env
 from exception import RedactedException
 
+logger = logging.getLogger(__name__)
+
 def psql(uri: str, sql: str):
     return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "{uri}" -c " {sql} " """
+
+
+def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, tail: int = 50):
+    """
+    Print error logs in the provided log_path along with tail
+    of given number of log lines at all levels.
+    """
+    proc = subprocess.run(f"cat {log_path} | grep -i 'error\|warn' -A{after} -B{before}",
+                                    shell=True,
+                                    env=env,
+                                    stderr=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    text=True)
+    r = str(proc.stdout)
+    if r != "":
+        logger.error(f"---------LOGS WITH ERROR FROM '{log_path}'---------")
+        for line in r.splitlines():
+            logger.error(line)
+        logger.error("------------------END------------------")
+
+    if tail > 0:
+        proc = subprocess.run(f"tail -n {tail} {log_path}",
+                                        shell=True,
+                                        env=env,
+                                        stderr=subprocess.PIPE,
+                                        stdout=subprocess.PIPE,
+                                        text=True)
+        r = str(proc.stdout)
+        if r != "":
+            logger.info(f"---------LAST {tail} LOG LINES FROM '{log_path}'---------")
+            for line in r.splitlines():
+                logger.info(line)
+            logger.info("------------------END------------------")
 
 
 class Command:

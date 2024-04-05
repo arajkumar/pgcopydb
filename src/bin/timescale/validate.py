@@ -2,8 +2,8 @@ import logging
 import sys
 
 from exec import run_sql, run_cmd, psql
-from usr_signal import wait_for_event
-from telemetry import telemetry_command
+from environ import env
+from utils import get_dbtype, DBType
 
 logger = logging.getLogger(__name__)
 
@@ -100,4 +100,5 @@ def validate_dbs():
         logger.error(f"Live migration requires the current user to have 'EXECUTE' permissions on pg_replication_origin functions in the Target DB")
         sys.exit(1)
 
-    check_timescaledb_version()
+    if get_dbtype(env["PGCOPYDB_SOURCE_PGURI"]) == DBType.TIMESCALEDB:
+        check_timescaledb_version()

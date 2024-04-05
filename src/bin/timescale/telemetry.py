@@ -6,11 +6,12 @@ from environ import env
 from exec import run_cmd, run_sql, psql
 from version import SCRIPT_VERSION
 from exception import RedactedException
+from utils import get_dbtype, DBType
 
 class TelemetryDBStats:
     def __init__(self, uri: str) -> None:
         num_hypertables_query = "select count(*) from timescaledb_information.hypertables"
-        if not self.is_timescaledb(uri):
+        if get_dbtype(uri) == DBType.POSTGRES:
             num_hypertables_query = "select 0"
         query = f"""
 select
@@ -30,9 +31,6 @@ select
         self.size_approx = int(result[2])
         self.num_user_tables = int(result[3])
         self.num_hypertables = int(result[4])
-
-    def is_timescaledb(self, uri: str) -> bool:
-        return run_cmd(psql(uri, "select exists(select 1 from pg_extension where extname='timescaledb')"))[:-1] == "t"
 
     def object(self) -> str:
         return {

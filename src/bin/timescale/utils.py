@@ -1,15 +1,16 @@
 import os
 import sys
-import subprocess
 import tempfile
 import logging
 
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlparse
+from enum import Enum
 
 from version import SCRIPT_VERSION
 from environ import LIVE_MIGRATION_DOCKER, env
+from exec import run_cmd, psql
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,18 @@ class timeit:
     def __exit__(self, type, value, traceback):
         self.time = perf_counter() - self.start
         logger.info(f"=> Completed in {seconds_to_human(self.time)}")
+
+
+class DBType(Enum):
+    POSTGRES = 1
+    TIMESCALEDB = 2
+
+
+def get_dbtype(uri):
+    result = run_cmd(psql(uri=uri, sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
+    if result == "t\n":
+        return DBType.TIMESCALEDB
+    return DBType.POSTGRES
 
 
 def seconds_to_human(seconds):
@@ -100,36 +113,3 @@ def dbname_from_uri(uri: str) -> str:
         # result.path[1]: '/rbac_test'
         result = urlparse(uri)
         return result.path[1:]
-
-
-def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, tail: int = 50):
-    """
-    Print error logs in the provided log_path along with tail
-    of given number of log lines at all levels.
-    """
-    proc = subprocess.run(f"cat {log_path} | grep -i 'error\|warn' -A{after} -B{before}",
-                                    shell=True,
-                                    env=env,
-                                    stderr=subprocess.PIPE,
-                                    stdout=subprocess.PIPE,
-                                    text=True)
-    r = str(proc.stdout)
-    if r != "":
-        logger.error(f"---------LOGS WITH ERROR FROM '{log_path}'---------")
-        for line in r.splitlines():
-            logger.error(line)
-        logger.error("------------------END------------------")
-
-    if tail > 0:
-        proc = subprocess.run(f"tail -n {tail} {log_path}",
-                                        shell=True,
-                                        env=env,
-                                        stderr=subprocess.PIPE,
-                                        stdout=subprocess.PIPE,
-                                        text=True)
-        r = str(proc.stdout)
-        if r != "":
-            logger.info(f"---------LAST {tail} LOG LINES FROM '{log_path}'---------")
-            for line in r.splitlines():
-                logger.info(line)
-            logger.info("------------------END------------------")
