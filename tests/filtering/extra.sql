@@ -62,3 +62,9 @@ create table schema_name_20_chars.very______long______table______name_______50_c
  (
    id serial
  );
+
+--
+-- To test matview ignore
+--
+create materialized view foo.matview_1 as select 1;
+create materialized view foo.matview_1_ignored as select 1;
