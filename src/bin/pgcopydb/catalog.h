@@ -188,6 +188,11 @@ bool catalog_delete_s_table(DatabaseCatalog *catalog,
 bool catalog_delete_s_table_chksum_all(DatabaseCatalog *catalog);
 
 /*
+ * Materialized views
+ */
+bool catalog_add_s_matview(DatabaseCatalog *catalog, SourceMatView *matview);
+
+/*
  * To loop over our catalog "arrays" we provide an iterator based API, which
  * allows for allocating a single item in memory for the whole scan.
  */
@@ -395,6 +400,23 @@ bool catalog_lookup_filter_by_rlname(DatabaseCatalog *catalog,
 									 const char *restoreListName);
 
 bool catalog_filter_fetch(SQLiteQuery *query);
+
+/*
+ * Materialized views
+ */
+typedef struct CatalogrMatview
+{
+	uint32_t oid;
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+	bool excludeData;
+} CatalogMatview;
+
+bool catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
+									 CatalogMatview *result,
+									 uint32_t oid);
+
+bool catalog_s_matview_fetch(SQLiteQuery *query);
 
 /*
  * Databases

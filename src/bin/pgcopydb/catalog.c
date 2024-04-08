@@ -243,6 +243,15 @@ static char *filterDBcreateDDLs[] = {
 	"create unique index s_t_qname on s_table(qname)",
 	"create unique index s_t_rlname on s_table(restore_list_name)",
 
+	"create table s_matview("
+	"  oid integer primary key, "
+	"  nspname text, relname text, restore_list_name text, "
+	"  exclude_data boolean"
+	")",
+
+	"create unique index s_mv_rlname on s_matview(restore_list_name)",
+	"create unique index s_mv_qname on s_matview(nspname, relname)",
+
 	"create table s_table_size("
 	"  oid integer primary key references s_table(oid), "
 	"  bytes integer, bytes_pretty text "
@@ -1639,6 +1648,11 @@ CopyDataSectionToString(CopyDataSection section)
 			return "table-data";
 		}
 
+		case DATA_SECTION_MATERIALIZED_VIEWS:
+		{
+			return "matviews";
+		}
+
 		case DATA_SECTION_TABLE_DATA_PARTS:
 		{
 			return "table-data-parts";
@@ -1699,6 +1713,67 @@ CopyDataSectionToString(CopyDataSection section)
 
 	/* keep compiler happy */
 	return "unknown";
+}
+
+
+/*
+ * catalog_add_s_matview INSERTs a SourceMaterializedView to our internal
+ * catalogs database.
+ */
+bool
+catalog_add_s_matview(DatabaseCatalog *catalog,
+					  SourceMatView *matview)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_matview: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert into s_matview("
+		"  oid, nspname, relname, restore_list_name, exclude_data) "
+		"values($1, $2, $3, $4, $5)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", matview->oid, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, matview->nspname },
+		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, matview->relname },
+
+		{ BIND_PARAMETER_TYPE_TEXT, "restore_list_name", 0,
+		  matview->restoreListName },
+
+		{ BIND_PARAMETER_TYPE_INT, "exclude_data",
+		  matview->excludeData ? 1 : 0, NULL },
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -4820,6 +4895,15 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 
 		"  union all "
 
+		/*
+		 * This is only for materialized views. Materialized view refresh
+		 * filtering is done with the help of s_matview data.
+		 */
+		"	 select oid, restore_list_name, 'matview' "
+		"	   from s_matview where exclude_data = 0 "
+
+		"  union all "
+
 		"     select oid, restore_list_name, 'index' "
 		"       from s_index "
 
@@ -5146,6 +5230,105 @@ catalog_filter_fetch(SQLiteQuery *query)
 	strlcpy(entry->kind,
 			(char *) sqlite3_column_text(query->ppStmt, 2),
 			sizeof(entry->kind));
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_s_matview_by_oid fetches a s_matview entry from catalog.
+ */
+bool
+catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
+								CatalogMatview *result,
+								uint32_t oid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_filter_by_oid: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select oid, nspname, relname, exclude_data"
+		"    from s_matview "
+		"   where oid = $1 ";
+
+	SQLiteQuery query = {
+		.context = result,
+		.fetchFunction = &catalog_s_matview_fetch
+	};
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL },
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_s_matview_fetch fetches a CatalogMatview entry from a SQLite ppStmt
+ * result set.
+ */
+bool
+catalog_s_matview_fetch(SQLiteQuery *query)
+{
+	CatalogMatview *entry = (CatalogMatview *) query->context;
+
+	/* cleanup the memory area before re-use */
+	bzero(entry, sizeof(CatalogMatview));
+
+	entry->oid = sqlite3_column_int64(query->ppStmt, 0);
+
+	if (sqlite3_column_type(query->ppStmt, 1) != SQLITE_NULL)
+	{
+		strlcpy(entry->nspname,
+				(char *) sqlite3_column_text(query->ppStmt, 1),
+				sizeof(entry->nspname));
+	}
+
+	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
+	{
+		strlcpy(entry->relname,
+				(char *) sqlite3_column_text(query->ppStmt, 1),
+				sizeof(entry->relname));
+	}
+
+	entry->excludeData = sqlite3_column_int64(query->ppStmt, 3) == 1;
 
 	return true;
 }

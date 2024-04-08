@@ -98,6 +98,15 @@ typedef struct SourceCollationArrayContext
 } SourceCollationArrayContext;
 
 /* Context used when fetching all the table definitions */
+typedef struct SourceMatViewArrayContext
+{
+	char sqlstate[SQLSTATE_LENGTH];
+	DatabaseCatalog *catalog;
+	bool parsedOk;
+} SourceMatViewArrayContext;
+
+
+/* Context used when fetching all the table definitions */
 typedef struct SourceTableArrayContext
 {
 	char sqlstate[SQLSTATE_LENGTH];
@@ -197,6 +206,8 @@ static void getExtensionsVersions(void *ctx, PGresult *result);
 static void getCollationList(void *ctx, PGresult *result);
 
 static void getTableArray(void *ctx, PGresult *result);
+
+static void getMatViewArray(void *ctx, PGresult *result);
 
 static bool parseCurrentSourceTable(PGresult *result,
 									int rowNumber,
@@ -918,6 +929,254 @@ schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 								   &context, &getTableSizeArray))
 	{
 		log_error("Failed to compute table size, see above for details");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * For code simplicity the index array is also the SourceFilterType enum value.
+ */
+struct FilteringQueries listSourceMatViewSQL[] = {
+	{
+		SOURCE_FILTER_TYPE_NONE,
+
+		"  select c.oid, "
+		"         format('%I', n.nspname) as nspname, "
+		"         format('%I', c.relname) as relname, "
+		"         false as excludedata, "
+		"         format('%s %s %s', "
+		"                regexp_replace(n.nspname, '[\\n\\r]', ' '), "
+		"                regexp_replace(c.relname, '[\\n\\r]', ' '), "
+		"                regexp_replace(auth.rolname, '[\\n\\r]', ' '))"
+		"    from pg_catalog.pg_class c"
+		"         join pg_catalog.pg_namespace n on c.relnamespace = n.oid"
+		"         join pg_roles auth ON auth.oid = c.relowner"
+		"   where relkind = 'm'"
+		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
+		"     and n.nspname !~ 'pgcopydb' "
+		"order by n.nspname, c.relname"
+	},
+
+	{
+		SOURCE_FILTER_TYPE_INCL,
+
+		"  select c.oid, "
+		"         format('%I', n.nspname) as nspname, "
+		"         format('%I', c.relname) as relname, "
+		"         exists(select 1 "
+		"                  from pg_temp.filter_exclude_table_data ftd "
+		"                 where n.nspname = ftd.nspname "
+		"                   and c.relname = ftd.relname) as excludedata,"
+		"         format('%s %s %s', "
+		"                regexp_replace(n.nspname, '[\\n\\r]', ' '), "
+		"                regexp_replace(c.relname, '[\\n\\r]', ' '), "
+		"                regexp_replace(auth.rolname, '[\\n\\r]', ' ')) "
+		"    from pg_catalog.pg_class c "
+		"         join pg_catalog.pg_namespace n on c.relnamespace = n.oid "
+		"         join pg_roles auth ON auth.oid = c.relowner"
+
+		/* include-only-table */
+		"         join pg_temp.filter_include_only_table inc "
+		"           on n.nspname = inc.nspname "
+		"          and c.relname = inc.relname "
+
+		"   where relkind = 'm' "
+		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
+		"     and n.nspname !~ 'pgcopydb' "
+
+		"order by n.nspname, c.relname"
+	},
+
+	{
+		SOURCE_FILTER_TYPE_EXCL,
+
+		"  select c.oid, "
+		"         format('%I', n.nspname) as nspname, "
+		"         format('%I', c.relname) as relname, "
+		"         ftd.relname is not null as excludedata, "
+		"         format('%s %s %s', "
+		"                regexp_replace(n.nspname, '[\\n\\r]', ' '), "
+		"                regexp_replace(c.relname, '[\\n\\r]', ' '), "
+		"                regexp_replace(auth.rolname, '[\\n\\r]', ' ')) "
+
+		"    from pg_catalog.pg_class c "
+		"         join pg_catalog.pg_namespace n on c.relnamespace = n.oid "
+		"         join pg_roles auth ON auth.oid = c.relowner"
+
+		/* exclude-schema */
+		"         left join pg_temp.filter_exclude_schema fn "
+		"                on n.nspname = fn.nspname "
+
+		/* exclude-table */
+		"         left join pg_temp.filter_exclude_table ft "
+		"                on n.nspname = ft.nspname "
+		"               and c.relname = ft.relname "
+
+		/* exclude-table-data */
+		"         left join pg_temp.filter_exclude_table_data ftd "
+		"                on n.nspname = ftd.nspname "
+		"               and c.relname = ftd.relname "
+
+		"   where relkind = 'm' "
+		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
+		"     and n.nspname !~ 'pgcopydb' "
+
+		/* WHERE clause for exclusion filters */
+		"     and fn.nspname is null "
+		"     and ft.relname is null "
+
+		"order by n.nspname, c.relname"
+	},
+
+	{
+		SOURCE_FILTER_TYPE_LIST_NOT_INCL,
+
+		"  select c.oid, "
+		"         format('%I', n.nspname) as nspname, "
+		"         format('%I', c.relname) as relname, "
+		"         false as excludedata, "
+		"         format('%s %s %s', "
+		"                regexp_replace(n.nspname, '[\\n\\r]', ' '), "
+		"                regexp_replace(c.relname, '[\\n\\r]', ' '), "
+		"                regexp_replace(auth.rolname, '[\\n\\r]', ' ')) "
+
+		"    from pg_catalog.pg_class c "
+		"         join pg_catalog.pg_namespace n on c.relnamespace = n.oid "
+		"         join pg_roles auth ON auth.oid = c.relowner"
+
+		/* include-only-table */
+		"    left join pg_temp.filter_include_only_table inc "
+		"           on n.nspname = inc.nspname "
+		"          and c.relname = inc.relname "
+
+		"   where relkind = 'm' "
+		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
+		"     and n.nspname !~ 'pgcopydb' "
+
+		/* WHERE clause for exclusion filters */
+		"     and inc.nspname is null "
+
+		"order by n.nspname, c.relname"
+	},
+
+	{
+		SOURCE_FILTER_TYPE_LIST_EXCL,
+
+		"  select c.oid, "
+		"         format('%I', n.nspname) as nspname, "
+		"         format('%I', c.relname) as relname, "
+		"         ftd.relname is not null as excludedata, "
+		"         format('%s %s %s', "
+		"                regexp_replace(n.nspname, '[\\n\\r]', ' '), "
+		"                regexp_replace(c.relname, '[\\n\\r]', ' '), "
+		"                regexp_replace(auth.rolname, '[\\n\\r]', ' ')) "
+
+		"    from pg_catalog.pg_class c "
+		"         join pg_catalog.pg_namespace n on c.relnamespace = n.oid "
+		"         join pg_roles auth ON auth.oid = c.relowner"
+
+		/* exclude-schema */
+		"         left join pg_temp.filter_exclude_schema fn "
+		"                on n.nspname = fn.nspname "
+
+		/* exclude-table */
+		"         left join pg_temp.filter_exclude_table ft "
+		"                on n.nspname = ft.nspname "
+		"               and c.relname = ft.relname "
+
+		/* exclude-table-data */
+		"         left join pg_temp.filter_exclude_table_data ftd "
+		"                on n.nspname = ftd.nspname "
+		"               and c.relname = ftd.relname "
+
+		"   where relkind = 'm' "
+		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
+		"     and n.nspname !~ 'pgcopydb' "
+
+		/* WHERE clause for exclusion filters */
+		"     and (   fn.nspname is not null "
+		"		   or ft.relname is not null "
+		"          or ftd.relname is not null ) "
+
+		"order by n.nspname, c.relname"
+	}
+};
+
+/*
+ * schema_list_matviews grabs the list of materialized view refreshes from the
+ * given source Postgres instance and allocates a SourceTable array with
+ * the result of the query.
+ */
+bool
+schema_list_matviews(PGSQL *pgsql,
+					 SourceFilters *filters,
+					 DatabaseCatalog *catalog)
+{
+	SourceMatViewArrayContext context = { { 0 }, catalog, false };
+
+	log_trace("schema_list_matviews");
+
+	SourceFilterType filterType = SOURCE_FILTER_TYPE_NONE;
+
+	switch (filters->type)
+	{
+		case SOURCE_FILTER_TYPE_NONE:
+		case SOURCE_FILTER_TYPE_EXCL_INDEX:
+		{
+			/* skip filters preparing (temp tables) */
+			break;
+		}
+
+		case SOURCE_FILTER_TYPE_INCL:
+		case SOURCE_FILTER_TYPE_EXCL:
+		case SOURCE_FILTER_TYPE_LIST_NOT_INCL:
+		case SOURCE_FILTER_TYPE_LIST_EXCL:
+		{
+			if (!prepareFilters(pgsql, filters))
+			{
+				log_error("Failed to prepare pgcopydb filters, "
+						  "see above for details");
+				return false;
+			}
+
+			filterType = filters->type;
+
+			break;
+		}
+
+		/* ignore "exclude-index" listing of filtered-out tables */
+		case SOURCE_FILTER_TYPE_LIST_EXCL_INDEX:
+		{
+			return true;
+		}
+
+		default:
+		{
+			log_error("BUG: schema_list_ordinary_tables called with "
+					  "filtering type %d",
+					  filters->type);
+			return false;
+		}
+	}
+
+	log_debug("listSourceMatViewSQL[%s]",
+			  filterTypeToString(filterType));
+
+	char *sql = listSourceMatViewSQL[filterType].sql;
+
+	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
+								   &context, &getMatViewArray))
+	{
+		log_error("Failed to list materalized view refreshes");
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to list tables");
 		return false;
 	}
 
@@ -4734,6 +4993,101 @@ parseCurrentSourceTableSize(PGresult *result, int rowNumber, SourceTableSize *ta
 	}
 
 	return errors == 0;
+}
+
+
+/*
+ * getMatViewArray loops over the SQL result for the materialized views
+ * array query and allocates an array of materialized view then populates it
+ * with the query result.
+ */
+static void
+getMatViewArray(void *ctx, PGresult *result)
+{
+	SourceMatViewArrayContext *context = (SourceMatViewArrayContext *) ctx;
+
+	int nTuples = PQntuples(result);
+
+	if (PQnfields(result) != 5)
+	{
+		log_error("Query returned %d columns, expected 5", PQnfields(result));
+		context->parsedOk = false;
+		return;
+	}
+
+	int errors = 0;
+
+	int fnoid = PQfnumber(result, "oid");
+	int fnnspname = PQfnumber(result, "nspname");
+	int fnrelname = PQfnumber(result, "relname");
+	int fnexcldata = PQfnumber(result, "excludedata");
+	int fnrestorelistname = PQfnumber(result, "format");
+
+	for (int rowNumber = 0; rowNumber < nTuples; rowNumber++)
+	{
+		SourceMatView matview = { 0 };
+
+		/* c.oid */
+		char *value = PQgetvalue(result, rowNumber, fnoid);
+
+		if (!stringToUInt32(value, &(matview.oid)) || matview.oid == 0)
+		{
+			log_error("Invalid OID \"%s\"", value);
+			++errors;
+		}
+
+		/* n.nspname */
+		value = PQgetvalue(result, rowNumber, fnnspname);
+		int length = strlcpy(matview.nspname, value, PG_NAMEDATALEN);
+
+		if (length >= PG_NAMEDATALEN)
+		{
+			log_error("Schema name \"%s\" is %d bytes long, "
+					  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+					  value, length, PG_NAMEDATALEN - 1);
+			++errors;
+		}
+
+		/* c.relname */
+		value = PQgetvalue(result, rowNumber, fnrelname);
+		length = strlcpy(matview.relname, value, PG_NAMEDATALEN);
+
+		if (length >= PG_NAMEDATALEN)
+		{
+			log_error("Table name \"%s\" is %d bytes long, "
+					  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+					  value, length, PG_NAMEDATALEN - 1);
+			++errors;
+		}
+
+		/* excludeData */
+		value = PQgetvalue(result, rowNumber, fnexcldata);
+		matview.excludeData = (*value) == 't';
+
+		/* restoreListName */
+		value = PQgetvalue(result, rowNumber, fnrestorelistname);
+		length = strlcpy(matview.restoreListName, value, RESTORE_LIST_NAMEDATALEN);
+
+		if (length >= RESTORE_LIST_NAMEDATALEN)
+		{
+			log_error("Table restore list name \"%s\" is %d bytes long, "
+					  "the maximum expected is %d (RESTORE_LIST_NAMEDATALEN - 1)",
+					  value, length, RESTORE_LIST_NAMEDATALEN - 1);
+			++errors;
+		}
+
+		if (context->catalog != NULL && context->catalog->db != NULL)
+		{
+			if (!catalog_add_s_matview(context->catalog, &matview))
+			{
+				++errors;
+
+				break;
+			}
+		}
+	}
+
+	context->parsedOk = errors == 0;
 }
 
 

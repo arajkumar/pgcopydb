@@ -926,6 +926,35 @@ copydb_prepare_index_specs(CopyDataSpec *specs, PGSQL *pgsql)
 
 
 /*
+ * copydb_matview_objectid_is_filtered_out returns true when the
+ * given oid belongs to a database materialized view object that's
+ * been filtered out by the filtering setup.
+ */
+bool
+copydb_matview_objectid_is_filtered_out(CopyDataSpec *specs, uint32_t oid)
+{
+	DatabaseCatalog *filtersDB = &(specs->catalogs.filter);
+	CatalogMatview result = { 0 };
+
+	if (oid != 0)
+	{
+		if (!catalog_lookup_s_matview_by_oid(filtersDB, &result, oid))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (result.oid != 0)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
  * copydb_objectid_is_filtered_out returns true when the given oid belongs to a
  * database object that's been filtered out by the filtering setup.
  */
@@ -1198,6 +1227,33 @@ copydb_fetch_filtered_oids(CopyDataSpec *specs, PGSQL *pgsql)
 		{
 			/* errors have already been logged */
 			(void) semaphore_unlock(&(filtersDB->sema));
+			return false;
+		}
+	}
+
+	if ((specs->section == DATA_SECTION_ALL ||
+		 specs->section == DATA_SECTION_MATERIALIZED_VIEWS) &&
+		!filtersDB->sections[DATA_SECTION_MATERIALIZED_VIEWS].fetched)
+	{
+		TopLevelTiming timing = {
+			.label = CopyDataSectionToString(DATA_SECTION_MATERIALIZED_VIEWS)
+		};
+
+		(void) catalog_start_timing(&timing);
+
+		if (!schema_list_matviews(pgsql, filters, filtersDB))
+		{
+			/* errors have already been logged */
+			filters->type = type;
+			return false;
+		}
+
+		(void) catalog_stop_timing(&timing);
+
+		if (!catalog_register_section(filtersDB, &timing))
+		{
+			/* errors have already been logged */
+			filters->type = type;
 			return false;
 		}
 	}

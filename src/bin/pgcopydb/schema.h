@@ -304,6 +304,21 @@ typedef struct SourceProperty
 
 
 /*
+ * SourceMatView caches the information we need about all the
+ * materialized views found in the source database. This is used to filter-out
+ * the refresh of materialized views when it is part of exclude-table-data.
+ */
+typedef struct SourceMatView
+{
+	uint32_t oid;
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+	char restoreListName[RESTORE_LIST_NAMEDATALEN];
+	bool excludeData;
+} SourceMatView;
+
+
+/*
  * There is a cyclic dependency between schema.c and catalog.h, because the
  * schema queries need to fill-in the internal catalogs, and the internal
  * catalog API deals with schema.h structures (e.g. SourceTable or
@@ -347,6 +362,7 @@ typedef enum
 	DATA_SECTION_SCHEMA,
 	DATA_SECTION_TABLE_DATA,
 	DATA_SECTION_TABLE_DATA_PARTS,
+	DATA_SECTION_MATERIALIZED_VIEWS,
 	DATA_SECTION_SET_SEQUENCES,
 	DATA_SECTION_INDEXES,
 	DATA_SECTION_CONSTRAINTS,
@@ -413,6 +429,10 @@ bool schema_list_collations(PGSQL *pgsql, DatabaseCatalog *catalog);
 
 bool schema_prepare_pgcopydb_table_size(PGSQL *pgsql,
 										SourceFilters *filters, DatabaseCatalog *catalog);
+
+bool schema_list_matviews(PGSQL *pgsql,
+						  SourceFilters *filters,
+						  DatabaseCatalog *catalog);
 
 bool schema_list_ordinary_tables(PGSQL *pgsql,
 								 SourceFilters *filters,
