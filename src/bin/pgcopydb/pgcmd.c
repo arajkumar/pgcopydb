@@ -446,6 +446,59 @@ pg_dump_db(PostgresPaths *pgPaths,
 		}
 	}
 
+	/*
+	 * This applies [exclude-table-data] filtering.
+	 *
+	 * Eventhough pgcopydb handles table data copying, we still want to
+	 * exclude table data to filter materialized view data by avoiding
+	 * REFRESH MATERIALIZED VIEW.
+	 */
+	int excludeTableDataCount = filters->excludeTableDataList.count;
+
+	char **excludeTableData = NULL;
+
+	if (excludeTableDataCount > 0)
+	{
+		excludeTableData = calloc(excludeTableDataCount, sizeof(char *));
+
+		if (excludeTableData == NULL)
+		{
+
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		for (int i = 0; i < excludeTableDataCount; i++)
+		{
+			SourceFilterTable *table = &(filters->excludeTableDataList.array[i]);
+
+			excludeTableData[i] = calloc(PG_NAMEDATALEN_FQ, sizeof(char));
+
+			if (excludeTableData[i] == NULL)
+			{
+				log_error(ALLOCATION_FAILED_ERROR);
+				return false;
+			}
+
+			sformat(excludeTableData[i], PG_NAMEDATALEN_FQ, "%s.%s",
+					table->nspname,
+					table->relname);
+
+			/* check that we still have room for --exclude-schema args */
+			if (PG_CMD_MAX_ARG < (argsIndex + 2))
+			{
+				log_error("Failed to call pg_dump, too many exclude-schema entries: "
+						"argsIndex %d > %d",
+						argsIndex + 2,
+						PG_CMD_MAX_ARG);
+				return false;
+			}
+
+			args[argsIndex++] = "--exclude-table-data";
+			args[argsIndex++] = excludeTableData[i];
+		}
+	}
+
 	args[argsIndex++] = "--file";
 	args[argsIndex++] = (char *) filename;
 	args[argsIndex++] = (char *) connStrings->safeSourcePGURI.pguri;
@@ -482,6 +535,11 @@ pg_dump_db(PostgresPaths *pgPaths,
 		setenv("PGPASSWORD", PGPASSWORD, 1);
 	}
 
+	for (int i = 0; i < excludeTableDataCount; i++)
+	{
+		free(excludeTableData[i]);
+	}
+
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_dump: exit code %d", program.returnCode);
@@ -491,6 +549,7 @@ pg_dump_db(PostgresPaths *pgPaths,
 	}
 
 	free_program(&program);
+
 	return true;
 }
 

@@ -335,6 +335,8 @@ def migrate_existing_data_from_ts(args):
         "--snapshot",
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
+        "--filters",
+        "/tmp/filter.ini",
         ]
 
     if args.resume:
