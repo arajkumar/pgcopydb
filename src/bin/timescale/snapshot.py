@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import logging
+import os
 
 from utils import docker_command
 from usr_signal import wait_for_event
@@ -28,6 +29,10 @@ def snapshot(args):
         sys.exit(1)
 
     validate_dbs()
+
+    if not os.path.ismount("/opt/timescale/ts_cdc"):
+        logger.error("Volume mount not found. To proceed, mount a volume: '-v <host_dir>:/opt/timescale/ts_cdc'")
+        sys.exit(1)
 
     tables_without_pkey_replident = has_tables_without_pkey_replident()
     if len(tables_without_pkey_replident) > 0:
