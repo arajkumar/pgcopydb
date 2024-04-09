@@ -109,7 +109,7 @@ def monitor_db_sizes() -> threading.Event:
 
 
 @telemetry_command("migrate_existing_data_from_pg")
-def migrate_existing_data_from_pg(target_type: DBType):
+def migrate_existing_data_from_pg(target_type: DBType, args):
     # TODO: Switch to the following simplified commands once we
     # figure out how to deal with incompatible indexes.
     # pgcopydb dump schema
@@ -181,7 +181,9 @@ def migrate_existing_data_from_pg(target_type: DBType):
                                  "copy",
                                  "table-data",
                                  "--table-jobs",
-                                 "8",
+                                 args.table_jobs,
+                                 "--index-jobs",
+                                 args.index_jobs,
                                  "--split-tables-larger-than='1 GB'",
                                  "--notice",
                                  "--skip-vacuum",
@@ -224,7 +226,7 @@ def migrate_existing_data_from_pg(target_type: DBType):
                                         "--dbname",
                                         "$PGCOPYDB_TARGET_PGURI",
                                         "--jobs",
-                                        "8",
+                                        args.table_jobs,
                                         ])
             run_cmd(vaccumdb_command, f"{env['PGCOPYDB_DIR']}/logs/analyze_db")
         mark_section_complete("analyze-db")
@@ -327,15 +329,17 @@ def migrate_existing_data_from_ts(args):
         "--skip-extensions",
         "--no-acl",
         "--no-owner",
-        "--table-jobs=8",
-        "--index-jobs=8",
+        "--table-jobs",
+        args.table_jobs,
+        "--index-jobs",
+        args.index_jobs,
         "--split-tables-larger-than='1 GB'",
         "--dir",
         "$PGCOPYDB_DIR/pgcopydb_clone",
         "--snapshot",
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
-        ]
+    ]
 
     if args.resume:
         clone_table_data.append("--resume")
@@ -560,7 +564,7 @@ def migrate(args):
             if not is_section_migration_complete("initial-data-migration"):
                 logger.info("Migrating existing data from Source DB to Target DB ...")
                 if source_type == DBType.POSTGRES:
-                    migrate_existing_data_from_pg(target_type)
+                    migrate_existing_data_from_pg(target_type, args)
                 else:
                     migrate_existing_data_from_ts(args)
                 mark_section_complete("initial-data-migration")
