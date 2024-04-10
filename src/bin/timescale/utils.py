@@ -76,7 +76,6 @@ def bytes_to_human(bytes):
 
 
 def create_dirs(work_dir: Path):
-    global env
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)
     # This is needed because cleanup doesn't support --dir
     pgcopydb_dir = Path(tempfile.gettempdir()) / "pgcopydb"

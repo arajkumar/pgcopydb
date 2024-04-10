@@ -1,6 +1,9 @@
+import datetime
 import subprocess
 import threading
 import logging
+
+from pathlib import Path
 
 from environ import env
 from exception import RedactedException
@@ -9,6 +12,15 @@ logger = logging.getLogger(__name__)
 
 def psql(uri: str, sql: str):
     return f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "{uri}" -c " {sql} " """
+
+
+INIT_TIME = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+class LogFile:
+    def __init__(self, fname: str):
+        log_dir = Path(env["PGCOPYDB_DIR"]) / "logs"
+        self.stdout = log_dir/f"{fname}_stdout_{INIT_TIME}.log"
+        self.stderr = log_dir/f"{fname}_stderr_{INIT_TIME}.log"
 
 
 def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, tail: int = 50):
@@ -45,17 +57,16 @@ def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, t
 
 
 class Command:
-    def __init__(self, command: str = "", env=env, use_shell: bool = False, log_path: str = ""):
+    def __init__(self, command: str = "", env=env, use_shell: bool = False, log_file: LogFile = None):
         self.command = command
-        self.log_path = log_path
-        if log_path == "":
+        self.stderr_path = ""
+        if log_file == None:
             self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env)
         else:
-            fname_stdout = f"{log_path}_stdout.log"
-            f_stdout = open(fname_stdout, "w")
+            f_stdout = open(log_file.stdout, "w")
 
-            fname_stderr = f"{log_path}_stderr.log"
-            f_stderr = open(fname_stderr, "w")
+            self.stderr_path = log_file.stderr
+            f_stderr = open(log_file.stderr, "w")
 
             self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env,
                                             stdout=f_stdout, stderr=f_stderr,
@@ -77,8 +88,8 @@ class Command:
             #
             # code 12 is received when `pgcopydb follow`'s internal child processes exit due to an external signal.
             # We believe ignoring this code is safe.
-            if self.log_path != "":
-                print_logs_with_error(log_path=f"{self.log_path}_stderr.log")
+            if self.stderr_path != "":
+                print_logs_with_error(log_path=self.stderr_path)
             cmd_name = self.command.split()[0]
             raise RedactedException(
                 f"command '{self.command}' exited with {self.process.returncode} code stderr={self.process.stderr}",
@@ -97,18 +108,16 @@ class Command:
         self.process.kill()
 
 
-def run_cmd(cmd: str, log_path: str = "", ignore_non_zero_code: bool = False) -> str:
+def run_cmd(cmd: str, log_file: LogFile = None, ignore_non_zero_code: bool = False) -> str:
     stdout = subprocess.PIPE
     stderr = subprocess.PIPE
-    if log_path != "":
-        fname_stdout = f"{log_path}_stdout.log"
-        stdout = open(fname_stdout, "w")
-        fname_stderr = f"{log_path}_stderr.log"
-        stderr = open(fname_stderr, "w")
+    if log_file != None:
+        stdout = open(log_file.stdout, "w")
+        stderr = open(log_file.stderr, "w")
     result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
     if result.returncode != 0 and not ignore_non_zero_code:
-        if log_path != "":
-            print_logs_with_error(log_path=f"{log_path}_stderr.log")
+        if log_file != None:
+            print_logs_with_error(log_path=log_file.stderr)
         cmd_name = cmd.split()[0]
         raise RedactedException(
             f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}",

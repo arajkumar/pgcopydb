@@ -2,6 +2,8 @@ import threading
 import typing
 import logging
 
+from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
 class HealthCheck:
@@ -13,7 +15,7 @@ class HealthCheck:
     def get_filename(self, path):
         return path.split("/")[-1]
 
-    def check_log_for_health(self, name: str, log_path: str, is_error_func: typing.Callable):
+    def check_log_for_health(self, name: str, log_path: Path, is_error_func: typing.Callable):
         """
         Monitors log health by passing lines from the log file to `is_error_func`.
         - `name`: Name for check.
@@ -29,17 +31,12 @@ class HealthCheck:
         - Continuous scanning of file. The function opens a file and keeps scanning until a new line is found.
             This avoids reopening of files and skipping the lines that were previously scanned.
         """
+        log_path = str(log_path)
         if log_path is None or log_path == "" or is_error_func is None:
             raise Exception("provide a valid log_path and health_func")
         stop_event = threading.Event()
         def checker():
             with open(log_path, "rb") as file:
-                # Optimization
-                # ------------
-                # Move the read pointer to the end of file so that we only read
-                # the new content for errors and do not repeat the errors that
-                # were logged in the last session.
-                file.seek(0, 2)
                 while not stop_event.is_set():
                     line = file.readline()
                     if line == b'':

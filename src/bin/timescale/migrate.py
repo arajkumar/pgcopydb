@@ -12,11 +12,12 @@ from pathlib import Path
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
-from utils import timeit, docker_command, dbname_from_uri, store_val, get_stored_val, bytes_to_human, seconds_to_human, DBType, get_dbtype
+from utils import timeit, docker_command, dbname_from_uri, store_val, \
+    get_stored_val, bytes_to_human, seconds_to_human, DBType, get_dbtype
 from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
-from exec import Command, run_cmd, run_sql, psql, print_logs_with_error
+from exec import Command, run_cmd, run_sql, psql, print_logs_with_error, LogFile
 
 logger = logging.getLogger(__name__)
 
@@ -53,15 +54,15 @@ def create_follow(resume: bool = False):
         # temporary snapshot is acceptable, as it's only used for catalog access.
         follow_command += " --resume --not-consistent"
 
-    log_path = f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_follow"
-    follow_proc = Command(command=follow_command, use_shell=True, log_path=log_path)
+    log_file = LogFile("pgcopydb_follow")
+    follow_proc = Command(command=follow_command, use_shell=True, log_file=log_file)
     def is_error_func_for_follow(log_line: str):
         if "pgcopydb.sentinel" in log_line:
             return False
         if "ERROR" in log_line or "free(): double free detected" in log_line:
             return True
         return False
-    health_checker.check_log_for_health("follow", f"{log_path}_stderr.log", is_error_func_for_follow)
+    health_checker.check_log_for_health("follow", log_file.stderr, is_error_func_for_follow)
 
     return follow_proc
 
@@ -130,7 +131,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                        "--section=pre-data",
                                        "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
                                        ])
-            run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_dump")
+            run_cmd(pgdump_command, LogFile("pre_data_dump"))
         mark_section_complete("pre-data-dump")
 
     if not is_section_migration_complete("post-data-dump"):
@@ -147,13 +148,13 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                        "--section=post-data",
                                        "--file=$PGCOPYDB_DIR/post-data-dump.sql",
                                        ])
-            run_cmd(pgdump_command, f"{env['PGCOPYDB_DIR']}/logs/post_data_dump")
+            run_cmd(pgdump_command, LogFile("post_data_dump"))
         mark_section_complete("post-data-dump")
 
     if not is_section_migration_complete("pre-data-restore"):
         logger.info("Restoring pre-data ...")
         with timeit():
-            log_path = f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore"
+            log_file = LogFile("pre_data_restore")
             psql_command = " ".join(["psql",
                                      "-X",
                                      "-d",
@@ -164,8 +165,8 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                      "-f",
                                      "$PGCOPYDB_DIR/pre-data-dump.sql",
                                      ])
-            run_cmd(psql_command, f"{env['PGCOPYDB_DIR']}/logs/pre_data_restore")
-            print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
+            run_cmd(psql_command, log_file)
+            print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
         mark_section_complete("pre-data-restore")
 
     if (target_type == DBType.TIMESCALEDB and
@@ -193,13 +194,13 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                  "$(cat $PGCOPYDB_DIR/snapshot)",
                                  ])
         with timeit():
-            run_cmd(copy_table_data, f"{env['PGCOPYDB_DIR']}/logs/copy_table_data")
+            run_cmd(copy_table_data, LogFile("copy_table_data"))
         mark_section_complete("copy-table-data")
 
     if not is_section_migration_complete("post-data-restore"):
         logger.info("Restoring post-data ...")
         with timeit():
-            log_path = f"{env['PGCOPYDB_DIR']}/logs/post_data_restore"
+            log_file = LogFile("post_data_restore")
             psql_command = " ".join(["psql",
                                      "-X",
                                      "-d",
@@ -210,8 +211,8 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                      "-f",
                                      "$PGCOPYDB_DIR/post-data-dump.sql",
                                      ])
-            run_cmd(psql_command, log_path)
-            print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
+            run_cmd(psql_command, log_file)
+            print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
         mark_section_complete("post-data-restore")
 
     if not is_section_migration_complete("analyze-db"):
@@ -228,7 +229,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                         "--jobs",
                                         args.table_jobs,
                                         ])
-            run_cmd(vaccumdb_command, f"{env['PGCOPYDB_DIR']}/logs/analyze_db")
+            run_cmd(vaccumdb_command, LogFile("analyze_db"))
         mark_section_complete("analyze-db")
     stop_progress.set()
 
@@ -247,7 +248,7 @@ def migrate_extensions():
             "$(cat $PGCOPYDB_DIR/snapshot)",
             "--resume",
             ])
-        run_cmd(copy_extensions, f"{env['PGCOPYDB_DIR']}/logs/copy_extensions")
+        run_cmd(copy_extensions, LogFile("copy_extensions"))
 
 
 @telemetry_command("migrate_roles")
@@ -313,11 +314,9 @@ sed -i -E \
         ]
 
         restore_roles_cmd = " ".join(restore_roles_cmd)
-        log_path = f"{env['PGCOPYDB_DIR']}/logs/restore_roles"
-
-        run_cmd(restore_roles_cmd, log_path)
-
-        print_logs_with_error(log_path=f"{log_path}_stderr.log", after=3, tail=0)
+        log_file = LogFile("restore_roles")
+        run_cmd(restore_roles_cmd, log_file)
+        print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
 
 
 @telemetry_command("migrate_existing_data_from_ts")
@@ -349,7 +348,7 @@ def migrate_existing_data_from_ts(args):
     stop_progress = monitor_db_sizes()
 
     with timeit():
-       run_cmd(clone_table_data, f"{env['PGCOPYDB_DIR']}/logs/pgcopydb_clone")
+       run_cmd(clone_table_data, LogFile("pgcopydb_clone"))
 
     stop_progress.set()
 
@@ -407,7 +406,7 @@ def wait_for_DBs_to_sync(follow_proc):
 
 @telemetry_command("copy_sequences")
 def copy_sequences():
-    run_cmd("pgcopydb copy sequences --resume --not-consistent", f"{env['PGCOPYDB_DIR']}/logs/copy_sequences")
+    run_cmd("pgcopydb copy sequences --resume --not-consistent", LogFile("copy_sequences"))
 
 @telemetry_command("enable_user_background_jobs")
 def enable_user_background_jobs():
