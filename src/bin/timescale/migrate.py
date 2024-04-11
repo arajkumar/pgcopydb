@@ -9,6 +9,8 @@ import logging
 
 from enum import Enum
 from pathlib import Path
+from typing import Tuple, Callable
+from multiprocessing.pool import ThreadPool
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
@@ -321,6 +323,18 @@ sed -i -E \
 @telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts(args):
     logger.info("Copying table data ...")
+
+    # Create a filter file to exclude materialized views from the clone.
+    # This is necessary to support materialized views that depend on caggs,
+    # otherwise materialized view refreshes will fail due to timescaledb
+    # extension not being availble until post-restore.
+    #
+    # We refresh materialized views after the initial data migration is
+    # complete.
+    filter_path = f"{env['PGCOPYDB_DIR']}/filter.ini"
+    populate_filter_file(filter_path,
+                         ignore_materialized_views(env["PGCOPYDB_SOURCE_PGURI"]))
+
     clone_table_data = [
         "pgcopydb",
         "clone",
@@ -336,8 +350,8 @@ def migrate_existing_data_from_ts(args):
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
         "--filters",
-        "/tmp/filter.ini",
-        ]
+        filter_path,
+    ]
 
     if args.resume:
         clone_table_data.append("--resume")
@@ -440,6 +454,38 @@ END;
     """
     run_sql(execute_on_target=False,
             sql=sql)
+
+def get_all_materialized_views(pg_uri):
+    r = run_cmd(psql(uri=pg_uri, sql="""
+        SELECT CONCAT(QUOTE_IDENT(schemaname), '.', QUOTE_IDENT(matviewname))
+        FROM pg_matviews
+        WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
+    """))
+    return r.splitlines()
+
+def ignore_materialized_views(pg_uri):
+    def _ignore():
+        return "[exclude-table-data]", get_all_materialized_views(pg_uri)
+    return _ignore
+
+def populate_filter_file(filter_path: str, body: Tuple[str, Callable]):
+    with open(filter_path, "w") as f:
+        header, content = body()
+        f.write(header + "\n")
+        for line in content:
+            f.write(line + "\n")
+
+def refresh_materialized_views():
+    materialized_views = get_all_materialized_views("$PGCOPYDB_TARGET_PGURI")
+
+    def _refresh_view(view):
+        run_sql(execute_on_target=True,
+                sql=f"REFRESH MATERIALIZED VIEW {view};")
+
+    # Refresh materialized views in parallel.
+    # TODO: use jobs arg instead of hardcoded 8.
+    with ThreadPool(8) as p:
+        p.map(_refresh_view, materialized_views)
 
 
 def replication_origin_exists():
@@ -573,6 +619,10 @@ def migrate(args):
                 # are issues restoring indexes and foreign key constraints to chunks.
                 timescaledb_post_restore()
                 mark_section_complete("timescaledb-post-restore")
+
+            if not is_section_migration_complete("refresh-materialized-views"):
+                refresh_materialized_views()
+                mark_section_complete("refresh-materialized-views")
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
