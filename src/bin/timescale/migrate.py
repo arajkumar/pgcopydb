@@ -10,7 +10,6 @@ import logging
 from enum import Enum
 from pathlib import Path
 from typing import Tuple, Callable
-from multiprocessing.pool import ThreadPool
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
@@ -477,15 +476,45 @@ def populate_filter_file(filter_path: str, body: Tuple[str, Callable]):
 
 def refresh_materialized_views():
     materialized_views = get_all_materialized_views("$PGCOPYDB_TARGET_PGURI")
+    if len(materialized_views) == 0:
+        return
 
-    def _refresh_view(view):
-        run_sql(execute_on_target=True,
-                sql=f"REFRESH MATERIALIZED VIEW {view};")
+    logger.info("Refreshing materialized views ...")
 
-    # Refresh materialized views in parallel.
-    # TODO: use jobs arg instead of hardcoded 8.
-    with ThreadPool(8) as p:
-        p.map(_refresh_view, materialized_views)
+    dump_file = f"{env['PGCOPYDB_DIR']}/materialized_views.dump"
+    with timeit():
+        # We use pg_dump and pg_restore to refresh materialized views in order
+        # to handle dependencies between materialized views properly along with
+        # concurrency.
+        dump_materialized_views_cmd = [
+            "pg_dump",
+            "-d",
+            "$PGCOPYDB_SOURCE_PGURI",
+            "-Fc",
+            "--quote-all-identifiers",
+            # We are interested only in REFRESH MATERIALIZED VIEWS statements
+            "--section=post-data",
+            "--file",
+            dump_file,
+        ]
+
+        # Use --table to select only the materialized views
+        for mv in materialized_views:
+            dump_materialized_views_cmd.append(f"--table={mv}")
+
+        dump_materialized_views_cmd = " ".join(dump_materialized_views_cmd)
+        run_cmd(dump_materialized_views_cmd, f"{env['PGCOPYDB_DIR']}/logs/dump_materialized_views")
+
+        refresh_materialized_views_cmd = [
+            "pg_restore",
+            "-d",
+            "$PGCOPYDB_TARGET_PGURI",
+            dump_file,
+            "--jobs=8", # TODO: Make this configurable
+        ]
+        refresh_materialized_views_cmd = " ".join(refresh_materialized_views_cmd)
+        run_cmd(refresh_materialized_views_cmd, f"{env['PGCOPYDB_DIR']}/logs/refresh_materialized_views")
+
 
 
 def replication_origin_exists():
