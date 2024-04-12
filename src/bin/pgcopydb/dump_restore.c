@@ -658,6 +658,17 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 			log_notice("Skipping COMMENT ON EXTENSION \"%s\"", name);
 		}
 
+		if (!skip &&
+			(item->desc == ARCHIVE_TAG_EXTENSION ||
+			(item->isCompositeTag &&
+			item->tagKind == ARCHIVE_TAG_KIND_COMMENT &&
+			item->tagType == ARCHIVE_TAG_TYPE_EXTENSION)) &&
+			streq(name, "aiven_extras"))
+		{
+			skip = true;
+			log_notice("Skipping EXTENSION \"%s\"", name);
+		}
+
 		if (!skip && catOid == PG_NAMESPACE_OID)
 		{
 			bool exists = false;
