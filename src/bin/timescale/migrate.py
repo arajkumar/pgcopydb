@@ -7,9 +7,7 @@ import sys
 import threading
 import logging
 
-from enum import Enum
 from pathlib import Path
-from typing import Tuple, Callable
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
@@ -18,6 +16,7 @@ from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql, print_logs_with_error
+from filter import Filter
 
 logger = logging.getLogger(__name__)
 
@@ -330,9 +329,10 @@ def migrate_existing_data_from_ts(args):
     #
     # We refresh materialized views after the initial data migration is
     # complete.
-    filter_path = f"{env['PGCOPYDB_DIR']}/filter.ini"
-    populate_filter_file(filter_path,
-                         ignore_materialized_views(env["PGCOPYDB_SOURCE_PGURI"]))
+    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
+    filter = Filter(f"{env['PGCOPYDB_DIR']}/filter.ini")
+    filter.exclude_materialized_view_refresh(
+                         get_all_materialized_views(source_pg_uri))
 
     clone_table_data = [
         "pgcopydb",
@@ -349,7 +349,7 @@ def migrate_existing_data_from_ts(args):
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
         "--filters",
-        filter_path,
+        filter.path(),
     ]
 
     if args.resume:
@@ -461,18 +461,6 @@ def get_all_materialized_views(pg_uri):
         WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
     """))
     return r.splitlines()
-
-def ignore_materialized_views(pg_uri):
-    def _ignore():
-        return "[exclude-table-data]", get_all_materialized_views(pg_uri)
-    return _ignore
-
-def populate_filter_file(filter_path: str, body: Tuple[str, Callable]):
-    with open(filter_path, "w") as f:
-        header, content = body()
-        f.write(header + "\n")
-        for line in content:
-            f.write(line + "\n")
 
 def refresh_materialized_views():
     materialized_views = get_all_materialized_views("$PGCOPYDB_TARGET_PGURI")

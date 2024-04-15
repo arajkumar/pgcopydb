@@ -487,7 +487,7 @@ pg_dump_db(PostgresPaths *pgPaths,
 			/* check that we still have room for --exclude-schema args */
 			if (PG_CMD_MAX_ARG < (argsIndex + 2))
 			{
-				log_error("Failed to call pg_dump, too many exclude-schema entries: "
+				log_error("Failed to call pg_dump, too many exclude-table-data entries: "
 						"argsIndex %d > %d",
 						argsIndex + 2,
 						PG_CMD_MAX_ARG);
@@ -540,6 +540,11 @@ pg_dump_db(PostgresPaths *pgPaths,
 		free(excludeTableData[i]);
 	}
 
+	if (excludeTableData != NULL)
+	{
+		free(excludeTableData);
+	}
+
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_dump: exit code %d", program.returnCode);
@@ -549,7 +554,6 @@ pg_dump_db(PostgresPaths *pgPaths,
 	}
 
 	free_program(&program);
-
 	return true;
 }
 
