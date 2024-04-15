@@ -2,7 +2,7 @@ import shutil
 import logging
 
 from telemetry import telemetry_command
-from exec import run_cmd
+from exec import run_cmd, run_sql
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +16,9 @@ def cleanup(args):
         dir = str(args.dir.absolute())
         shutil.rmtree(dir, ignore_errors=True)
         logger.info(f"Pruned {dir}...")
+        # Dropping pgcopydb schema is under '--prune' since '--prune' flag is used when
+        # the user no longer intends to resume the migration process.
+        run_sql(execute_on_target=True, sql="drop schema if exists pgcopydb cascade")
 
 def clean(args):
     cleanup(args)
