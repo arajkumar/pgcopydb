@@ -294,7 +294,9 @@ sed -i -E \
 -e 's/GRANTED BY "[^"]*"//g' \
 -e '/CREATE ROLE "tsdbadmin";/d' \
 -e '/ALTER ROLE "tsdbadmin"/d' \
--e '/TO "tsdbadmin/d' \
+-e 's/WITH ADMIN OPTION//g' \
+-e 's/GRANTED BY ".*"//g' \
+-e '/GRANT "pg_.*" TO "tsdbadmin"/d' \
 -e '/CREATE ROLE "_aiven";/d' \
 -e '/ALTER ROLE "_aiven"/d' \
 {roles_file_path}"""
