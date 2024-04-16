@@ -65,9 +65,9 @@ def main():
                                            add_help=False)
     parser_migrate.add_argument('--resume', action='store_true', help='Resume the migration')
     parser_migrate.add_argument('--skip-roles', action='store_true', help='Skip roles migration')
-    parser_migrate.add_argument('--table-jobs', default=8, type=str,
+    parser_migrate.add_argument('--table-jobs', default="8", type=str,
                                 help='Number of parallel jobs to copy "existing data" from source db to target db (Default: 8)')
-    parser_migrate.add_argument('--index-jobs', default=8, type=str,
+    parser_migrate.add_argument('--index-jobs', default="8", type=str,
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
