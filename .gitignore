@@ -42,4 +42,3 @@ lib*.pc
 /GIT-VERSION-FILE
 /version
 /src/bin/timescale/__pycache__/
-/integration/target

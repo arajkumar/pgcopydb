@@ -1,0 +1,50 @@
+name: Integration
+on:
+  push:
+    tags-ignore:
+      - "*"
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ci-${{ github.ref }}-1
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup git PAT override
+      run: |
+        git config --global --add url."https://${{ secrets.ORG_AUTOMATION_TOKEN }}:@github".insteadOf ssh://git@github
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.75.0
+        components: clippy, rustfmt
+
+    - name: Rust format
+      run: |
+        cd integration && cargo fmt -- --check
+
+    - name: Rust lint
+      run: |
+        cd integration && cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build docker image
+      uses: docker/build-push-action@v3
+      with:
+        push: false
+        tags: local/live-migration:dev
+        platforms: linux/amd64
+        file: Dockerfile.live-migration
+
+    - name: Test
+      run: |
+        cd integration
+        RUSTFLAGS="-D warnings" cargo test
