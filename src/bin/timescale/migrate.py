@@ -59,7 +59,9 @@ def create_follow(resume: bool = False):
     def is_error_func_for_follow(log_line: str):
         if "pgcopydb.sentinel" in log_line:
             return False
-        if "ERROR" in log_line or "free(): double free detected" in log_line:
+        if "ERROR" in log_line or \
+            "free(): double free detected" in log_line or \
+            "no tuple identifier for" in log_line:
             return True
         return False
     health_checker.check_log_for_health("follow", log_file.stderr, is_error_func_for_follow)
