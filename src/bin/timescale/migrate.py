@@ -6,8 +6,8 @@ import signal
 import sys
 import threading
 import logging
+import traceback
 
-from enum import Enum
 from pathlib import Path
 
 from housekeeping import start_housekeeping
@@ -18,6 +18,7 @@ from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql, print_logs_with_error, LogFile
+from filter import Filter
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,30 @@ def monitor_db_sizes() -> threading.Event:
     return stop_event
 
 
+def skip_extensions_list(args):
+    # Default known list of extensions that should be skipped
+    skip_extensions_default = [
+            "aiven_extras",
+    ]
+
+    if args.skip_extensions:
+        return skip_extensions_default + args.skip_extensions
+    else:
+        return skip_extensions_default
+
+
+def prepare_exclude_extensions(clone_cmd: list[str], args, filter: Filter):
+    # empty list of skip_extensions ignores all extensions
+    if args.skip_extensions is not None and len(args.skip_extensions) == 0:
+        logger.warn("Ignoring all extensions")
+        clone_cmd.append("--skip-extensions")
+        return
+
+    skip_list = skip_extensions_list(args)
+    logger.info("Skipping extensions: %s", skip_list)
+    filter.exclude_extensions(skip_list)
+
+
 @telemetry_command("migrate_existing_data_from_pg")
 def migrate_existing_data_from_pg(target_type: DBType, args):
     # TODO: Switch to the following simplified commands once we
@@ -119,6 +144,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
     # pgcopydb restore pre-data --skip-extensions --no-acl --no-owner
     # <-- create hypertables -->
     # pgcopydb clone --skip-extensions --no-acl --no-owner
+
     if not is_section_migration_complete("pre-data-dump"):
         logger.info(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
         with timeit():
@@ -170,6 +196,30 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
             run_cmd(psql_command, log_file)
             print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
         mark_section_complete("pre-data-restore")
+
+    filter = Filter()
+
+    with timeit():
+        logger.info("Copy extension config tables ...")
+        copy_extensions = [
+            "pgcopydb",
+            "copy",
+            "extensions",
+            "--dir",
+            "$PGCOPYDB_DIR/copy_extensions",
+            "--snapshot",
+            "$(cat $PGCOPYDB_DIR/snapshot)",
+            "--resume",
+        ]
+
+        prepare_exclude_extensions(copy_extensions, args, filter)
+        # Apply filters
+        with open(args.dir / "filter.ini", "w") as f:
+            filter.write(f)
+            copy_extensions.append(f"--filters={f.name}")
+
+        copy_extensions = " ".join(copy_extensions)
+        run_cmd(copy_extensions, LogFile("copy_extensions"))
 
     if (target_type == DBType.TIMESCALEDB and
         not is_section_migration_complete("hypertable-creation")):
@@ -234,23 +284,6 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
             run_cmd(vaccumdb_command, LogFile("analyze_db"))
         mark_section_complete("analyze-db")
     stop_progress.set()
-
-
-@telemetry_command("migrate_extensions")
-def migrate_extensions():
-    logger.info("Copy extension config tables ...")
-    with timeit():
-        copy_extensions = " ".join([
-            "pgcopydb",
-            "copy",
-            "extensions",
-            "--dir",
-            "$PGCOPYDB_DIR/copy_extensions",
-            "--snapshot",
-            "$(cat $PGCOPYDB_DIR/snapshot)",
-            "--resume",
-            ])
-        run_cmd(copy_extensions, LogFile("copy_extensions"))
 
 
 @telemetry_command("migrate_roles")
@@ -323,13 +356,14 @@ sed -i -E \
         print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
 
 
-@telemetry_command("migrate_existing_data_from_ts")
 def migrate_existing_data_from_ts(args):
     logger.info("Copying table data ...")
+
+    timescaledb_pre_restore()
+
     clone_table_data = [
         "pgcopydb",
         "clone",
-        "--skip-extensions",
         "--no-acl",
         "--no-owner",
         "--table-jobs",
@@ -344,6 +378,13 @@ def migrate_existing_data_from_ts(args):
         "--notice",
     ]
 
+    filter = Filter()
+    prepare_exclude_extensions(clone_table_data, args, filter)
+    # Apply filters
+    with open(args.dir / "filter.ini", "w") as f:
+        filter.write(f)
+        clone_table_data.append(f"--filters={f.name}")
+
     if args.resume:
         clone_table_data.append("--resume")
 
@@ -355,6 +396,10 @@ def migrate_existing_data_from_ts(args):
        run_cmd(clone_table_data, LogFile("pgcopydb_clone"))
 
     stop_progress.set()
+
+    # Note: timescaledb_post_restore must come after post-data, otherwise there
+    # are issues restoring indexes and foreign key constraints to chunks.
+    timescaledb_post_restore()
 
 
 @telemetry_command("wait_for_DBs_to_sync")
@@ -554,30 +599,13 @@ def migrate(args):
             migrate_roles()
             mark_section_complete("roles")
 
-        if not args.skip_initial_data:
-            handle_timescaledb_extension = (source_type == DBType.TIMESCALEDB and target_type == DBType.TIMESCALEDB)
-
-            if not is_section_migration_complete("extensions"):
-                if handle_timescaledb_extension:
-                    timescaledb_pre_restore()
-                logger.info("Migrating extensions from Source DB to Target DB ...")
-                migrate_extensions()
-                mark_section_complete("extensions")
-
-            if not is_section_migration_complete("initial-data-migration"):
-                logger.info("Migrating existing data from Source DB to Target DB ...")
-                if source_type == DBType.POSTGRES:
-                    migrate_existing_data_from_pg(target_type, args)
-                else:
-                    migrate_existing_data_from_ts(args)
-                mark_section_complete("initial-data-migration")
-
-            if (handle_timescaledb_extension and
-               not is_section_migration_complete("timescaledb-post-restore")):
-                # Note: timescaledb_post_restore must come after post-data, otherwise there
-                # are issues restoring indexes and foreign key constraints to chunks.
-                timescaledb_post_restore()
-                mark_section_complete("timescaledb-post-restore")
+        if not is_section_migration_complete("initial-data-migration"):
+            logger.info("Migrating existing data from Source DB to Target DB ...")
+            if source_type == DBType.POSTGRES:
+                migrate_existing_data_from_pg(target_type, args)
+            else:
+                migrate_existing_data_from_ts(args)
+            mark_section_complete("initial-data-migration")
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
@@ -606,7 +634,8 @@ def migrate(args):
     except KeyboardInterrupt:
         logger.info("Exiting ... (Ctrl+C)")
     except Exception as e:
-        logger.info(f"Unexpected exception: {e}")
+        logger.error(f"Unexpected exception: {e}")
+        logger.error(traceback.format_exc())
         telemetry.complete_fail()
     else:
         logger.info("Migration successfully completed.")

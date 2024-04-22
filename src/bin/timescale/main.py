@@ -69,6 +69,8 @@ def main():
                                 help='Number of parallel jobs to copy "existing data" from source db to target db (Default: 8)')
     parser_migrate.add_argument('--index-jobs', default="8", type=str,
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
+    parser_migrate.add_argument('--skip-extensions', nargs='*',
+                                help='Skips the given extensions during migration. Empty list skips all extensions.')
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',
@@ -80,15 +82,6 @@ def main():
                                 action='store_true',
                                 help=argparse.SUPPRESS,
                                 default=(os.environ.get('POSTGRES_TARGET') == "true"))
-    # TODO: Remove this once we know the existing customers who are still
-    # using the old migration image < v0.0.5.
-    parser_migrate.add_argument('--skip-initial-data',
-                                action='store_true',
-                                help=('Skip initial data migration. '
-                                      'This is provided for backward '
-                                      'compatibility with the old migration '
-                                      'process which did not support granular '
-                                      'resume over the section.'))
 
     args = parser.parse_args()
 

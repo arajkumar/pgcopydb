@@ -435,6 +435,59 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 
 
 /*
+ * skipExtensionFromFilter skips the extension and its comment when it is in the
+ * list of filtered-out extensions.
+ */
+static
+bool skipExtensionFromFilter(CopyDataSpec *specs,
+							 ArchiveContentItem *item,
+							 bool *skip)
+{
+	/*
+	 * Skip COMMENT ON EXTENSION when either of the option
+	 * --skip-extensions or --skip-ext-comment has been used.
+	 */
+	char *name = item->restoreListName;
+
+	bool isExtensionComment = item->isCompositeTag &&
+							  item->tagKind == ARCHIVE_TAG_KIND_COMMENT &&
+							  item->tagType == ARCHIVE_TAG_TYPE_EXTENSION;
+
+	if ((specs->skipExtensions || specs->skipCommentOnExtension) &&
+		isExtensionComment)
+	{
+		*skip = true;
+		log_notice("Skipping COMMENT ON EXTENSION \"%s\"", name);
+		return true;
+	}
+
+	/*
+	 * Skip the extension and its comment when it is in the list of
+	 * filtered-out extensions.
+	 */
+	bool isExtension = item->desc == ARCHIVE_TAG_EXTENSION ||
+					   isExtensionComment;
+
+	/* The item is not an extension */
+	if (!isExtension)
+	{
+		*skip = false;
+		return true;
+	}
+
+	if (copydb_skip_extension(specs, name))
+	{
+		*skip = true;
+		log_notice("Skipping EXTENSION %s \"%s\"",
+				isExtensionComment ? "COMMENT ON" : "",
+				name);
+		return true;
+	}
+
+	return true;
+}
+
+/*
  * copydb_write_restore_list fetches the pg_restore --list output, parses it,
  * and then writes it again to file and applies the filtering to the archive
  * catalog that is meant to be used as pg_restore --use-list argument.
@@ -521,19 +574,7 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 
 		bool skip = false;
 
-		/*
-		 * Skip COMMENT ON EXTENSION when either of the option
-		 * --skip-extensions or --skip-ext-comment has been used.
-		 */
-		if ((specs->skipExtensions ||
-			 specs->skipCommentOnExtension) &&
-			item->isCompositeTag &&
-			item->tagKind == ARCHIVE_TAG_KIND_COMMENT &&
-			item->tagType == ARCHIVE_TAG_TYPE_EXTENSION)
-		{
-			skip = true;
-			log_notice("Skipping COMMENT ON EXTENSION \"%s\"", name);
-		}
+		(void) skipExtensionFromFilter(specs, item, &skip);
 
 		if (!skip && catOid == PG_NAMESPACE_OID)
 		{

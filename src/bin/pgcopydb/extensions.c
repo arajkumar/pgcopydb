@@ -16,6 +16,10 @@
 
 
 static bool copydb_copy_ext_sequence(PGSQL *src, PGSQL *dst, char *qname);
+static bool
+prepareTableSpecsForExtension(CopyTableDataSpec *tableSpecs,
+							  CopyDataSpec *copySpecs,
+							  SourceExtensionConfig *config);
 
 /*
  * copydb_start_extension_process an auxilliary process that copies the
@@ -100,6 +104,35 @@ copydb_copy_ext_sequence(PGSQL *src, PGSQL *dst, char *qname)
 	return true;
 }
 
+
+/*
+ * prepareTableSpecsForExtension prepares the table specs for the extension
+ * configuration table.
+ */
+static bool
+prepareTableSpecsForExtension(CopyTableDataSpec *tableSpecs,
+							  CopyDataSpec *copySpecs,
+							  SourceExtensionConfig *config)
+{
+
+	SourceTable table = { 0 };
+
+	strlcpy(table.nspname, config->nspname, sizeof(table.nspname));
+	strlcpy(table.relname, config->relname, sizeof(table.relname));
+	sformat(table.qname, sizeof(table.qname),
+			"%s.%s",
+			config->nspname, config->relname);
+	table.oid = config->oid;
+
+	if (!copydb_init_table_specs(tableSpecs, copySpecs, &table, 0))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
 /*
  * copydb_copy_extensions copies extensions from the source instance into the
  * target instance.
@@ -109,6 +142,25 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 {
 	int errors = 0;
 	PGSQL dst = { 0 };
+
+	/* make sure that we have our own process local connection */
+	TransactionSnapshot snapshot = { 0 };
+
+	if (!copydb_copy_snapshot(copySpecs, &snapshot))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* swap the new instance in place of the previous one */
+	copySpecs->sourceSnapshot = snapshot;
+
+	/* connect to the source database and set snapshot */
+	if (!copydb_set_snapshot(copySpecs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	ExtensionReqs *reqs = copySpecs->extRequirements;
 	SourceExtensionArray *extensionArray = &(copySpecs->catalog.extensionArray);
@@ -122,6 +174,11 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 	for (int i = 0; i < extensionArray->count; i++)
 	{
 		SourceExtension *ext = &(extensionArray->array[i]);
+
+		if (copydb_skip_extension(copySpecs, ext->extname))
+		{
+			continue;
+		}
 
 		if (createExtensions)
 		{
@@ -166,6 +223,33 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 			for (int i = 0; i < ext->config.count; i++)
 			{
 				SourceExtensionConfig *config = &(ext->config.array[i]);
+
+				CopyTableDataSpec tableSpecs = { 0 };
+
+				if (!prepareTableSpecsForExtension(&tableSpecs, copySpecs, config))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				/*
+				 * Skip tables that have been entirely done already on a previous run.
+				 */
+				bool isDone = false;
+
+				if (!copydb_table_create_lockfile(copySpecs, &tableSpecs, &isDone))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				if (isDone)
+				{
+					log_info("Skipping table %s (%u), already done on a previous run",
+							 tableSpecs.sourceTable->qname,
+							 tableSpecs.sourceTable->oid);
+					continue;
+				}
 
 				log_info("COPY extension \"%s\" "
 						 "configuration table \"%s\".\"%s\"",
@@ -240,6 +324,12 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 						return false;
 					}
 				}
+
+				if (!copydb_mark_table_as_done(copySpecs, &tableSpecs))
+				{
+					/* errors have already been logged */
+					return false;
+				}
 			}
 		}
 	}
@@ -305,4 +395,30 @@ copydb_parse_extensions_requirements(CopyDataSpec *copySpecs, char *filename)
 	copySpecs->extRequirements = reqs;
 
 	return true;
+}
+
+/*
+ * copydb_skip_extension checks if the extension should be skipped.
+ * It returns true if the extension should be skipped, false otherwise.
+ */
+bool copydb_skip_extension(CopyDataSpec *copySpecs, char *extname)
+{
+	if (copySpecs->skipExtensions)
+	{
+		log_info("Skipping extension \"%s\"", extname);
+		return true;
+	}
+
+	SourceFilterExtensionList *filterExtensions = &(copySpecs->filters.excludeExtensionList);
+	for (int i = 0; i < filterExtensions->count; i++)
+	{
+		SourceFilterExtension *filter = &(filterExtensions->array[i]);
+
+		if (streq(filter->extname, extname))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
