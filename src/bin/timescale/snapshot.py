@@ -6,6 +6,7 @@ import os
 from utils import docker_command
 from usr_signal import wait_for_event
 from validate import validate_dbs, has_tables_without_pkey_replident
+from environ import LIVE_MIGRATION_DOCKER
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,8 @@ def snapshot(args):
 
     validate_dbs()
 
-    if not os.path.ismount("/opt/timescale/ts_cdc"):
-        logger.error("Volume mount not found. To proceed, mount a volume: '-v <host_dir>:/opt/timescale/ts_cdc'")
+    if LIVE_MIGRATION_DOCKER and not os.path.ismount(args.dir):
+        logger.error("Volume mount not found. To proceed, mount a volume: '-v <host_dir>:%s'", args.dir)
         sys.exit(1)
 
     tables_without_pkey_replident = has_tables_without_pkey_replident()
