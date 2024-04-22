@@ -6,7 +6,7 @@ FROM --platform=${TARGETPLATFORM} debian:11-slim as build
 ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
-ARG PGVERSION=14
+ARG PGVERSION=16
 
 RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
   && apt install -qqy --no-install-recommends \
@@ -35,6 +35,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     libreadline-dev \
     libselinux1-dev \
     libssl-dev \
+	libzstd-dev \
     libxslt1-dev \
     lsof \
     psmisc \
@@ -44,7 +45,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     watch \
     make \
     openssl \
-    postgresql-server-dev-14 \
+    postgresql-server-dev-${PGVERSION} \
     psutils \
     tmux \
     watch \
@@ -63,6 +64,7 @@ FROM --platform=${TARGETPLATFORM} debian:11-slim as run
 ARG TARGETPLATFORM
 ARG TARGETOS
 ARG TARGETARCH
+ARG PGVERSION=16
 
 # used to configure Github Packages
 LABEL org.opencontainers.image.source https://github.com/dimitri/pgcopydb
@@ -79,7 +81,7 @@ RUN echo "deb http://apt.postgresql.org/pub/repos/apt bullseye-pgdg main ${PGVER
 RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
   && apt install -qqy --no-install-suggests --no-install-recommends \
     sudo \
-	passwd \
+    passwd \
     ca-certificates \
     libpq5 \
     lsof \
@@ -87,6 +89,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     watch \
     psmisc \
     openssl \
+    sqlite3 \
     postgresql-common \
     postgresql-client \
     postgresql-client-common \
@@ -96,7 +99,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
 RUN useradd -rm -d /var/lib/postgres -s /bin/bash -g postgres -G sudo docker
 RUN echo '%sudo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
-COPY --from=build --chmod=755 /usr/lib/postgresql/14/bin/pgcopydb /usr/local/bin
+COPY --from=build --chmod=755 /usr/lib/postgresql/${PGVERSION}/bin/pgcopydb /usr/local/bin
 
 USER docker
 
