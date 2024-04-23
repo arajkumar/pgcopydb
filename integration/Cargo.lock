@@ -48,6 +48,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8901269c6307e8d93993578286ac0edf7f195079ffff5ebdeea6a59ffb7e36bc"
 
 [[package]]
+name = "anyhow"
+version = "1.0.82"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f538837af36e6f6a9be0faa67f9a314f8119e4e4b5867c6ab40ed60360142519"
+
+[[package]]
 name = "assert_cmd"
 version = "2.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -589,7 +595,9 @@ dependencies = [
 name = "integration"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "pretty_env_logger",
+ "rand",
  "tempfile",
  "test-common",
  "testcontainers",
@@ -1252,8 +1260,8 @@ checksum = "3369f5ac52d5eb6ab48c6b4ffdc8efbcad6b89c765749064ba298f2c68a16a76"
 
 [[package]]
 name = "test-common"
-version = "0.14.0"
-source = "git+ssh://git@github.com/timescale/test-common.git?rev=v0.14.0#4836529c98ba115f51f4d83b74e27d09efcd1046"
+version = "0.15.0"
+source = "git+ssh://git@github.com/timescale/test-common.git?rev=v0.15.0#9eb40c29f0266e47b535790f2f53096185bd74ca"
 dependencies = [
  "assert_cmd",
  "assert_fs",
