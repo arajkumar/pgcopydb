@@ -49,11 +49,11 @@ def run_cmd(cmd: str) -> str:
 
 
 def run_sql_source(sql: str) -> str:
-    return run_cmd(f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d $PGCOPYDB_SOURCE_PGURI -c " {sql} " """)
+    return run_cmd(f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "$PGCOPYDB_SOURCE_PGURI" -c " {sql} " """)
 
 
 def run_sql_target(sql: str) -> str:
-    return run_cmd(f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d $PGCOPYDB_TARGET_PGURI -c " {sql} " """)
+    return run_cmd(f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "$PGCOPYDB_TARGET_PGURI" -c " {sql} " """)
 
 
 HOUSEKEEPING_INTERVAL = int(os.getenv("HOUSEKEEPING_INTERVAL", 300))
