@@ -199,6 +199,8 @@ stream_transform_resume(StreamSpecs *specs)
 		return false;
 	}
 
+	PrepareGeneratedColumnsCache(&(specs->private));
+
 	/* we need timeline and wal_segment_size to compute WAL filenames */
 	if (specs->system.timeline == 0)
 	{
@@ -391,10 +393,12 @@ stream_transform_write_message(StreamContext *privateContext,
 		txn->commit = true;
 	}
 
+	GeneratedColumnsCache *cache = privateContext->generatedColumnsCache;
+
 	/* now write the transaction out */
 	if (privateContext->out != NULL)
 	{
-		if (!stream_write_message(privateContext->out, currentMsg))
+		if (!stream_write_message(privateContext->out, currentMsg, cache))
 		{
 			/* errors have already been logged */
 			return false;
@@ -402,7 +406,7 @@ stream_transform_write_message(StreamContext *privateContext,
 	}
 
 	/* now write the transaction out also to file on-disk */
-	if (!stream_write_message(privateContext->sqlFile, currentMsg))
+	if (!stream_write_message(privateContext->sqlFile, currentMsg, cache))
 	{
 		/* errors have already been logged */
 		return false;
@@ -621,6 +625,8 @@ stream_transform_from_queue(StreamSpecs *specs)
 		/* errors have already been logged */
 		return false;
 	}
+
+	PrepareGeneratedColumnsCache(&(specs->private));
 
 	while (!stop)
 	{
@@ -1751,11 +1757,12 @@ AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
  * already open out stream.
  */
 bool
-stream_write_message(FILE *out, LogicalMessage *msg)
+stream_write_message(FILE *out, LogicalMessage *msg,
+					 GeneratedColumnsCache *cache)
 {
 	if (msg->isTransaction)
 	{
-		return stream_write_transaction(out, &(msg->command.tx));
+		return stream_write_transaction(out, &(msg->command.tx), cache);
 	}
 	else
 	{
@@ -1806,7 +1813,8 @@ stream_write_message(FILE *out, LogicalMessage *msg)
  * the already open out stream.
  */
 bool
-stream_write_transaction(FILE *out, LogicalTransaction *txn)
+stream_write_transaction(FILE *out, LogicalTransaction *txn,
+						 GeneratedColumnsCache *cache)
 {
 	/*
 	 * Logical decoding also outputs empty transactions that act here kind of
@@ -1898,7 +1906,9 @@ stream_write_transaction(FILE *out, LogicalTransaction *txn)
 					sentBEGIN = true;
 				}
 
-				if (!stream_write_insert(out, &(currentStmt->stmt.insert)))
+				if (!stream_write_insert(out,
+										 &(currentStmt->stmt.insert),
+										 cache))
 				{
 					return false;
 				}
@@ -1917,7 +1927,8 @@ stream_write_transaction(FILE *out, LogicalTransaction *txn)
 					sentBEGIN = true;
 				}
 
-				if (!stream_write_update(out, &(currentStmt->stmt.update)))
+				if (!stream_write_update(out, &(currentStmt->stmt.update),
+										 cache))
 				{
 					return false;
 				}
@@ -2131,7 +2142,7 @@ stream_write_endpos(FILE *out, LogicalMessageEndpos *endpos)
  * stream.
  */
 bool
-stream_write_insert(FILE *out, LogicalMessageInsert *insert)
+stream_write_insert(FILE *out, LogicalMessageInsert *insert, GeneratedColumnsCache *cache)
 {
 	/* loop over INSERT statements targeting the same table */
 	for (int s = 0; s < insert->new.count; s++)
@@ -2153,8 +2164,23 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 		/* loop over column names and add them to the out stream */
 		appendPQExpBuffer(buf, "%s", "(");
 
+		bool first = true;
+
 		for (int c = 0; c < stmt->cols; c++)
 		{
+			/* skip generated columns */
+			bool isGeneratedColumn = false;
+
+			IsGeneratedColumn(cache,
+							  insert->nspname,
+							  insert->relname,
+							  stmt->columns[c],
+							  &isGeneratedColumn);
+			if (isGeneratedColumn)
+			{
+				continue;
+			}
+
 			/*
 			 * In the case of the test_decoding plugin, it already escapes
 			 * keywords using double quotes, so we should avoid double quoting
@@ -2163,8 +2189,13 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 			const char *quoteFormatStr = (stmt->columns[c][0] == '"') ? "%s%s" :
 										 "%s\"%s\"";
 			appendPQExpBuffer(buf, quoteFormatStr,
-							  c > 0 ? ", " : "",
+							  !first ? ", " : "",
 							  stmt->columns[c]);
+
+			if (first)
+			{
+				first = false;
+			}
 		}
 
 		appendPQExpBuffer(buf, "%s", ")");
@@ -2195,12 +2226,26 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 			/* now loop over column values for this VALUES row */
 			appendPQExpBuffer(buf, "%s(", r > 0 ? ", " : "");
 
+			first = true;
+
 			for (int v = 0; v < values->cols; v++)
 			{
+				bool isGeneratedColumn = false;
+
+				IsGeneratedColumn(cache,
+								  insert->nspname,
+								  insert->relname,
+								  stmt->columns[v],
+								  &isGeneratedColumn);
+				if (isGeneratedColumn)
+				{
+					continue;
+				}
+
 				LogicalMessageValue *value = &(values->array[v]);
 
 				appendPQExpBuffer(buf, "%s$%d",
-								  v > 0 ? ", " : "",
+								  !first ? ", " : "",
 								  ++pos);
 
 				if (!stream_add_value_in_json_array(value, jsArray))
@@ -2208,6 +2253,11 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 					/* errors have already been logged */
 					destroyPQExpBuffer(buf);
 					return false;
+				}
+
+				if (first)
+				{
+					first = false;
 				}
 			}
 
@@ -2247,7 +2297,7 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
  * stream.
  */
 bool
-stream_write_update(FILE *out, LogicalMessageUpdate *update)
+stream_write_update(FILE *out, LogicalMessageUpdate *update, GeneratedColumnsCache *cache)
 {
 	if (update->old.count != update->new.count)
 	{
@@ -2731,4 +2781,77 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 
 	/* makes compiler happy */
 	return false;
+}
+
+
+/*
+ * IsGeneratedColumn checks if a column is generated in a table by looking up
+ * the cache.
+ */
+void IsGeneratedColumn(GeneratedColumnsCache *cache,
+					  const char *schema,
+					  const char *table,
+					  const char *column,
+					  bool *isGenerated)
+{
+	*isGenerated = false;
+
+	if (cache == NULL)
+	{
+		return;
+	}
+
+	GeneratedColumnsCache *item = NULL;
+
+	char qColumnName[PG_NAMEDATALEN_FQ_ATT] = { 0 };
+
+	/* TODO: escape schema, table, and column */
+	sformat(qColumnName, sizeof(qColumnName), "%s.%s.%s", schema, table, column);
+
+	HASH_FIND_STR(cache, qColumnName, item);
+
+	*isGenerated = (item != NULL);
+
+	log_debug("IsColumnGenerated: %s.%s.%s is %s",
+			  schema, table, column,
+			  *isGenerated ? "generated" : "not generated");
+}
+
+
+void PrepareGeneratedColumnsCache(StreamContext *privateContext)
+{
+	SourceTableArray *tables = &(privateContext->catalog->sourceTableArray);
+
+	for (int i = 0; i < tables->count; i++)
+	{
+		SourceTable *table = &(tables->array[i]);
+
+		SourceTableAttributeArray *attributes = &(table->attributes);
+
+		for (int n = 0; n < attributes->count; n++)
+		{
+			SourceTableAttribute *attribute = &(attributes->array[n]);
+
+			if (attribute->attisgenerated)
+			{
+				GeneratedColumnsCache *item = (GeneratedColumnsCache *)
+					calloc(1, sizeof(GeneratedColumnsCache));
+
+				if (item == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return;
+				}
+
+				sformat(item->qColumnName, sizeof(item->qColumnName), "%s.%s.%s",
+						table->nspname, table->relname, attribute->attname);
+
+				HASH_ADD_STR(privateContext->generatedColumnsCache,
+							 qColumnName,
+							 item);
+			}
+
+		}
+
+	}
 }

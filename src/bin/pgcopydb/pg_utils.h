@@ -38,6 +38,9 @@
 /* Fully Qualified Postgres name: "nspname"."relname" */
 #define PG_NAMEDATALEN_FQ (PG_NAMEDATALEN * 2 + 1)
 
+/* Fully Qualified Postgres column name: "nspname"."relname"."attname" */
+#define PG_NAMEDATALEN_FQ_ATT (PG_NAMEDATALEN_FQ + PG_NAMEDATALEN + 1)
+
 
 /*
  * OID values from PostgreSQL src/include/catalog/pg_type.h

@@ -273,6 +273,18 @@ typedef enum
 
 
 /*
+ * Keep track of tables with generated columns to avoid unnecessary lookups
+ * in the catalog.
+ */
+typedef struct GeneratedColumnsCache
+{
+	char qColumnName[PG_NAMEDATALEN_FQ]; /* key: "schema.table.attname" */
+
+	UT_hash_handle hh;          /* makes this structure hashable */
+} GeneratedColumnsCache;
+
+
+/*
  * StreamContext allows tracking the progress of the ld_stream module and is
  * shared also with the ld_transform module, which has its own instance of a
  * StreamContext to track its own progress.
@@ -305,6 +317,9 @@ typedef struct StreamContext
 
 	/* transform needs some catalog lookups (pkey, type oid) */
 	SourceCatalog *catalog;
+
+	/* hash table acts as a cache for tables with generated columns */
+	GeneratedColumnsCache *generatedColumnsCache;
 
 	Queue *transformQueue;
 	uint32_t WalSegSz;
@@ -589,8 +604,9 @@ bool stream_transform_file(StreamSpecs *specs,
 
 bool stream_transform_file_at_lsn(StreamSpecs *specs, uint64_t lsn);
 
-bool stream_write_message(FILE *out, LogicalMessage *msg);
-bool stream_write_transaction(FILE *out, LogicalTransaction *tx);
+bool stream_write_message(FILE *out, LogicalMessage *msg,
+					      GeneratedColumnsCache *cache);
+bool stream_write_transaction(FILE *out, LogicalTransaction *tx, GeneratedColumnsCache *cache);
 
 bool stream_write_switchwal(FILE *out, LogicalMessageSwitchWAL *switchwal);
 bool stream_write_keepalive(FILE *out, LogicalMessageKeepalive *keepalive);
@@ -600,9 +616,9 @@ bool stream_write_begin(FILE *out, LogicalTransaction *tx);
 bool stream_write_commit(FILE *out, LogicalTransaction *tx);
 bool stream_write_rollback(FILE *out, LogicalTransaction *tx);
 
-bool stream_write_insert(FILE *out, LogicalMessageInsert *insert);
+bool stream_write_insert(FILE *out, LogicalMessageInsert *insert, GeneratedColumnsCache *cache);
 bool stream_write_truncate(FILE *out, LogicalMessageTruncate *truncate);
-bool stream_write_update(FILE *out, LogicalMessageUpdate *update);
+bool stream_write_update(FILE *out, LogicalMessageUpdate *update, GeneratedColumnsCache *cache);
 bool stream_write_delete(FILE * out, LogicalMessageDelete *delete);
 bool stream_write_sql_escape_string_constant(FILE *out, const char *str);
 
@@ -625,6 +641,13 @@ void FreeLogicalTransaction(LogicalTransaction *tx);
 void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
 void FreeLogicalMessageTuple(LogicalMessageTuple *tuple);
 bool AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count);
+
+void PrepareGeneratedColumnsCache(StreamContext *privateContext);
+void IsGeneratedColumn(GeneratedColumnsCache *cache,
+					  const char *schema,
+					  const char *table,
+					  const char *column,
+					  bool *isGenerated);
 
 /* ld_test_decoding.c */
 bool prepareTestDecodingMessage(LogicalStreamContext *context);

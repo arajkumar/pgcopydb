@@ -54,6 +54,9 @@ timescaledb: build
 timescaledb-test-decoding: build
 	$(MAKE) -C $@
 
+cdc-generated-column: build
+	$(MAKE) -C $@
+
 build:
 	docker build $(BUILD_ARGS) -t pagila -f Dockerfile.pagila .
 
