@@ -8,8 +8,8 @@ typedef struct ChunkHypertableMap
 {
 	uint32_t hypertableID;
 
-	char nspname[NAMEDATALEN];
-	char relname[NAMEDATALEN];
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 
 	UT_hash_handle hh;          /* makes this structure hashable */
 } ChunkHypertableMap;
@@ -50,11 +50,11 @@ parseHypertableDetails(void *ctx, PGresult *res)
 			}
 			else if (streq(columnName, "schema_name"))
 			{
-				strlcpy(chunkMapEntry->nspname, columnValue, NAMEDATALEN);
+				strlcpy(chunkMapEntry->nspname, columnValue, PG_NAMEDATALEN);
 			}
 			else if (streq(columnName, "table_name"))
 			{
-				strlcpy(chunkMapEntry->relname, columnValue, NAMEDATALEN);
+				strlcpy(chunkMapEntry->relname, columnValue, PG_NAMEDATALEN);
 			}
 		}
 
@@ -114,10 +114,10 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 		/* Move the pointer to the character after the prefix */
 		prefixPosition += strlen(prefix);
 
-		char hypertableIDStr[NAMEDATALEN] = { 0 };
+		char hypertableIDStr[PG_NAMEDATALEN] = { 0 };
 
 		/* Copy the hypertable id string into a temporary buffer */
-		sformat(hypertableIDStr, NAMEDATALEN, "%s", prefixPosition);
+		sformat(hypertableIDStr, PG_NAMEDATALEN, "%s", prefixPosition);
 
 		/* Find the position of the first underscore after the hypertable id */
 		char *endptr = strchr(hypertableIDStr, '_');
@@ -165,8 +165,8 @@ timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
 	log_trace("Found mapping for chunk %s.%s => %s.%s", nspname_in, relname_in,
 			  foundMapEntry->nspname, foundMapEntry->relname);
 
-	strlcpy(nspname_out, foundMapEntry->nspname, NAMEDATALEN);
-	strlcpy(relname_out, foundMapEntry->relname, NAMEDATALEN);
+	strlcpy(nspname_out, foundMapEntry->nspname, PG_NAMEDATALEN);
+	strlcpy(relname_out, foundMapEntry->relname, PG_NAMEDATALEN);
 	return true;
 }
 
