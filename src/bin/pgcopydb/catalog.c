@@ -71,6 +71,15 @@ static char *sourceDBcreateDDLs[] = {
 	"create unique index s_t_qname on s_table(qname)",
 	"create unique index s_t_rlname on s_table(restore_list_name)",
 
+	"create table s_matview("
+	"  oid integer primary key, "
+	"  nspname text, relname text, restore_list_name text, "
+	"  exclude_data boolean"
+	")",
+
+	"create unique index s_mv_rlname on s_matview(restore_list_name)",
+	"create unique index s_mv_qname on s_matview(nspname, relname)",
+
 	"create table s_table_size("
 	"  oid integer primary key references s_table(oid), "
 	"  bytes integer, bytes_pretty text "
@@ -243,6 +252,15 @@ static char *filterDBcreateDDLs[] = {
 	"create unique index s_t_qname on s_table(qname)",
 	"create unique index s_t_rlname on s_table(restore_list_name)",
 
+	"create table s_matview("
+	"  oid integer primary key, "
+	"  nspname text, relname text, restore_list_name text, "
+	"  exclude_data boolean"
+	")",
+
+	"create unique index s_mv_rlname on s_matview(restore_list_name)",
+	"create unique index s_mv_qname on s_matview(nspname, relname)",
+
 	"create table s_table_size("
 	"  oid integer primary key references s_table(oid), "
 	"  bytes integer, bytes_pretty text "
@@ -312,6 +330,9 @@ static char *filterDBcreateDDLs[] = {
 	" where oid > 0",
 
 	"create index filter_rlname on filter(restore_list_name)",
+	/* no other kind queried other than 'matview_refresh' */
+	"create index filter_matview_refresh_kind on filter(oid, kind) "
+		"where kind = 'matview_refresh'",
 
 	/*
 	 * While we don't use a summary table in the filter database, some queries
@@ -1639,6 +1660,11 @@ CopyDataSectionToString(CopyDataSection section)
 			return "table-data";
 		}
 
+		case DATA_SECTION_MATERIALIZED_VIEWS:
+		{
+			return "matviews";
+		}
+
 		case DATA_SECTION_TABLE_DATA_PARTS:
 		{
 			return "table-data-parts";
@@ -1699,6 +1725,67 @@ CopyDataSectionToString(CopyDataSection section)
 
 	/* keep compiler happy */
 	return "unknown";
+}
+
+
+/*
+ * catalog_add_s_matview INSERTs a SourceMaterializedView to our internal
+ * catalogs database.
+ */
+bool
+catalog_add_s_matview(DatabaseCatalog *catalog,
+					  SourceMaterializedView *matview)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_s_matview: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert into s_matview("
+		"  oid, nspname, relname, restore_list_name, exclude_data) "
+		"values($1, $2, $3, $4, $5)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", matview->oid, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, matview->nspname },
+		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, matview->relname },
+
+		{ BIND_PARAMETER_TYPE_TEXT, "restore_list_name", 0,
+		  matview->restoreListName },
+
+		{ BIND_PARAMETER_TYPE_INT, "exclude_data",
+		  matview->excludeData ? 1 : 0, NULL },
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
 }
 
 
@@ -4819,6 +4906,16 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 
 		"  union all "
 
+		/* we need to filter-out matviews and matview_refresh */
+		"	 select oid, restore_list_name, "
+	    "		case exclude_data "
+		"          when 0 then 'matview' "
+	    "		   when 1 then 'matview_refresh' "
+		"       end "
+		"	   from s_matview"
+
+		"  union all "
+
 		"     select oid, restore_list_name, 'index' "
 		"       from s_index "
 
@@ -4974,6 +5071,62 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 			/* errors have already been logged */
 			return false;
 		}
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_filter_matview_refresh_by_oid fetches a entry from our
+ * catalogs
+ */
+bool
+catalog_lookup_filter_matview_refresh_by_oid(DatabaseCatalog *catalog,
+											 CatalogFilter *result,
+											 uint32_t oid)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_filter_matview_refresh_by_oid: "
+				  "db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select oid, restore_list_name, kind "
+		"    from filter "
+		"   where oid = $1 and kind = 'matview_refresh' ";
+
+	SQLiteQuery query = {
+		.context = result,
+		.fetchFunction = &catalog_filter_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[1] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL },
+	};
+
+	if (!catalog_sql_bind(&query, params, 1))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
 	}
 
 	return true;

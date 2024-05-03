@@ -68,8 +68,8 @@ do
     e=./exclude/expected/${t}.out
     psql -d "${PGCOPYDB_TARGET_PGURI}" ${pgopts} --file ./exclude/sql/$t.sql &> $r
     test -f $e || cat $r
-    diff $e $r || cat $r
-    diff $e $r || exit 1
+    diff -urN $e $r || cat $e $r
+    diff -urN $e $r || exit 1
 done
 
 # list the tables that are (not) selected by the filters

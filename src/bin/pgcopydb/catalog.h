@@ -188,6 +188,13 @@ bool catalog_delete_s_table(DatabaseCatalog *catalog,
 bool catalog_delete_s_table_chksum_all(DatabaseCatalog *catalog);
 
 /*
+ * Materialized views
+ */
+bool
+catalog_add_s_matview(DatabaseCatalog *catalog,
+					  SourceMaterializedView *matview);
+
+/*
  * To loop over our catalog "arrays" we provide an iterator based API, which
  * allows for allocating a single item in memory for the whole scan.
  */
@@ -385,6 +392,11 @@ typedef struct CatalogFilter
 	char restoreListName[RESTORE_LIST_NAMEDATALEN];
 	char kind[PG_NAMEDATALEN];
 } CatalogFilter;
+
+bool
+catalog_lookup_filter_matview_refresh_by_oid(DatabaseCatalog *catalog,
+											 CatalogFilter *result,
+											 uint32_t oid);
 
 bool catalog_lookup_filter_by_oid(DatabaseCatalog *catalog,
 								  CatalogFilter *result,

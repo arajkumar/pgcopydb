@@ -66,5 +66,7 @@ create table schema_name_20_chars.very______long______table______name_______50_c
 --
 -- To test matview ignore
 --
-create materialized view foo.matview_1 as select 1;
+create materialized view foo.matview_1 as select 1 as id;
 create materialized view foo.matview_1_ignored as select 1;
+create materialized view foo.matview_1_exclude_as_table as select 1 as id;
+create index if not exists matview_1_idx on foo.matview_1(id);

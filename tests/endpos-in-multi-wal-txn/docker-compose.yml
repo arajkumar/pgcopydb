@@ -41,3 +41,5 @@ services:
     depends_on:
       - source
       - target
+    volumes:
+      - ./tmp:/tmp
