@@ -235,7 +235,7 @@ timescale_is_chunk(const char *nspname_in, const char *relname_in)
 	}
 
 	/* Chunk will be always present in _timescaledb_internal schema */
-	if ((streq(nspname_in, "_timescaledb_internal") &&
+	if (streq(nspname_in, "_timescaledb_internal") &&
 		strstr(relname_in, "_hyper_"))
 	{
 		return true;

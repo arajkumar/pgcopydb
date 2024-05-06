@@ -317,13 +317,13 @@ SetMessageRelation(JSON_Object *jsobj,
 	char chunk_schema[PG_NAMEDATALEN] = { 0 };
 	char chunk_table[PG_NAMEDATALEN] = { 0 };
 
-	if (timescale_is_chunk(table->nspname, table->relname) &&
+	if (timescale_is_chunk(schema, relname) &&
 		(metadata->action == STREAM_ACTION_INSERT ||
 		 metadata->action == STREAM_ACTION_UPDATE ||
 		 metadata->action == STREAM_ACTION_DELETE))
 	{
-		if (!timescale_chunk_to_hypertable(table->nspname,
-										   table->relname,
+		if (!timescale_chunk_to_hypertable(schema,
+										   relname,
 										   chunk_schema,
 										   chunk_table))
 		{
