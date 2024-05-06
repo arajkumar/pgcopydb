@@ -15,6 +15,7 @@
 typedef struct CopyTableSummaryArray
 {
 	int count;
+	int capacity;
 	CopyTableSummary *array;         /* malloc'ed area */
 } CopyTableSummaryArray;
 
@@ -22,6 +23,7 @@ typedef struct CopyTableSummaryArray
 typedef struct CopyIndexSummaryArray
 {
 	int count;
+	int capacity;
 	CopyIndexSummary *array;         /* malloc'ed area */
 } CopyIndexSummaryArray;
 
@@ -48,5 +50,6 @@ bool copydb_update_progress(CopyDataSpec *copySpecs, CopyProgress *progress);
 bool copydb_progress_as_json(CopyDataSpec *copySpecs,
 							 CopyProgress *progress,
 							 JSON_Value *js);
+
 
 #endif  /* PROGRESS_H */

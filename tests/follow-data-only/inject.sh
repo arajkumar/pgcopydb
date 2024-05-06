@@ -14,13 +14,25 @@ set -e
 pgcopydb ping
 
 #
-# Only start injecting DML traffic on the source database ready. Our proxy
-# to know that that's the case is the existence of the pgcopydb.sentinel
-# table on the source database.
+# Only start injecting DML traffic on the source database when pgcopydb
+# follow command has been started. We know that by querying the SQLite
+# catalogs database, where the prefetch/transform/catchup sub-processes
+# register themselves in the process table.
 #
-sql="select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace where relname = 'sentinel' and nspname = 'pgcopydb' union all select 0 limit 1"
-while [ `psql -At -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}"` -ne 1 ]
+dbf=${TMPDIR}/pgcopydb/schema/source.db
+
+while [ ! -s ${dbf} ]
 do
+    sleep 1
+done
+
+sql="select pid from process where ps_type = 'prefetch'"
+pidf=/tmp/prefetch.pid
+
+while [ ! -s ${pidf} ]
+do
+    # sometimes we have "Error: database is locked", ignore
+    sqlite3 -batch -bail -noheader ${dbf} "${sql}" > ${pidf} || echo error
     sleep 1
 done
 
@@ -36,6 +48,24 @@ psql -v a=21 -v b=30 -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/dml.sql
 # also insert data that won't fit in a single Unix PIPE buffer
 psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/dml-bufsize.sql
 
+# add some data to update_test table
+psql -d ${PGCOPYDB_SOURCE_PGURI} << EOF
+begin;
+insert into update_test(id, name) values
+(1, 'a'),
+(2, 'b');
+commit;
+
+begin;
+update update_test set name = 'c' where id = 1;
+commit;
+
+begin;
+update update_test set name = 'd' where id = 2;
+commit;
+
+EOF
+
 # grab the current LSN, it's going to be our streaming end position
 lsn=`psql -At -d ${PGCOPYDB_SOURCE_PGURI} -c 'select pg_current_wal_flush_lsn()'`
 pgcopydb stream sentinel set endpos --current
@@ -47,8 +77,9 @@ pgcopydb stream sentinel get
 # here.
 #
 sql="select '${lsn}'::pg_lsn <= replay_lsn from pgcopydb.sentinel"
+sql="select exists(select 1 from pg_replication_slots where slot_name = 'pgcopydb')"
 
-while [ `psql -At -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}"` != 't' ]
+while [ `psql -At -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}"` = 't' ]
 do
     sleep 1
 done

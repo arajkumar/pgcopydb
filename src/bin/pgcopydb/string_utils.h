@@ -44,8 +44,16 @@ bool hexStringToUInt32(const char *str, uint32_t *number);
 
 bool IntervalToString(uint64_t millisecs, char *buffer, size_t size);
 
-int countLines(char *buffer);
-int splitLines(char *buffer, char **linesArray, int size);
+typedef struct LinesBuffer
+{
+	char *buffer;
+	uint64_t count;
+	char **lines;                     /* malloc'ed area */
+} LinesBuffer;
+
+uint64_t countLines(char *buffer);
+bool splitLines(LinesBuffer *lbuf, char *buffer);
+
 void processBufferCallback(const char *buffer, bool error);
 
 void pretty_print_bytes(char *buffer, size_t size, uint64_t bytes);

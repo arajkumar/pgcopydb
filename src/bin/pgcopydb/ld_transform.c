@@ -14,12 +14,14 @@
 
 #include "postgres.h"
 #include "postgres_fe.h"
+#include "libpq-fe.h"
 #include "access/xlog_internal.h"
 #include "access/xlogdefs.h"
 
 #include "lookup3.h"
 #include "parson.h"
 
+#include "catalog.h"
 #include "cli_common.h"
 #include "cli_root.h"
 #include "copydb.h"
@@ -30,6 +32,7 @@
 #include "parsing_utils.h"
 #include "pidfile.h"
 #include "pg_utils.h"
+#include "pgsql.h"
 #include "schema.h"
 #include "signals.h"
 #include "string_utils.h"
@@ -43,10 +46,45 @@ typedef struct TransformStreamCtx
 	uint64_t currentMsgIndex;
 } TransformStreamCtx;
 
+static bool stream_transform_stream_internal(StreamSpecs *specs);
+
+static bool stream_transform_from_queue_internal(StreamSpecs *specs);
+
 static bool canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												   LogicalTransactionStatement *new);
 static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												LogicalTransactionStatement *new);
+
+/*
+ * stream_transform_context_init_pgsql initializes StreamContext's
+ * transformPGSQL and opens a connection to the target. This is required to use
+ * PQescapeIdentifier API of libpq when escaping identifiers
+ */
+bool
+stream_transform_context_init_pgsql(StreamSpecs *specs)
+{
+	StreamContext *privateContext = &(specs->private);
+
+	privateContext->transformPGSQL = &(specs->transformPGSQL);
+
+	/* initialize our connection to the target database */
+	if (!pgsql_init(privateContext->transformPGSQL,
+					specs->connStrings->target_pguri,
+					PGSQL_CONN_TARGET))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!pgsql_open_connection(privateContext->transformPGSQL))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
 
 /*
  * stream_transform_stream transforms a JSON formatted input stream (read line
@@ -55,6 +93,27 @@ static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
  */
 bool
 stream_transform_stream(StreamSpecs *specs)
+{
+	if (!stream_transform_context_init_pgsql(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success = stream_transform_stream_internal(specs);
+
+	pgsql_finish(&(specs->transformPGSQL));
+
+	return success;
+}
+
+
+/*
+ * stream_transform_stream_internal implements the core of
+ * stream_transform_stream
+ */
+static bool
+stream_transform_stream_internal(StreamSpecs *specs)
 {
 	StreamContext *privateContext = &(specs->private);
 
@@ -143,27 +202,28 @@ stream_transform_resume(StreamSpecs *specs)
 	 * command line option (found in specs->endpos) prevails, but when it's not
 	 * been used, we have a look at the sentinel value.
 	 */
-	PGSQL src = { 0 };
-
-	if (!pgsql_init(&src, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	CopyDBSentinel sentinel = { 0 };
 
-	if (!pgsql_get_sentinel(&src, &sentinel))
+	if (!sentinel_get(specs->sourceDB, &sentinel))
 	{
 		/* errors have already been logged */
 		return false;
 	}
+
+	log_notice("stream_transform_resume: "
+			   "startpos %X/%X endpos %X/%X "
+			   "write_lsn %X/%X flush_lsn %X/%X replay_lsn %X/%X",
+			   LSN_FORMAT_ARGS(sentinel.startpos),
+			   LSN_FORMAT_ARGS(sentinel.endpos),
+			   LSN_FORMAT_ARGS(sentinel.write_lsn),
+			   LSN_FORMAT_ARGS(sentinel.flush_lsn),
+			   LSN_FORMAT_ARGS(sentinel.replay_lsn));
 
 	if (specs->endpos == InvalidXLogRecPtr)
 	{
 		specs->endpos = sentinel.endpos;
 	}
-	else
+	else if (specs->endpos != sentinel.endpos)
 	{
 		log_warn("Sentinel endpos is %X/%X, overriden by --endpos %X/%X",
 				 LSN_FORMAT_ARGS(sentinel.endpos),
@@ -183,10 +243,8 @@ stream_transform_resume(StreamSpecs *specs)
 		{
 			specs->startpos = sentinel.startpos;
 
-			log_info("Resuming streaming at LSN %X/%X "
-					 "from replication slot \"%s\"",
-					 LSN_FORMAT_ARGS(specs->startpos),
-					 specs->slot.slotName);
+			log_notice("Resuming transform at LSN %X/%X from sentinel",
+					   LSN_FORMAT_ARGS(specs->startpos));
 		}
 	}
 
@@ -315,18 +373,9 @@ stream_transform_line(void *ctx, const char *line, bool *stop)
 	/* at ENDPOS check that it's the current sentinel value and exit */
 	else if (metadata->action == STREAM_ACTION_ENDPOS)
 	{
-		PGSQL src = { 0 };
-		char *dsn = privateContext->connStrings->source_pguri;
-
-		if (!pgsql_init(&src, dsn, PGSQL_CONN_SOURCE))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
 		CopyDBSentinel sentinel = { 0 };
 
-		if (!pgsql_get_sentinel(&src, &sentinel))
+		if (!sentinel_get(privateContext->sourceDB, &sentinel))
 		{
 			/* errors have already been logged */
 			return false;
@@ -408,8 +457,6 @@ stream_transform_write_message(StreamContext *privateContext,
 		return false;
 	}
 
-	(void) FreeLogicalMessage(currentMsg);
-
 	if (metadata->action == STREAM_ACTION_COMMIT ||
 		metadata->action == STREAM_ACTION_ROLLBACK)
 	{
@@ -435,16 +482,16 @@ stream_transform_write_message(StreamContext *privateContext,
 		new.isTransaction = true;
 		new.action = STREAM_ACTION_BEGIN;
 
-		LogicalTransaction *old = &(currentMsg->command.tx);
-		LogicalTransaction *txn = &(new.command.tx);
+		LogicalTransaction *oldTxn = &(currentMsg->command.tx);
+		LogicalTransaction *newTxn = &(new.command.tx);
 
-		txn->continued = true;
+		newTxn->continued = true;
 
-		txn->xid = old->xid;
-		txn->beginLSN = old->beginLSN;
-		strlcpy(txn->timestamp, old->timestamp, sizeof(txn->timestamp));
+		newTxn->xid = oldTxn->xid;
+		newTxn->beginLSN = oldTxn->beginLSN;
+		strlcpy(newTxn->timestamp, oldTxn->timestamp, sizeof(newTxn->timestamp));
 
-		txn->first = NULL;
+		newTxn->first = NULL;
 
 		*currentMsg = new;
 	}
@@ -467,7 +514,6 @@ stream_transform_message(StreamContext *privateContext, char *message)
 	if (!parseMessageMetadata(metadata, message, json, false))
 	{
 		/* errors have already been logged */
-		json_value_free(json);
 		return false;
 	}
 
@@ -476,11 +522,9 @@ stream_transform_message(StreamContext *privateContext, char *message)
 		log_error("Failed to parse JSON message: %.1024s%s",
 				  message,
 				  strlen(message) > 1024 ? "..." : "");
-		json_value_free(json);
 		return false;
 	}
 
-	json_value_free(json);
 
 	return true;
 }
@@ -611,16 +655,45 @@ stream_transform_worker(StreamSpecs *specs)
 bool
 stream_transform_from_queue(StreamSpecs *specs)
 {
-	Queue *transformQueue = &(specs->transformQueue);
-
-	int errors = 0;
-	bool stop = false;
+	DatabaseCatalog *sourceDB = specs->sourceDB;
 
 	if (!stream_init_context(specs))
 	{
 		/* errors have already been logged */
 		return false;
 	}
+
+	if (!stream_transform_context_init_pgsql(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success = stream_transform_from_queue_internal(specs);
+
+	pgsql_finish(&(specs->transformPGSQL));
+
+	if (!catalog_close(sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return success;
+}
+
+
+/*
+ * stream_transform_from_queue_internal implements the core of
+ * stream_transform_from_queue
+ */
+static bool
+stream_transform_from_queue_internal(StreamSpecs *specs)
+{
+	Queue *transformQueue = &(specs->transformQueue);
+
+	int errors = 0;
+	bool stop = false;
 
 	while (!stop)
 	{
@@ -809,7 +882,6 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 {
 	StreamContext *privateContext = &(specs->private);
 	StreamContent content = { 0 };
-	long size = 0L;
 
 	log_notice("Transforming JSON file \"%s\" into SQL file \"%s\"",
 			   jsonfilename,
@@ -822,27 +894,33 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 	 * decoding messages, and parse the JSON messages into our internal
 	 * representation structure.
 	 */
-	if (!read_file(content.filename, &(content.buffer), &size))
+	char *contents = NULL;
+	long size = 0L;
+
+	if (!read_file(content.filename, &contents, &size))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	content.count = countLines(content.buffer);
-	content.lines = (char **) calloc(content.count, sizeof(char *));
-	content.count = splitLines(content.buffer, content.lines, content.count);
-
-	if (content.lines == NULL)
+	if (!splitLines(&(content.lbuf), contents))
 	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		free(content.buffer);
-		free(content.lines);
+		/* errors have already been logged */
 		return false;
 	}
 
-	log_debug("stream_transform_file: read %d lines from \"%s\"",
-			  content.count,
+	log_debug("stream_transform_file: read %lld lines from \"%s\"",
+			  (long long) content.lbuf.count,
 			  content.filename);
+
+	/*
+	 * If the file contains zero lines, we're done already, Also malloc(zero)
+	 * leads to "corrupted size vs. prev_size" run-time errors.
+	 */
+	if (content.lbuf.count == 0)
+	{
+		return true;
+	}
 
 	/*
 	 * The output is written to a temp/partial file which is renamed after
@@ -859,8 +937,6 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 	if (privateContext->sqlFile == NULL)
 	{
 		log_error("Failed to open file \"%s\"", tempfilename);
-		free(content.buffer);
-		free(content.lines);
 		return false;
 	}
 
@@ -875,23 +951,20 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 	/* we skip KEEPALIVE message in the beginning of the file */
 	bool firstMessage = true;
 
-	for (int i = 0; i < content.count; i++)
+	for (uint64_t i = 0; i < content.lbuf.count; i++)
 	{
-		char *message = content.lines[i];
+		char *message = content.lbuf.lines[i];
 
 		LogicalMessageMetadata empty = { 0 };
 		*metadata = empty;
 
-		log_trace("stream_transform_file[%2d]: %s", i, message);
+		log_trace("stream_transform_file[%4lld]: %s", (long long) i, message);
 
 		JSON_Value *json = json_parse_string(message);
 
 		if (!parseMessageMetadata(metadata, message, json, false))
 		{
 			/* errors have already been logged */
-			json_value_free(json);
-			free(content.buffer);
-			free(content.lines);
 			return false;
 		}
 
@@ -929,13 +1002,9 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 		if (!parseMessage(privateContext, message, json))
 		{
 			log_error("Failed to parse JSON message: %s", message);
-			json_value_free(json);
-			free(content.buffer);
-			free(content.lines);
 			return false;
 		}
 
-		json_value_free(json);
 
 		/*
 		 * Prepare a new message when we just read the COMMIT message of an
@@ -947,8 +1016,6 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 		{
 			log_error("Failed to transform and flush the current message, "
 					  "see above for details");
-			free(content.buffer);
-			free(content.lines);
 			return false;
 		}
 
@@ -964,9 +1031,7 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 
 	if (fclose(privateContext->sqlFile) == EOF)
 	{
-		log_error("Failed to write file \"%s\"", tempfilename);
-		free(content.buffer);
-		free(content.lines);
+		log_error("Failed to close file \"%s\"", tempfilename);
 		return false;
 	}
 
@@ -981,17 +1046,12 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 		log_error("Failed to move \"%s\" to \"%s\": %m",
 				  tempfilename,
 				  sqlfilename);
-		free(content.buffer);
-		free(content.lines);
 		return false;
 	}
 
-	log_info("Transformed %d JSON messages into SQL file \"%s\"",
-			 content.count,
+	log_info("Transformed %lld JSON messages into SQL file \"%s\"",
+			 (long long) content.lbuf.count,
 			 sqlfilename);
-
-	free(content.buffer);
-	free(content.lines);
 
 	return true;
 }
@@ -1184,7 +1244,6 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				/* copy the stmt over, then free the extra allocated memory */
 				mesg->action = metadata->action;
 				mesg->command.switchwal = stmt->stmt.switchwal;
-				free(stmt);
 			}
 
 			break;
@@ -1208,7 +1267,6 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				/* copy the stmt over, then free the extra allocated memory */
 				mesg->action = metadata->action;
 				mesg->command.keepalive = stmt->stmt.keepalive;
-				free(stmt);
 			}
 
 			break;
@@ -1227,7 +1285,6 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				/* copy the stmt over, then free the extra allocated memory */
 				mesg->action = metadata->action;
 				mesg->command.endpos = stmt->stmt.endpos;
-				free(stmt);
 			}
 
 			break;
@@ -1361,10 +1418,6 @@ coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	lastValuesArray->array[lastValuesArray->count++] = newValuesArray->array[0];
 	newValuesArray->count = 0;
 
-	/* Deallocate the tuple and the new statement */
-	FreeLogicalMessageTupleArray(&(new->stmt.insert.new));
-	free(new);
-
 	return true;
 }
 
@@ -1393,8 +1446,8 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	LogicalMessageInsert *newInsert = &new->stmt.insert;
 
 	/* Last and current statements must target same relation */
-	if (!streq(lastInsert->nspname, newInsert->nspname) ||
-		!streq(lastInsert->relname, newInsert->relname))
+	if (!streq(lastInsert->table.nspname, newInsert->table.nspname) ||
+		!streq(lastInsert->table.relname, newInsert->table.relname))
 	{
 		return false;
 	}
@@ -1470,24 +1523,6 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 		return false;
 	}
 
-	/* TODO: Refactor using inheritance info from pg_catalog.pg_inherits */
-	char *nspname, *relname;
-	if (GetRelationFromLogicalTransactionStatement(stmt, &nspname, &relname))
-	{
-		/* Map if the relation is chunk */
-		if (timescale_is_chunk(nspname, relname))
-		{
-			if (stmt->action == STREAM_ACTION_TRUNCATE)
-			{
-				log_warn("Ignore TRUNCATE on timescale chunk %s.%s",
-						 nspname, relname);
-				FreeLogicalTransactionStatement(stmt);
-				return true;
-			}
-		}
-	}
-
-
 	if (txn->first == NULL)
 	{
 		txn->first = stmt;
@@ -1524,174 +1559,6 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 
 
 /*
- * FreeLogicalMessage frees the malloc'ated memory areas of a LogicalMessage.
- */
-void
-FreeLogicalMessage(LogicalMessage *msg)
-{
-	if (msg->isTransaction)
-	{
-		FreeLogicalTransaction(&(msg->command.tx));
-	}
-}
-
-
-bool
-GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
-										   char **nspname, char **relname)
-{
-	switch (stmt->action)
-	{
-		case STREAM_ACTION_INSERT:
-		{
-			*nspname = stmt->stmt.insert.nspname;
-			*relname = stmt->stmt.insert.relname;
-			break;
-		}
-
-		case STREAM_ACTION_UPDATE:
-		{
-			*nspname = stmt->stmt.update.nspname;
-			*relname = stmt->stmt.update.relname;
-			break;
-		}
-
-		case STREAM_ACTION_DELETE:
-		{
-			*nspname = stmt->stmt.delete.nspname;
-			*relname = stmt->stmt.delete.relname;
-			break;
-		}
-
-		case STREAM_ACTION_TRUNCATE:
-		{
-			*nspname = stmt->stmt.truncate.nspname;
-			*relname = stmt->stmt.truncate.relname;
-			break;
-		}
-
-		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
-		default:
-		{
-			return false;
-		}
-	}
-	return true;
-}
-
-
-/*
- * FreeLogicalTransactionStatement frees the malloc'ated memory areas of a
- * LogicalTransaction.
- */
-void
-FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt)
-{
-	switch (stmt->action)
-	{
-		case STREAM_ACTION_INSERT:
-		{
-			FreeLogicalMessageTupleArray(&(stmt->stmt.insert.new));
-			break;
-		}
-
-		case STREAM_ACTION_UPDATE:
-		{
-			FreeLogicalMessageTupleArray(&(stmt->stmt.update.old));
-			FreeLogicalMessageTupleArray(&(stmt->stmt.update.new));
-			break;
-		}
-
-		case STREAM_ACTION_DELETE:
-		{
-			FreeLogicalMessageTupleArray(&(stmt->stmt.delete.old));
-			break;
-		}
-
-		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
-		default:
-		{
-			break;
-		}
-	}
-	free(stmt);
-}
-
-
-/*
- * FreeLogicalTransaction frees the malloc'ated memory areas of a
- * LogicalTransaction.
- */
-void
-FreeLogicalTransaction(LogicalTransaction *tx)
-{
-	LogicalTransactionStatement *currentStmt = tx->first;
-
-	for (; currentStmt != NULL;)
-	{
-		LogicalTransactionStatement *stmt = currentStmt;
-		currentStmt = currentStmt->next;
-		FreeLogicalTransactionStatement(stmt);
-	}
-
-	tx->first = NULL;
-}
-
-
-/*
- * FreeLogicalMessageTupleArray frees the malloc'ated memory areas of a
- * LogicalMessageTupleArray.
- */
-void
-FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray)
-{
-	for (int s = 0; s < tupleArray->count; s++)
-	{
-		LogicalMessageTuple *tuple = &(tupleArray->array[s]);
-
-		(void) FreeLogicalMessageTuple(tuple);
-	}
-
-	free(tupleArray->array);
-}
-
-
-/*
- * FreeLogicalMessageTuple frees the malloc'ated memory areas of a
- * LogicalMessageTuple.
- */
-void
-FreeLogicalMessageTuple(LogicalMessageTuple *tuple)
-{
-	for (int i = 0; i < tuple->cols; i++)
-	{
-		free(tuple->columns[i]);
-	}
-	free(tuple->columns);
-
-	for (int r = 0; r < tuple->values.count; r++)
-	{
-		LogicalMessageValues *values = &(tuple->values.array[r]);
-
-		for (int v = 0; v < values->cols; v++)
-		{
-			LogicalMessageValue *value = &(values->array[v]);
-
-			if ((value->oid == TEXTOID || value->oid == BYTEAOID) &&
-				!value->isNull)
-			{
-				free(value->val.str);
-			}
-		}
-
-		free(values->array);
-	}
-
-	free(tuple->values.array);
-}
-
-
-/*
  * allocateLogicalMessageTuple allocates memory for count columns (and values)
  * for the given LogicalMessageTuple.
  */
@@ -1699,6 +1566,19 @@ bool
 AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
 {
 	tuple->cols = count;
+
+	if (count == 0)
+	{
+		tuple->columns = NULL;
+
+		LogicalMessageValuesArray *valuesArray = &(tuple->values);
+		valuesArray->count = 0;
+		valuesArray->capacity = 0;
+		valuesArray->array = NULL;
+
+		return true;
+	}
+
 	tuple->columns = (char **) calloc(count, sizeof(char *));
 
 	if (tuple->columns == NULL)
@@ -2147,8 +2027,8 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 		 * First, the PREPARE part.
 		 */
 		appendPQExpBuffer(buf, "INSERT INTO %s.%s ",
-						  insert->nspname,
-						  insert->relname);
+						  insert->table.nspname,
+						  insert->table.relname);
 
 		/* loop over column names and add them to the out stream */
 		appendPQExpBuffer(buf, "%s", "(");
@@ -2235,7 +2115,6 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 		FFORMAT(out, "EXECUTE %x%s;\n", hash, serialized_string);
 
 		json_free_serialized_string(serialized_string);
-		json_value_free(js);
 	}
 
 	return true;
@@ -2284,8 +2163,8 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 		 * First, the PREPARE part.
 		 */
 		appendPQExpBuffer(buf, "UPDATE %s.%s SET ",
-						  update->nspname,
-						  update->relname);
+						  update->table.nspname,
+						  update->table.relname);
 		int pos = 0;
 
 		for (int r = 0; r < new->values.count; r++)
@@ -2388,18 +2267,35 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 				 * keywords using double quotes, so we should avoid double quoting
 				 * again.
 				 */
-				const char *quoteFormatStr = (old->columns[v][0] == '"') ? "%s%s = $%d" :
-											 "%s\"%s\" = $%d";
-				appendPQExpBuffer(buf, quoteFormatStr,
-								  v > 0 ? " and " : "",
-								  old->columns[v],
-								  ++pos);
-
-				if (!stream_add_value_in_json_array(value, jsArray))
+				if (value->isNull)
 				{
-					/* errors have already been logged */
-					destroyPQExpBuffer(buf);
-					return false;
+					/*
+					 * Attributes with the value `NULL` require `IS NULL` instead of `=`
+					 * in the WHERE clause.
+					 */
+					const char *quoteFormatStr = (old->columns[v][0] == '"') ?
+												 "%s%s IS NULL" :
+												 "%s\"%s\" IS NULL";
+					appendPQExpBuffer(buf, quoteFormatStr,
+									  v > 0 ? " and " : "",
+									  old->columns[v]);
+				}
+				else
+				{
+					const char *quoteFormatStr = (old->columns[v][0] == '"') ?
+												 "%s%s = $%d" :
+												 "%s\"%s\" = $%d";
+					appendPQExpBuffer(buf, quoteFormatStr,
+									  v > 0 ? " and " : "",
+									  old->columns[v],
+									  ++pos);
+
+					if (!stream_add_value_in_json_array(value, jsArray))
+					{
+						/* errors have already been logged */
+						destroyPQExpBuffer(buf);
+						return false;
+					}
 				}
 			}
 		}
@@ -2425,7 +2321,6 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 		FFORMAT(out, "EXECUTE %x%s;\n", hash, serialized_string);
 
 		json_free_serialized_string(serialized_string);
-		json_value_free(js);
 	}
 
 	return true;
@@ -2452,8 +2347,8 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 		 * First, the PREPARE part.
 		 */
 		appendPQExpBuffer(buf, "DELETE FROM %s.%s WHERE ",
-						  delete->nspname,
-						  delete->relname);
+						  delete->table.nspname,
+						  delete->table.relname);
 
 		int pos = 0;
 
@@ -2481,18 +2376,35 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 				 * keywords using double quotes, so we should avoid double quoting
 				 * again.
 				 */
-				const char *quoteFormatStr = (old->columns[v][0] == '"') ? "%s%s = $%d" :
-											 "%s\"%s\" = $%d";
-				appendPQExpBuffer(buf, quoteFormatStr,
-								  v > 0 ? " and " : "",
-								  old->columns[v],
-								  ++pos);
-
-				if (!stream_add_value_in_json_array(value, jsArray))
+				if (value->isNull)
 				{
-					/* errors have already been logged */
-					destroyPQExpBuffer(buf);
-					return false;
+					/*
+					 * Attributes with the value `NULL` require `IS NULL` instead of `=`
+					 * in the WHERE clause.
+					 */
+					const char *quoteFormatStr = (old->columns[v][0] == '"') ?
+												 "%s%s IS NULL" :
+												 "%s\"%s\" IS NULL";
+					appendPQExpBuffer(buf, quoteFormatStr,
+									  v > 0 ? " and " : "",
+									  old->columns[v]);
+				}
+				else
+				{
+					const char *quoteFormatStr = (old->columns[v][0] == '"') ?
+												 "%s%s = $%d" :
+												 "%s\"%s\" = $%d";
+					appendPQExpBuffer(buf, quoteFormatStr,
+									  v > 0 ? " and " : "",
+									  old->columns[v],
+									  ++pos);
+
+					if (!stream_add_value_in_json_array(value, jsArray))
+					{
+						/* errors have already been logged */
+						destroyPQExpBuffer(buf);
+						return false;
+					}
 				}
 			}
 		}
@@ -2511,7 +2423,6 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 		FFORMAT(out, "EXECUTE %x%s;\n", hash, serialized_string);
 
 		json_free_serialized_string(serialized_string);
-		json_value_free(js);
 	}
 
 	return true;
@@ -2525,7 +2436,10 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 bool
 stream_write_truncate(FILE *out, LogicalMessageTruncate *truncate)
 {
-	FFORMAT(out, "TRUNCATE ONLY %s.%s\n", truncate->nspname, truncate->relname);
+	FFORMAT(out,
+			"TRUNCATE ONLY %s.%s\n",
+			truncate->table.nspname,
+			truncate->table.relname);
 
 	return true;
 }

@@ -18,10 +18,9 @@
 #include "pqexpbuffer.h"
 #include "portability/instr_time.h"
 
+#include "catalog.h"
 #include "string_utils.h"
 #include "schema.h"
-
-#define COPY_TABLE_SUMMARY_LINES 8
 
 typedef struct CopyTableSummary
 {
@@ -37,7 +36,16 @@ typedef struct CopyTableSummary
 } CopyTableSummary;
 
 
-#define COPY_INDEX_SUMMARY_LINES 8
+typedef struct CopyVacuumTableSummary
+{
+	pid_t pid;                  /* pid */
+	SourceTable *table;         /* oid, nspname, relname */
+	uint64_t startTime;         /* time(NULL) at start time */
+	uint64_t doneTime;          /* time(NULL) at done time */
+	uint64_t durationMs;        /* instr_time duration in milliseconds */
+	instr_time startTimeInstr;  /* internal instr_time tracker */
+	instr_time durationInstr;   /* internal instr_time tracker */
+} CopyVacuumTableSummary;
 
 typedef struct CopyIndexSummary
 {
@@ -51,6 +59,15 @@ typedef struct CopyIndexSummary
 	char *command;              /* malloc'ed area */
 } CopyIndexSummary;
 
+
+/* generic data type for OID lookup */
+typedef struct CopyOidSummary
+{
+	pid_t pid;                  /* pid */
+	uint64_t startTime;         /* time(NULL) at start time */
+	uint64_t doneTime;          /* time(NULL) at done time */
+	uint64_t durationMs;        /* instr_time duration in milliseconds */
+} CopyOidSummary;
 
 #define COPY_BLOBS_SUMMARY_LINES 3
 
@@ -74,6 +91,7 @@ typedef struct SummaryTableHeaders
 	int maxOidSize;
 	int maxNspnameSize;
 	int maxRelnameSize;
+	int maxPartCountSize;
 	int maxTableMsSize;
 	int maxBytesSize;
 	int maxIndexCountSize;
@@ -82,6 +100,7 @@ typedef struct SummaryTableHeaders
 	char oidSeparator[NAMEDATALEN];
 	char nspnameSeparator[NAMEDATALEN];
 	char relnameSeparator[NAMEDATALEN];
+	char partCountSeparator[NAMEDATALEN];
 	char tableMsSeparator[NAMEDATALEN];
 	char bytesSeparator[NAMEDATALEN];
 	char indexCountSeparator[NAMEDATALEN];
@@ -114,6 +133,7 @@ typedef struct SummaryTableEntry
 	char oidStr[INTSTRING_MAX_DIGITS];
 	char nspname[PG_NAMEDATALEN];
 	char relname[PG_NAMEDATALEN];
+	char partCount[INTSTRING_MAX_DIGITS];
 	char tableMs[INTERVAL_MAXLEN];
 	uint64_t bytes;
 	char bytesStr[INTSTRING_MAX_DIGITS];
@@ -135,107 +155,103 @@ typedef struct SummaryTable
 	SummaryTableEntry *array;   /* calloc'ed area */
 } SummaryTable;
 
-
-typedef enum
-{
-	TIMING_STEP_START = 0,
-	TIMING_STEP_BEFORE_SCHEMA_FETCH,
-	TIMING_STEP_BEFORE_SCHEMA_DUMP,
-	TIMING_STEP_BEFORE_PREPARE_SCHEMA,
-	TIMING_STEP_AFTER_PREPARE_SCHEMA,
-	TIMING_STEP_BEFORE_FINALIZE_SCHEMA,
-	TIMING_STEP_AFTER_FINALIZE_SCHEMA,
-	TIMING_STEP_END,
-} TimingStep;
-
-typedef struct TopLevelTimings
-{
-	instr_time startTime;
-	instr_time beforeSchemaDump;
-	instr_time beforeSchemaFetch;
-	instr_time beforePrepareSchema;
-	instr_time afterPrepareSchema;
-	instr_time beforeFinalizeSchema;
-	instr_time afterFinalizeSchema;
-	instr_time endTime;
-
-	char totalMs[INTSTRING_MAX_DIGITS];
-	char dumpSchemaMs[INTSTRING_MAX_DIGITS];
-	char fetchSchemaMs[INTSTRING_MAX_DIGITS];
-	char prepareSchemaMs[INTSTRING_MAX_DIGITS];
-	char dataAndIndexMs[INTSTRING_MAX_DIGITS];
-	char finalizeSchemaMs[INTSTRING_MAX_DIGITS];
-	char totalTableMs[INTSTRING_MAX_DIGITS];
-	char totalIndexMs[INTSTRING_MAX_DIGITS];
-	char blobsMs[INTSTRING_MAX_DIGITS];
-
-	/* allow computing the overhead */
-	uint64_t totalDurationMs;   /* wall clock total duration */
-	uint64_t schemaDurationMs;  /* dump + prepare + finalize duration */
-	uint64_t dumpSchemaDurationMs;
-	uint64_t fetchSchemaDurationMs;
-	uint64_t prepareSchemaDurationMs;
-	uint64_t dataAndIndexesDurationMs;
-	uint64_t finalizeSchemaDurationMs;
-	uint64_t tableDurationMs;   /* sum of COPY (TABLE DATA) durations */
-	uint64_t indexDurationMs;   /* sum of CREATE INDEX durations */
-	uint64_t blobDurationMs;
-
-	char totalCopyDataMs[INTSTRING_MAX_DIGITS];
-	char totalCreateIndexMs[INTSTRING_MAX_DIGITS];
-} TopLevelTimings;
-
+/*
+ * Keep track of the timing for the main steps of the pgcopydb operations.
+ */
+extern TopLevelTiming topLevelTimingArray[];
 
 typedef struct Summary
 {
-	TopLevelTimings timings;
 	SummaryTable table;
 	int tableJobs;
 	int indexJobs;
+	int vacuumJobs;
 	int lObjectJobs;
+	int restoreJobs;
 } Summary;
 
-bool write_table_summary(CopyTableSummary *summary, char *filename);
-bool read_table_summary(CopyTableSummary *summary, const char *filename);
-bool open_table_summary(CopyTableSummary *summary, char *filename);
-bool finish_table_summary(CopyTableSummary *summary, char *filename);
 
+bool summary_start_timing(DatabaseCatalog *catalog, TimingSection section);
+bool summary_stop_timing(DatabaseCatalog *catalog, TimingSection section);
+
+bool summary_increment_timing(DatabaseCatalog *catalog,
+							  TimingSection section,
+							  uint64_t count,
+							  uint64_t bytes,
+							  uint64_t durationMs);
+
+bool summary_set_timing_count(DatabaseCatalog *catalog,
+							  TimingSection section,
+							  uint64_t count);
+
+bool summary_lookup_timing(DatabaseCatalog *catalog,
+						   TopLevelTiming *timing,
+						   TimingSection section);
+
+bool summary_pretty_print_timing(DatabaseCatalog *catalog,
+								 TopLevelTiming *timing);
+
+/*
+ * Summary Iterator
+ */
+typedef bool (TimingIterFun)(void *context, TopLevelTiming *timing);
+
+typedef struct TimingIterator
+{
+	DatabaseCatalog *catalog;
+	TopLevelTiming *timing;
+	SQLiteQuery query;
+} TimingIterator;
+
+bool summary_iter_timing(DatabaseCatalog *catalog,
+						 void *context,
+						 TimingIterFun *callback);
+
+bool summary_iter_timing_init(TimingIterator *iter);
+bool summary_iter_timing_next(TimingIterator *iter);
+bool catalog_timing_fetch(SQLiteQuery *query);
+bool summary_iter_timing_finish(TimingIterator *iter);
+
+
+/*
+ * Internals
+ */
+bool table_summary_init(CopyTableSummary *summary);
+bool table_summary_finish(CopyTableSummary *summary);
+
+bool table_vacuum_summary_init(CopyVacuumTableSummary *summary);
+bool table_vacuum_summary_finish(CopyVacuumTableSummary *summary);
+
+bool index_summary_init(CopyIndexSummary *summary);
+bool index_summary_finish(CopyIndexSummary *summary);
+
+/*
+ * Summary as JSON
+ */
 bool prepare_table_summary_as_json(CopyTableSummary *summary,
 								   JSON_Object *jsobj,
 								   const char *key);
-
-bool create_table_index_file(SourceTable *table, char *filename);
-bool read_table_index_file(SourceIndexArray *indexArray, char *filename);
-
-bool write_blobs_summary(CopyBlobsSummary *summary, char *filename);
-bool read_blobs_summary(CopyBlobsSummary *summary, char *filename);
-
-
-void summary_set_current_time(TopLevelTimings *timings, TimingStep step);
-
-
-bool write_index_summary(CopyIndexSummary *summary, char *filename,
-						 bool constraint);
-bool read_index_summary(CopyIndexSummary *summary, const char *filename);
-bool open_index_summary(CopyIndexSummary *summary, char *filename,
-						bool constraint);
-bool finish_index_summary(CopyIndexSummary *summary, char *filename,
-						  bool constraint);
 
 bool prepare_index_summary_as_json(CopyIndexSummary *summary,
 								   JSON_Object *jsobj,
 								   const char *key);
 
-void summary_prepare_toplevel_durations(Summary *summary);
+void print_summary_as_json(Summary *summary, const char *filename);
+
+/*
+ * Large Object top-level like summary
+ */
+bool write_blobs_summary(CopyBlobsSummary *summary, char *filename);
+bool read_blobs_summary(CopyBlobsSummary *summary, char *filename);
+
+
+/*
+ * Human Readable Summary Table
+ */
 void print_toplevel_summary(Summary *summary);
 void print_summary_table(SummaryTable *summary);
 void prepare_summary_table_headers(SummaryTable *summary);
 
-void print_summary_as_json(Summary *summary, const char *filename);
-
-bool summary_read_index_donefile(SourceIndex *index,
-								 const char *filename,
-								 bool constraint,
-								 SummaryIndexEntry *indexEntry);
+int TopLevelTimingConcurrency(Summary *summary, TopLevelTiming *timing);
 
 #endif /* SUMMARY_H */

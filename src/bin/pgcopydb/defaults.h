@@ -6,10 +6,32 @@
 #ifndef DEFAULTS_H
 #define DEFAULTS_H
 
+/*
+ * Setup Boehm-Demers-Weiser conservative garbage collector as a garbage
+ * collecting replacement for malloc. See https://www.hboehm.info/gc/
+ */
+#include <gc/gc.h>
+
+#define malloc(n) GC_malloc(n)
+#define calloc(m, n) GC_malloc((m) * (n))
+#define free(p) GC_free(p)
+#define realloc(p, n) GC_realloc((p), (n))
+#define strdup(p) GC_strdup(p)
+#define strndup(p, n) GC_strndup(p, n)
+
+/*
+ * The GC API can also be used as leak detector, thanks to using the following
+ * macro, as per https://www.hboehm.info/gc/leak.html
+ */
+#define CHECK_LEAKS() GC_gcollect()
+
+/*
+ * Now install the version string.
+ */
 #include "git-version.h"
 
 /* additional version information for printing version on CLI */
-#define PGCOPYDB_VERSION "0.14"
+#define PGCOPYDB_VERSION "0.15"
 
 #ifdef GIT_VERSION
 #define VERSION_STRING GIT_VERSION
@@ -28,21 +50,25 @@
 #define PGCOPYDB_TARGET_PGURI "PGCOPYDB_TARGET_PGURI"
 #define PGCOPYDB_TABLE_JOBS "PGCOPYDB_TABLE_JOBS"
 #define PGCOPYDB_INDEX_JOBS "PGCOPYDB_INDEX_JOBS"
+#define PGCOPYDB_RESTORE_JOBS "PGCOPYDB_RESTORE_JOBS"
 #define PGCOPYDB_LARGE_OBJECTS_JOBS "PGCOPYDB_LARGE_OBJECTS_JOBS"
 #define PGCOPYDB_SPLIT_TABLES_LARGER_THAN "PGCOPYDB_SPLIT_TABLES_LARGER_THAN"
 #define PGCOPYDB_DROP_IF_EXISTS "PGCOPYDB_DROP_IF_EXISTS"
 #define PGCOPYDB_SNAPSHOT "PGCOPYDB_SNAPSHOT"
 #define PGCOPYDB_OUTPUT_PLUGIN "PGCOPYDB_OUTPUT_PLUGIN"
+#define PGCOPYDB_WAL2JSON_NUMERIC_AS_STRING "PGCOPYDB_WAL2JSON_NUMERIC_AS_STRING"
 #define PGCOPYDB_LOG_TIME_FORMAT "PGCOPYDB_LOG_TIME_FORMAT"
 #define PGCOPYDB_LOG_JSON "PGCOPYDB_LOG_JSON"
 #define PGCOPYDB_LOG_JSON_FILE "PGCOPYDB_LOG_JSON_FILE"
 #define PGCOPYDB_LOG_FILENAME "PGCOPYDB_LOG_FILENAME"
 #define PGCOPYDB_FAIL_FAST "PGCOPYDB_FAIL_FAST"
 #define PGCOPYDB_SKIP_VACUUM "PGCOPYDB_SKIP_VACUUM"
+#define PGCOPYDB_SKIP_TABLESPACES "PGCOPYDB_SKIP_TABLESPACES"
 
 /* default values for the command line options */
 #define DEFAULT_TABLE_JOBS 4
 #define DEFAULT_INDEX_JOBS 4
+#define DEFAULT_RESTORE_JOBS 0
 #define DEFAULT_LARGE_OBJECTS_JOBS 4
 #define DEFAULT_SPLIT_TABLES_LARGER_THAN 0 /* no COPY partitioning by default */
 

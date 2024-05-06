@@ -40,7 +40,6 @@
 static char * ConnectionTypeToString(ConnectionType connectionType);
 static void log_connection_error(PGconn *connection, int logLevel);
 static void pgAutoCtlDefaultNoticeProcessor(void *arg, const char *message);
-static PGconn * pgsql_open_connection(PGSQL *pgsql);
 static bool pgsql_retry_open_connection(PGSQL *pgsql);
 
 static bool is_response_ok(PGresult *result);
@@ -59,13 +58,12 @@ static bool build_parameters_list(PQExpBuffer buffer,
 
 static void parseIdentifySystemResult(void *ctx, PGresult *result);
 static void parseTimelineHistoryResult(void *ctx, PGresult *result);
-static bool pg_copy_data(PGSQL *src, PGSQL *dst, const char *srcQname,
-						 const char *dstQname, bool truncate,
-						 uint64_t *bytesTransmitted);
-static bool pg_copy_send_query(PGSQL *pgsql,
-							   const char *qname,
-							   ExecStatusType status,
-							   bool freeze);
+
+static bool pg_copy_data(PGSQL *src, PGSQL *dst, CopyArgs *args);
+
+static bool pg_copy_send_query(PGSQL *pgsql, CopyArgs *args,
+							   ExecStatusType status);
+
 static void pgcopy_log_error(PGSQL *pgsql, PGresult *res, const char *context);
 
 static void getSequenceValue(void *ctx, PGresult *result);
@@ -86,8 +84,6 @@ static void prepareToTerminate(LogicalStreamClient *client,
 							   XLogRecPtr lsn);
 
 static void parseReplicationSlot(void *ctx, PGresult *result);
-
-static void parseSentinel(void *ctx, PGresult *result);
 
 
 /*
@@ -246,8 +242,14 @@ pgsql_set_interactive_retry_policy(ConnectionRetryPolicy *retryPolicy)
 
 /*
  * http://c-faq.com/lib/randrange.html
+ *
+ * With additional protection against division-by-zero.
  */
-#define random_between(R, M, N) ((M) + R / (RAND_MAX / ((N) -(M) +1) + 1))
+#define random_between(R, M, N) \
+	((((N) -(M) +1) == 0) \
+	 ? ((M) + R / (RAND_MAX / ((N) -(M)) + 1)) \
+	 : ((M) + R / (RAND_MAX / ((N) -(M) +1) + 1)))
+
 
 /*
  * pick_random_sleep_time picks a random sleep time between the given policy
@@ -418,9 +420,6 @@ pgsql_finish(PGSQL *pgsql)
 		pgsql->pgversion[0] = '\0';
 		pgsql->pgversion_num = 0;
 
-		/* we don't need the print-safe URL anymore */
-		freeSafeURI(&(pgsql->safeURI));
-
 		/*
 		 * When we fail to connect, on the way out we call pgsql_finish to
 		 * reset the connection to NULL. We still want the callers to be able
@@ -439,20 +438,24 @@ pgsql_finish(PGSQL *pgsql)
 static void
 log_connection_error(PGconn *connection, int logLevel)
 {
-	char *message = connection != NULL ? PQerrorMessage(connection) : NULL;
-	char *errorLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(message, errorLines, BUFSIZE);
-	int lineNumber = 0;
-
 	/* PQerrorMessage is then "connection pointer is NULL", not helpful */
 	if (connection == NULL)
 	{
 		return;
 	}
 
-	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	char *message = PQerrorMessage(connection);
+	LinesBuffer lbuf = { 0 };
+
+	if (!splitLines(&lbuf, message))
 	{
-		char *line = errorLines[lineNumber];
+		/* errors have already been logged */
+		return;
+	}
+
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
+	{
+		char *line = lbuf.lines[lineNumber];
 
 		if (lineNumber == 0)
 		{
@@ -471,7 +474,7 @@ log_connection_error(PGconn *connection, int logLevel)
  * instance. If a connection is already open in the client (it's not NULL),
  * then this errors, unless we are inside a transaction opened by pgsql_begin.
  */
-static PGconn *
+PGconn *
 pgsql_open_connection(PGSQL *pgsql)
 {
 	/* we might be connected already */
@@ -502,12 +505,35 @@ pgsql_open_connection(PGSQL *pgsql)
 	}
 
 	/*
-	 * set application_name to contain the process title and pid, so that it is
+	 * Set application_name to contain the process title and pid, so that it is
 	 * easier to identify our connections in pg_stat_activity.
+	 *
+	 * From Postgres docs: The application_name can be any string of less than
+	 * NAMEDATALEN characters (64 characters in a standard build).
+	 *
+	 * See: https://www.postgresql.org/docs/current/runtime-config-logging.html
 	 */
+	const char *ps_buffer_prefix = "pgcopydb: ";
+	int prefixLen = strlen(ps_buffer_prefix);
+
 	char app_name[BUFSIZE] = { 0 };
 
-	sformat(app_name, sizeof(app_name), "pgcopydb[%d] %s", getpid(), ps_buffer);
+	sformat(app_name, sizeof(app_name), "pgcopydb[%d]", getpid());
+
+	if (strncmp(ps_buffer, ps_buffer_prefix, prefixLen) == 0)
+	{
+		sformat(app_name, sizeof(app_name), "%s %s",
+				app_name,
+				ps_buffer + prefixLen);
+	}
+	else
+	{
+		sformat(app_name, sizeof(app_name), "%s %s", app_name, ps_buffer);
+	}
+
+	/* make sure to truncate application name to NAMEDATALEN to avoid notices */
+	app_name[NAMEDATALEN - 1] = '\0';
+
 	setenv("PGAPPNAME", app_name, 1);
 
 	/* we implement our own retry strategy */
@@ -828,17 +854,18 @@ pgsql_retry_open_connection(PGSQL *pgsql)
 static void
 pgAutoCtlDefaultNoticeProcessor(void *arg, const char *message)
 {
-	char *m = strdup(message);
-	char *lines[BUFSIZE];
-	int lineCount = splitLines(m, lines, BUFSIZE);
-	int lineNumber = 0;
+	LinesBuffer lbuf = { 0 };
 
-	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	if (!splitLines(&lbuf, (char *) message))
 	{
-		log_warn("%s", lines[lineNumber]);
+		/* errors have already been logged */
+		return;
 	}
 
-	free(m);
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
+	{
+		log_warn("%s", lbuf.lines[lineNumber]);
+	}
 }
 
 
@@ -849,17 +876,18 @@ pgAutoCtlDefaultNoticeProcessor(void *arg, const char *message)
 void
 pgAutoCtlDebugNoticeProcessor(void *arg, const char *message)
 {
-	char *m = strdup(message);
-	char *lines[BUFSIZE];
-	int lineCount = splitLines(m, lines, BUFSIZE);
-	int lineNumber = 0;
+	LinesBuffer lbuf = { 0 };
 
-	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	if (!splitLines(&lbuf, (char *) message))
 	{
-		log_sql("%s", lines[lineNumber]);
+		/* errors have already been logged */
+		return;
 	}
 
-	free(m);
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
+	{
+		log_sql("%s", lbuf.lines[lineNumber]);
+	}
 }
 
 
@@ -1103,7 +1131,7 @@ parseVersionContext(void *ctx, PGresult *result)
 	if (length >= sizeof(context->pgversion))
 	{
 		log_error("Postgres version string \"%s\" is %d bytes long, "
-				  "the maximum expected is %ld",
+				  "the maximum expected is %zu",
 				  value, length, sizeof(context->pgversion) - 1);
 		++errors;
 	}
@@ -1153,11 +1181,11 @@ pgsql_server_version(PGSQL *pgsql)
 	char *endpoint =
 		pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET";
 
-	log_notice("[%s %d] Postgres version %s (%d)",
-			   endpoint,
-			   PQbackendPID(pgsql->connection),
-			   pgsql->pgversion,
-			   pgsql->pgversion_num);
+	log_debug("[%s %d] Postgres version %s (%d)",
+			  endpoint,
+			  PQbackendPID(pgsql->connection),
+			  pgsql->pgversion,
+			  pgsql->pgversion_num);
 
 	return true;
 }
@@ -1292,6 +1320,44 @@ pgsql_has_sequence_privilege(PGSQL *pgsql,
 	if (!parseContext.parsedOk)
 	{
 		log_error("Failed to query privileges for sequence \"%s\"", seqname);
+		return false;
+	}
+
+	*granted = parseContext.boolVal;
+
+	return true;
+}
+
+
+/*
+ * pgsql_has_table_privilege calls has_table_privilege() and copies the result
+ * in the granted boolean pointer given.
+ */
+bool
+pgsql_has_table_privilege(PGSQL *pgsql,
+						  const char *tablename,
+						  const char *privilege,
+						  bool *granted)
+{
+	SingleValueResultContext parseContext = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	char *sql = "select has_table_privilege($1, $2);";
+
+	int paramCount = 2;
+	Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { tablename, privilege };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &parseContext, &parseSingleValueResult))
+	{
+		log_error("Failed to query privileges for table \"%s\"", tablename);
+		return false;
+	}
+
+	if (!parseContext.parsedOk)
+	{
+		log_error("Failed to query privileges for table \"%s\"", tablename);
 		return false;
 	}
 
@@ -1523,6 +1589,22 @@ pgsql_execute_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 									  NULL, NULL, 0);
 	}
 
+	/*
+	 * Use PQsetSingleRowMode(connection) to switch to select single-row mode
+	 * and fetch only one result at a time in memory. Works with query result
+	 * handlers that do not expect PQntuples() to reflect the actual number of
+	 * tuples returned by the query etc.
+	 */
+	if (pgsql->singleRowMode)
+	{
+		if (PQsetSingleRowMode(connection) != 1)
+		{
+			log_error("Failed to select single-row mode: %s",
+					  PQerrorMessage(connection));
+			return false;
+		}
+	}
+
 	bool done = false;
 	int errors = 0;
 
@@ -1649,20 +1731,25 @@ pgsql_send_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 	if (result == 0)
 	{
 		char *message = PQerrorMessage(connection);
-		char *errorLines[BUFSIZE] = { 0 };
-		int lineCount = splitLines(message, errorLines, BUFSIZE);
-		int lineNumber = 0;
+
+		LinesBuffer lbuf = { 0 };
+
+		if (!splitLines(&lbuf, message))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 
 		/*
 		 * PostgreSQL Error message might contain several lines. Log each of
 		 * them as a separate ERROR line here.
 		 */
-		for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+		for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 		{
 			log_error("[%s %d] %s",
 					  endpoint,
 					  PQbackendPID(pgsql->connection),
-					  errorLines[lineNumber]);
+					  lbuf.lines[lineNumber]);
 		}
 
 		if (pgsql->logSQL)
@@ -1676,7 +1763,6 @@ pgsql_send_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 		}
 
 		destroyPQExpBuffer(debugParameters);
-
 		clear_results(pgsql);
 
 		return false;
@@ -1759,6 +1845,8 @@ pgsql_fetch_results(PGSQL *pgsql, bool *done,
 	{
 		PGresult *result = NULL;
 
+		bool firstResult = true;
+
 		/*
 		 * When we got clearance that libpq did fetch the Postgres query result
 		 * in its internal buffers, we process the result without checking for
@@ -1781,12 +1869,36 @@ pgsql_fetch_results(PGSQL *pgsql, bool *done,
 				return false;
 			}
 
+			/*
+			 * From Postgres docs:
+			 *
+			 * If the query returns any rows, they are returned as individual
+			 * PGresult objects, which look like normal query results except
+			 * for having status code PGRES_SINGLE_TUPLE instead of
+			 * PGRES_TUPLES_OK. After the last row, or immediately if the query
+			 * returns zero rows, a zero-row object with status PGRES_TUPLES_OK
+			 * is returned; this is the signal that no more rows will arrive.
+			 */
 			if (parseFun != NULL)
 			{
-				(*parseFun)(context, result);
+				bool skipCallback =
+					!firstResult &&
+					pgsql->singleRowMode &&
+					PQntuples(result) == 0 &&
+					PQresultStatus(result) == PGRES_TUPLES_OK;
+
+				if (!skipCallback)
+				{
+					(*parseFun)(context, result);
+				}
 			}
 
 			PQclear(result);
+
+			if (firstResult)
+			{
+				firstResult = false;
+			}
 		}
 
 		*done = true;
@@ -1800,85 +1912,13 @@ pgsql_fetch_results(PGSQL *pgsql, bool *done,
 
 
 /*
- * pgsql_prepare implements server-side prepared statements by using the
- * Postgres protocol prepare/bind/execute messages. Use with
- * pgsql_execute_prepared().
- */
-bool
-pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
-			  int paramCount, const Oid *paramTypes)
-{
-	PGconn *connection = pgsql_open_connection(pgsql);
-
-	if (connection == NULL)
-	{
-		return false;
-	}
-
-	bool pipelineMode = pqPipelineModeEnabled(connection);
-
-	char *endpoint =
-		pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET";
-
-	if (pgsql->logSQL)
-	{
-		log_sql("[%s %d] PREPARE %s AS %s;",
-				endpoint, PQbackendPID(connection), name, sql);
-	}
-
-	PGresult *result = NULL;
-	bool ok = false;
-
-	if (pipelineMode)
-	{
-		ok = PQsendPrepare(connection, name, sql, paramCount, paramTypes) != 0;
-	}
-	else
-	{
-		result = PQprepare(connection, name, sql, paramCount, paramTypes);
-
-		ok = is_response_ok(result);
-	}
-
-	if (!ok)
-	{
-		pgsql_execute_log_error(pgsql, result, sql, NULL, NULL);
-
-		/*
-		 * Multi statements might want to ROLLBACK and hold to the open
-		 * connection for a retry step.
-		 */
-		if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
-		{
-			(void) pgsql_finish(pgsql);
-		}
-
-		return false;
-	}
-
-	/* Don't clear results in pipeline mode */
-	if (!pipelineMode)
-	{
-		PQclear(result);
-		clear_results(pgsql);
-	}
-
-	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
-	{
-		(void) pgsql_finish(pgsql);
-	}
-
-	return true;
-}
-
-
-/*
  * pgsql_enable_pipeline_mode enables the pipeline mode in the given PGSQL
  * connection. It also sets the connection to non-blocking mode.
  */
 bool
 pgsql_enable_pipeline_mode(PGSQL *pgsql)
 {
+#if defined(LIBPQ_HAS_PIPELINING) && LIBPQ_HAS_PIPELINING
 	PGconn *conn = pgsql_open_connection(pgsql);
 
 	if (conn == NULL)
@@ -1909,6 +1949,20 @@ pgsql_enable_pipeline_mode(PGSQL *pgsql)
 
 	log_trace("Enabled pipeline mode");
 	return true;
+#else
+	static bool warned = false;
+
+	if (!warned)
+	{
+		log_warn("Skipping libpq pipeline mode optimisation because pgcopydb "
+				 "was built with libpq " PG_MAJORVERSION
+				 ", pipeline mode is available since libpq 14");
+
+		warned = true;
+	}
+
+	return true;
+#endif
 }
 
 
@@ -1919,6 +1973,7 @@ pgsql_enable_pipeline_mode(PGSQL *pgsql)
 bool
 pgsql_sync_pipeline(PGSQL *pgsql)
 {
+#if defined(LIBPQ_HAS_PIPELINING) && LIBPQ_HAS_PIPELINING
 	PGconn *conn = pgsql->connection;
 
 	if (conn == NULL)
@@ -1998,9 +2053,9 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 		if (PQconsumeInput(conn) == 0)
 		{
 			(void) pgsql_stream_log_error(
-					pgsql,
-					NULL,
-					"Failed to consume input for pipeline sync");
+				pgsql,
+				NULL,
+				"Failed to consume input for pipeline sync");
 			return false;
 		}
 
@@ -2049,6 +2104,93 @@ pgsql_sync_pipeline(PGSQL *pgsql)
 	pgsql->pipelineSyncTime = time(NULL);
 
 	log_trace("Endof pipeline sync");
+
+	return true;
+#else
+	static bool warned = false;
+
+	if (!warned)
+	{
+		log_warn("Skipping libpq pipeline mode optimisation because pgcopydb "
+				 "was built with libpq " PG_MAJORVERSION
+				 ", pipeline mode is available since libpq 14");
+
+		warned = true;
+	}
+
+	return true;
+#endif
+}
+
+
+/*
+ * pgsql_prepare implements server-side prepared statements by using the
+ * Postgres protocol prepare/bind/execute messages. Use with
+ * pgsql_execute_prepared().
+ */
+bool
+pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
+			  int paramCount, const Oid *paramTypes)
+{
+	PGconn *connection = pgsql_open_connection(pgsql);
+
+	if (connection == NULL)
+	{
+		return false;
+	}
+
+	bool pipelineMode = pqPipelineModeEnabled(connection);
+
+	char *endpoint =
+		pgsql->connectionType == PGSQL_CONN_SOURCE ? "SOURCE" : "TARGET";
+
+	if (pgsql->logSQL)
+	{
+		log_sql("[%s %d] PREPARE %s AS %s;",
+				endpoint, PQbackendPID(connection), name, sql);
+	}
+
+	PGresult *result = NULL;
+	bool ok = false;
+
+	if (pipelineMode)
+	{
+		ok = PQsendPrepare(connection, name, sql, paramCount, paramTypes) != 0;
+	}
+	else
+	{
+		result = PQprepare(connection, name, sql, paramCount, paramTypes);
+
+		ok = is_response_ok(result);
+	}
+
+	if (!ok)
+	{
+		pgsql_execute_log_error(pgsql, result, sql, NULL, NULL);
+
+		/*
+		 * Multi statements might want to ROLLBACK and hold to the open
+		 * connection for a retry step.
+		 */
+		if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
+		{
+			(void) pgsql_finish(pgsql);
+		}
+
+		return false;
+	}
+
+	/* Don't clear results in pipeline mode */
+	if (!pipelineMode)
+	{
+		PQclear(result);
+		clear_results(pgsql);
+	}
+
+	if (pgsql->connectionStatementType == PGSQL_CONNECTION_SINGLE_STATEMENT)
+	{
+		(void) pgsql_finish(pgsql);
+	}
 
 	return true;
 }
@@ -2110,20 +2252,19 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 	}
 
 	PGresult *result = NULL;
-
 	bool ok = false;
 
 	if (pipelineMode)
 	{
 		ok = PQsendQueryPrepared(connection, name,
-						         paramCount, paramValues,
-				                 NULL, NULL, 0) != 0;
+								 paramCount, paramValues,
+								 NULL, NULL, 0) != 0;
 	}
 	else
 	{
 		result = PQexecPrepared(connection, name,
-				                paramCount, paramValues,
-				                NULL, NULL, 0);
+								paramCount, paramValues,
+								NULL, NULL, 0);
 
 		ok = is_response_ok(result);
 	}
@@ -2155,6 +2296,7 @@ pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 
 	destroyPQExpBuffer(debugParameters);
 
+	/* Don't clear results in pipeline mode */
 	if (!pipelineMode)
 	{
 		PQclear(result);
@@ -2201,15 +2343,20 @@ pgsql_execute_log_error(PGSQL *pgsql,
 	 */
 	char *message = PQerrorMessage(pgsql->connection);
 
-	char *errorLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(message, errorLines, BUFSIZE);
+	LinesBuffer lbuf = { 0 };
 
-	for (int lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	if (!splitLines(&lbuf, message))
+	{
+		/* errors have already been logged */
+		return;
+	}
+
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 	{
 		log_error("[%s %d] %s",
 				  endpoint,
 				  PQbackendPID(pgsql->connection),
-				  errorLines[lineNumber]);
+				  lbuf.lines[lineNumber]);
 	}
 
 	if (pgsql->logSQL)
@@ -2401,13 +2548,18 @@ clear_results(PGSQL *pgsql)
 
 		if (!is_response_ok(result))
 		{
+			LinesBuffer lbuf = { 0 };
 			char *pqmessage = PQerrorMessage(connection);
-			char *errorLines[BUFSIZE] = { 0 };
-			int lineCount = splitLines(pqmessage, errorLines, BUFSIZE);
 
-			for (int lineNumber = 0; lineNumber < lineCount; lineNumber++)
+			if (!splitLines(&lbuf, pqmessage))
 			{
-				log_error("[Postgres] %s", errorLines[lineNumber]);
+				/* errors have already been logged */
+				return false;
+			}
+
+			for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
+			{
+				log_error("[Postgres] %s", lbuf.lines[lineNumber]);
 			}
 
 			PQclear(result);
@@ -2494,6 +2646,23 @@ validate_connection_string(const char *connectionString)
 
 
 /*
+ * pgsql_lock_table runs a LOCK command with given lockmode.
+ */
+bool
+pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode)
+{
+	char sql[BUFSIZE] = { 0 };
+
+	sformat(sql, sizeof(sql), "LOCK TABLE ONLY %s IN %s MODE", qname, lockmode);
+
+	/* this is an internal operation, not meaningful from the outside */
+	log_sql("%s", sql);
+
+	return pgsql_execute(pgsql, sql);
+}
+
+
+/*
  * pgsql_truncate executes the TRUNCATE command on the given quoted relation
  * name qname, in the given Postgres connection.
  */
@@ -2503,6 +2672,9 @@ pgsql_truncate(PGSQL *pgsql, const char *qname)
 	char sql[BUFSIZE] = { 0 };
 
 	sformat(sql, sizeof(sql), "TRUNCATE ONLY %s", qname);
+
+	/* this being more like a DDL operation, proper log level is NOTICE */
+	log_notice("%s", sql);
 
 	return pgsql_execute(pgsql, sql);
 }
@@ -2515,8 +2687,7 @@ pgsql_truncate(PGSQL *pgsql, const char *qname)
  * referenced by the qualified identifier name dstQname on the target.
  */
 bool
-pg_copy(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
-		bool truncate, uint64_t *bytesTransmitted)
+pg_copy(PGSQL *src, PGSQL *dst, CopyArgs *args)
 {
 	bool srcConnIsOurs = src->connection == NULL;
 	if (!pgsql_open_connection(src))
@@ -2535,8 +2706,7 @@ pg_copy(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
 		return false;
 	}
 
-	bool result = pg_copy_data(src, dst, srcQname, dstQname,
-							   truncate, bytesTransmitted);
+	bool result = pg_copy_data(src, dst, args);
 
 	if (srcConnIsOurs)
 	{
@@ -2558,8 +2728,7 @@ pg_copy(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
  * expects src and dst are opened connection and doesn't manage their lifetime.
  */
 static bool
-pg_copy_data(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
-			 bool truncate, uint64_t *bytesTransmitted)
+pg_copy_data(PGSQL *src, PGSQL *dst, CopyArgs *args)
 {
 	PGconn *srcConn = src->connection;
 	PGconn *dstConn = dst->connection;
@@ -2569,23 +2738,26 @@ pg_copy_data(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
 		return false;
 	}
 
-	/* DST: TRUNCATE schema.table */
-	if (truncate)
+	if (args->truncate)
 	{
-		if (!pgsql_truncate(dst, dstQname))
+		if (!pgsql_truncate(dst, args->dstQname))
 		{
+			/* errors have already been logged */
 			return false;
 		}
 	}
 
+	/* make sure to log TRUNCATE before we log COPY, avoid confusion */
+	log_notice("%s", args->logCommand);
+
 	/* SRC: COPY schema.table TO STDOUT */
-	if (!pg_copy_send_query(src, srcQname, PGRES_COPY_OUT, false))
+	if (!pg_copy_send_query(src, args, PGRES_COPY_OUT))
 	{
 		return false;
 	}
 
 	/* DST: COPY schema.table FROM STDIN WITH (FREEZE) */
-	if (!pg_copy_send_query(dst, dstQname, PGRES_COPY_IN, truncate))
+	if (!pg_copy_send_query(dst, args, PGRES_COPY_IN))
 	{
 		return false;
 	}
@@ -2594,7 +2766,7 @@ pg_copy_data(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
 	char *copybuf;
 	bool failedOnSrc = false;
 	bool failedOnDst = false;
-	*bytesTransmitted = 0;
+	args->bytesTransmitted = 0;
 
 	for (;;)
 	{
@@ -2701,7 +2873,7 @@ pg_copy_data(PGSQL *src, PGSQL *dst, const char *srcQname, const char *dstQname,
 		 */
 		else if (bufsize > 0)
 		{
-			*bytesTransmitted += bufsize;
+			args->bytesTransmitted += bufsize;
 		}
 
 		/*
@@ -2903,33 +3075,45 @@ pg_copy_end(PGSQL *pgsql)
  * to a Postgres instance, and checks that the server's result is as expected.
  */
 static bool
-pg_copy_send_query(PGSQL *pgsql,
-				   const char *qname, ExecStatusType status, bool freeze)
+pg_copy_send_query(PGSQL *pgsql, CopyArgs *args, ExecStatusType status)
 {
-	char *sql = NULL;
+	PQExpBuffer sql = createPQExpBuffer();
 
 	if (status == PGRES_COPY_OUT)
 	{
 		/* There is no COPY TO with FREEZE */
-		char *template = "copy %s to stdout";
-		size_t len = strlen(template) + strlen(qname) + 1;
-
-		sql = (char *) calloc(len, sizeof(char));
-
-		sformat(sql, len, template, qname);
+		if (args->srcWhereClause != NULL)
+		{
+			appendPQExpBuffer(sql, "copy (SELECT %s FROM ONLY %s %s) ",
+							  args->srcAttrList,
+							  args->srcQname,
+							  args->srcWhereClause);
+		}
+		else
+		{
+			appendPQExpBuffer(sql, "copy (SELECT %s FROM ONLY %s) ",
+							  args->srcAttrList,
+							  args->srcQname);
+		}
+		appendPQExpBuffer(sql, "to stdout");
 	}
 	else if (status == PGRES_COPY_IN)
 	{
-		char *template =
-			freeze
-			? "copy %s from stdin with (freeze)"
-			: "copy %s from stdin";
+		if (args->dstAttrList != NULL && !streq(args->dstAttrList, ""))
+		{
+			appendPQExpBuffer(sql, "copy %s(%s) from stdin",
+							  args->dstQname,
+							  args->dstAttrList);
+		}
+		else
+		{
+			appendPQExpBuffer(sql, "copy %s from stdin", args->dstQname);
+		}
 
-		size_t len = strlen(template) + strlen(qname) + 1;
-
-		sql = (char *) calloc(len, sizeof(char));
-
-		sformat(sql, len, template, qname);
+		if (args->freeze)
+		{
+			appendPQExpBuffer(sql, " with (freeze)");
+		}
 	}
 	else
 	{
@@ -2937,19 +3121,26 @@ pg_copy_send_query(PGSQL *pgsql,
 		return false;
 	}
 
-	log_sql("%s;", sql);
-
-	PGresult *res = PQexec(pgsql->connection, sql);
-
-	if (PQresultStatus(res) != status)
+	if (PQExpBufferBroken(sql))
 	{
-		pgcopy_log_error(pgsql, res, sql);
-		free(sql);
-
+		log_error("Failed to create COPY query for %s: out of memory",
+				  args->srcQname);
 		return false;
 	}
 
-	free(sql);
+	log_sql("%s;", sql->data);
+
+	PGresult *res = PQexec(pgsql->connection, sql->data);
+
+	if (PQresultStatus(res) != status)
+	{
+		pgcopy_log_error(pgsql, res, sql->data);
+
+		destroyPQExpBuffer(sql);
+		return false;
+	}
+
+	destroyPQExpBuffer(sql);
 	return true;
 }
 
@@ -2961,10 +3152,14 @@ pg_copy_send_query(PGSQL *pgsql,
 static void
 pgcopy_log_error(PGSQL *pgsql, PGresult *res, const char *context)
 {
+	LinesBuffer lbuf = { 0 };
 	char *message = PQerrorMessage(pgsql->connection);
-	char *errorLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(message, errorLines, BUFSIZE);
-	int lineNumber = 0;
+
+	if (!splitLines(&lbuf, message))
+	{
+		/* errors have already been logged */
+		return;
+	}
 
 	if (res != NULL)
 	{
@@ -2979,7 +3174,7 @@ pgcopy_log_error(PGSQL *pgsql, PGresult *res, const char *context)
 	 * PostgreSQL Error message might contain several lines. Log each of
 	 * them as a separate ERROR line here.
 	 */
-	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 	{
 		if (lineNumber == 0 && res != NULL)
 		{
@@ -2987,14 +3182,14 @@ pgcopy_log_error(PGSQL *pgsql, PGresult *res, const char *context)
 					  endpoint,
 					  PQbackendPID(pgsql->connection),
 					  pgsql->sqlstate,
-					  errorLines[lineNumber]);
+					  lbuf.lines[lineNumber]);
 		}
 		else
 		{
 			log_error("[%s %d] %s",
 					  endpoint,
 					  PQbackendPID(pgsql->connection),
-					  errorLines[lineNumber]);
+					  lbuf.lines[lineNumber]);
 		}
 	}
 
@@ -3348,10 +3543,10 @@ parseTimelineHistoryResult(void *ctx, PGresult *result)
 
 	if (strlen(value) >= sizeof(context->content))
 	{
-		log_error("Received a timeline history file of %lu bytes, "
-				  "pgcopydb is limited to files of up to %lu bytes.",
-				  (unsigned long) strlen(value),
-				  (unsigned long) sizeof(context->content));
+		log_error("Received a timeline history file of %zu bytes, "
+				  "pgcopydb is limited to files of up to %zu bytes.",
+				  strlen(value),
+				  sizeof(context->content));
 		context->parsedOk = false;
 	}
 	strlcpy(context->content, value, sizeof(context->content));
@@ -3367,15 +3562,19 @@ bool
 parseTimeLineHistory(const char *filename, const char *content,
 					 IdentifySystem *system)
 {
-	char *historyLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines((char *) content, historyLines, BUFSIZE);
-	int lineNumber = 0;
+	LinesBuffer lbuf = { 0 };
 
-	if (lineCount >= PGCOPYDB_MAX_TIMELINES)
+	if (!splitLines(&lbuf, (char *) content))
 	{
-		log_error("history file \"%s\" contains %d lines, "
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (lbuf.count >= PGCOPYDB_MAX_TIMELINES)
+	{
+		log_error("history file \"%s\" contains %lld lines, "
 				  "pgcopydb only supports up to %d lines",
-				  filename, lineCount, PGCOPYDB_MAX_TIMELINES - 1);
+				  filename, (long long) lbuf.count, PGCOPYDB_MAX_TIMELINES - 1);
 		return false;
 	}
 
@@ -3390,9 +3589,9 @@ parseTimeLineHistory(const char *filename, const char *content,
 	TimeLineHistoryEntry *entry =
 		&(system->timelines.history[system->timelines.count]);
 
-	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 	{
-		char *ptr = historyLines[lineNumber];
+		char *ptr = lbuf.lines[lineNumber];
 
 		/* skip leading whitespace and check for # comment */
 		for (; *ptr; ptr++)
@@ -3408,22 +3607,22 @@ parseTimeLineHistory(const char *filename, const char *content,
 			continue;
 		}
 
-		log_trace("parseTimeLineHistory line %d is \"%s\"",
-				  lineNumber,
-				  historyLines[lineNumber]);
+		log_trace("parseTimeLineHistory line %lld is \"%s\"",
+				  (long long) lineNumber,
+				  lbuf.lines[lineNumber]);
 
-		char *tabptr = strchr(historyLines[lineNumber], '\t');
+		char *tabptr = strchr(lbuf.lines[lineNumber], '\t');
 
 		if (tabptr == NULL)
 		{
-			log_error("Failed to parse history file line %d: \"%s\"",
-					  lineNumber, ptr);
+			log_error("Failed to parse history file line %lld: \"%s\"",
+					  (long long) lineNumber, ptr);
 			return false;
 		}
 
 		*tabptr = '\0';
 
-		if (!stringToUInt(historyLines[lineNumber], &(entry->tli)))
+		if (!stringToUInt(lbuf.lines[lineNumber], &(entry->tli)))
 		{
 			log_error("Failed to parse history timeline \"%s\"", tabptr);
 			return false;
@@ -3453,10 +3652,8 @@ parseTimeLineHistory(const char *filename, const char *content,
 		log_trace("parseTimeLineHistory[%d]: tli %d [%X/%X %X/%X]",
 				  system->timelines.count,
 				  entry->tli,
-				  (uint32) (entry->begin >> 32),
-				  (uint32) entry->begin,
-				  (uint32) (entry->end >> 32),
-				  (uint32) entry->end);
+				  LSN_FORMAT_ARGS(entry->begin),
+				  LSN_FORMAT_ARGS(entry->end));
 
 		entry = &(system->timelines.history[++system->timelines.count]);
 	}
@@ -3472,10 +3669,8 @@ parseTimeLineHistory(const char *filename, const char *content,
 	log_trace("parseTimeLineHistory[%d]: tli %d [%X/%X %X/%X]",
 			  system->timelines.count,
 			  entry->tli,
-			  (uint32) (entry->begin >> 32),
-			  (uint32) entry->begin,
-			  (uint32) (entry->end >> 32),
-			  (uint32) entry->end);
+			  LSN_FORMAT_ARGS(entry->begin),
+			  LSN_FORMAT_ARGS(entry->end));
 
 	/* fix the off-by-one so that the count is a count, not an index */
 	++system->timelines.count;
@@ -3535,7 +3730,8 @@ bool
 pg_copy_large_object(PGSQL *src,
 					 PGSQL *dst,
 					 bool dropIfExists,
-					 uint32_t blobOid)
+					 uint32_t blobOid,
+					 uint64_t *bytesTransmitted)
 {
 	log_debug("Copying large object %u", blobOid);
 
@@ -3689,7 +3885,7 @@ pg_copy_large_object(PGSQL *src,
 			return false;
 		}
 
-		(void) free(buffer);
+		*bytesTransmitted += bytesRead;
 	} while (bytesRead > 0);
 
 	lo_close(src->connection, srcfd);
@@ -3902,7 +4098,7 @@ pgsql_create_logical_replication_slot(LogicalStreamClient *client,
 
 		if (length >= sizeof(slot->snapshot))
 		{
-			log_error("Snapshot \"%s\" is %d bytes long, the maximum is %ld",
+			log_error("Snapshot \"%s\" is %d bytes long, the maximum is %zu",
 					  value, length, sizeof(slot->snapshot) - 1);
 			pgsql_finish(pgsql);
 			return false;
@@ -4304,7 +4500,6 @@ pgsql_stream_logical(LogicalStreamClient *client, LogicalStreamContext *context)
 		{
 			int pos;
 			bool replyRequested;
-			XLogRecPtr walEnd;
 			bool endposReached = false;
 
 			/*
@@ -4313,12 +4508,18 @@ pgsql_stream_logical(LogicalStreamClient *client, LogicalStreamContext *context)
 			 * rest.
 			 */
 			pos = 1;            /* skip msgtype 'k' */
-			walEnd = fe_recvint64(&copybuf[pos]);
+			cur_record_lsn = fe_recvint64(&copybuf[pos]);
+
+			/*
+			 * Extract WAL location for keepalive messages in case we call
+			 * keepaliveFunction (directly or via flushAndSendFeedback)
+			 */
+			context->cur_record_lsn = cur_record_lsn;
 
 			client->current.written_lsn =
-				Max(walEnd, client->current.written_lsn);
+				Max(cur_record_lsn, client->current.written_lsn);
 
-			pos += 8;           /* read walEnd */
+			pos += 8;           /* read WAL location */
 
 			/* Extract server's system clock at the time of transmission */
 			context->sendTime = fe_recvint64(&copybuf[pos]);
@@ -4332,25 +4533,24 @@ pgsql_stream_logical(LogicalStreamClient *client, LogicalStreamContext *context)
 			}
 			replyRequested = copybuf[pos];
 
-			if (client->endpos != InvalidXLogRecPtr && walEnd >= client->endpos)
+			if (client->endpos != InvalidXLogRecPtr && cur_record_lsn >= client->endpos)
 			{
 				/*
 				 * If there's nothing to read on the socket until a keepalive
 				 * we know that the server has nothing to send us; and if
-				 * walEnd has passed endpos, we know nothing else can have
+				 * cur_record_lsn has passed endpos, we know nothing else can have
 				 * committed before endpos.  So we can bail out now.
 				 */
 				endposReached = true;
 
 				log_debug("pgsql_stream_logical: endpos reached on keepalive: "
 						  "%X/%X",
-						  LSN_FORMAT_ARGS(walEnd));
+						  LSN_FORMAT_ARGS(cur_record_lsn));
 			}
 
 			/* call the keepaliveFunction callback now, ignore errors */
 			if (replyRequested)
 			{
-				context->cur_record_lsn = walEnd;
 				context->now = client->now;
 
 				(void) (*client->keepaliveFunction)(context);
@@ -4548,12 +4748,17 @@ pgsql_stream_log_error(PGSQL *pgsql, PGresult *res, const char *message)
 	}
 	else
 	{
-		char *errorLines[BUFSIZE] = { 0 };
-		int lineCount = splitLines(pqmessage, errorLines, BUFSIZE);
+		LinesBuffer lbuf = { 0 };
 
-		if (lineCount == 1)
+		if (!splitLines(&lbuf, pqmessage))
 		{
-			log_error("%s: %s", message, errorLines[0]);
+			/* errors have already been logged */
+			return;
+		}
+
+		if (lbuf.count == 1)
+		{
+			log_error("%s: %s", message, lbuf.lines[0]);
 		}
 		else
 		{
@@ -4563,9 +4768,9 @@ pgsql_stream_log_error(PGSQL *pgsql, PGresult *res, const char *message)
 			 */
 			log_error("%s:", message);
 
-			for (int lineNumber = 0; lineNumber < lineCount; lineNumber++)
+			for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 			{
-				log_error("%s", errorLines[lineNumber]);
+				log_error("%s", lbuf.lines[lineNumber]);
 			}
 		}
 	}
@@ -4999,7 +5204,6 @@ pgsql_replication_origin_progress(PGSQL *pgsql,
 					  context.strVal,
 					  nodeName,
 					  flush ? "true" : "false");
-			free(context.strVal);
 
 			return false;
 		}
@@ -5088,7 +5292,6 @@ pgsql_replication_slot_exists(PGSQL *pgsql, const char *slotName,
 						  "confirmed_flush_lsn for slot \"%s\"",
 						  context.strVal,
 						  slotName);
-				free(context.strVal);
 
 				return false;
 			}
@@ -5219,26 +5422,34 @@ parseReplicationSlot(void *ctx, PGresult *result)
  */
 bool
 pgsql_table_exists(PGSQL *pgsql,
+				   uint32_t oid,
 				   const char *nspname,
 				   const char *relname,
 				   bool *exists)
 {
-	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_INT, false };
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
 
 	char *existsQuery =
-		"select 1 "
-		"  from pg_class c "
-		"       join pg_namespace n on n.oid = c.relnamespace "
-		" where n.nspname = $1 "
-		"   and c.relname = $2";
+		"select exists( "
+		"         select 1 "
+		"           from pg_class c "
+		"                join pg_namespace n on n.oid = c.relnamespace "
+		"          where c.oid = $1 "
+		"            and format('%I', n.nspname) = $2 "
+		"            and format('%I', c.relname) = $3"
+		"       )";
 
-	int paramCount = 2;
-	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
-	const char *paramValues[2] = { nspname, relname };
+	int paramCount = 3;
+	const Oid paramTypes[3] = { OIDOID, TEXTOID, TEXTOID };
+	const char *paramValues[3] = { 0 };
+
+	paramValues[0] = intToString(oid).strValue;
+	paramValues[1] = nspname;
+	paramValues[2] = relname;
 
 	if (!pgsql_execute_with_params(pgsql, existsQuery,
 								   paramCount, paramTypes, paramValues,
-								   &context, &fetchedRows))
+								   &context, &parseSingleValueResult))
 	{
 		log_error("Failed to check if \"%s\".\"%s\" exists", nspname, relname);
 		return false;
@@ -5254,7 +5465,7 @@ pgsql_table_exists(PGSQL *pgsql,
 	 * If the exists query returns no rows, create our table:
 	 *  pgcopydb.pgcopydb_table_size
 	 */
-	*exists = context.intVal == 1;
+	*exists = context.boolVal;
 
 	return true;
 }
@@ -5296,6 +5507,47 @@ pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists)
 
 
 /*
+ * pgsql_configuration_exists checks that a configuration exists on the
+ * Postgres server.
+ */
+bool
+pgsql_configuration_exists(PGSQL *pgsql, const char *setconfig, bool *exists)
+{
+	char *sql = "select exists(select name from pg_settings WHERE name = $1)";
+
+	char *configName = strdup(setconfig);
+	char *equalsSign = strchr(configName, '=');
+	if (equalsSign != NULL)
+	{
+		*equalsSign = '\0';
+	}
+
+	int paramCount = 1;
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { configName };
+
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	if (!pgsql_execute_with_params(pgsql, sql, paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error(
+			"Failed to check if target database contains the configuration, see above for details");
+		return false;
+	}
+
+	*exists = context.boolVal;
+
+	return true;
+}
+
+
+/*
  * pgsql_current_wal_flush_lsn calls pg_current_wal_flush_lsn().
  */
 bool
@@ -5304,6 +5556,20 @@ pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn)
 	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
 
 	const char *sql = "select pg_current_wal_flush_lsn()";
+
+	/*
+	 * Postgres function pg_current_wal_flush_lsn() has had different names.
+	 */
+	if (pgsql->pgversion_num < 90600)
+	{
+		/* Postgres 9.5 only had that one */
+		sql = "select pg_current_xlog_location()";
+	}
+	else if (pgsql->pgversion_num < 100000)
+	{
+		/* Postgres 9.6 then had that new one */
+		sql = "select pg_current_xlog_flush_location()";
+	}
 
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 								   &context, &parseSingleValueResult))
@@ -5324,12 +5590,9 @@ pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn)
 			log_error("Failed to parse LSN \"%s\" returned from "
 					  "pg_current_wal_flush_lsn()",
 					  context.strVal);
-			free(context.strVal);
 
 			return false;
 		}
-
-		free(context.strVal);
 	}
 
 	return true;
@@ -5345,6 +5608,20 @@ pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn)
 	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
 
 	const char *sql = "select pg_current_wal_insert_lsn()";
+
+	/*
+	 * Postgres function pg_current_wal_insert_lsn() has had different names.
+	 */
+	if (pgsql->pgversion_num < 100000)
+	{
+		/* Postgres 9.5 and 9.6 had that function name */
+		sql = "select pg_current_xlog_insert_location()";
+	}
+	else if (pgsql->pgversion_num < 110000)
+	{
+		/* Postgres 10 had that function name (now returned pg_lsn) */
+		sql = "select pg_current_wal_insert_lsn()";
+	}
 
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
 								   &context, &parseSingleValueResult))
@@ -5365,12 +5642,9 @@ pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn)
 			log_error("Failed to parse LSN \"%s\" returned from "
 					  "pg_current_wal_insert_lsn()",
 					  context.strVal);
-			free(context.strVal);
 
 			return false;
 		}
-
-		free(context.strVal);
 	}
 
 	return true;
@@ -5378,433 +5652,50 @@ pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn)
 
 
 /*
- * pgsql_update_sentinel_startpos updates our pgcopydb sentinel table start pos.
+ * pgsql_escape_identifier escapes PostgreSQL identifiers and always encloses
+ * the resulting string in quotes. It utilizes the PQescapeIdentifier function
+ * (https://www.postgresql.org/docs/current/libpq-exec.html#LIBPQ-PQESCAPEIDENTIFIER).
  */
-bool
-pgsql_update_sentinel_startpos(PGSQL *pgsql, uint64_t startpos)
+char *
+pgsql_escape_identifier(PGSQL *pgsql, char *src)
 {
-	char *update = "update pgcopydb.sentinel set startpos = $1";
-
-	char startLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-	sformat(startLSN, sizeof(startLSN), "%X/%X", LSN_FORMAT_ARGS(startpos));
-
-	int paramCount = 1;
-	Oid paramTypes[1] = { LSNOID };
-	const char *paramValues[1] = { startLSN };
-
-	if (!pgsql_execute_with_params(pgsql, update,
-								   paramCount, paramTypes, paramValues,
-								   NULL, NULL))
+	PGconn *conn = pgsql->connection;
+	if (conn == NULL)
 	{
-		log_error("Failed to update pgcopydb.sentinel startpos to %X/%X",
-				  LSN_FORMAT_ARGS(startpos));
-		return false;
+		return NULL;
 	}
 
-	return true;
-}
+	char *escapedIdentifier = PQescapeIdentifier(conn, src, strlen(src));
 
-
-/*
- * pgsql_update_sentinel_endpos updates our pgcopydb sentinel table end pos.
- */
-bool
-pgsql_update_sentinel_endpos(PGSQL *pgsql, bool current, uint64_t endpos)
-{
-	if (current)
+	if (escapedIdentifier == NULL)
 	{
-		char *updateTmpl = "update pgcopydb.sentinel set endpos = %s()";
-		char update[BUFSIZE] = { 0 };
-		char *fn = "pg_current_wal_flush_lsn";
-
-		if (pgsql->pgversion_num < 90600)
-		{
-			/* Postgres 9.5 only had that one */
-			fn = "pg_current_xlog_location";
-		}
-		else if (pgsql->pgversion_num < 100000)
-		{
-			/* Postgres 9.6 then had that new one */
-			fn = "pg_current_xlog_flush_location";
-		}
-
-		sformat(update, sizeof(update), updateTmpl, fn);
-
-		if (!pgsql_execute(pgsql, update))
-		{
-			log_error("Failed to update pgcopydb.sentinel endpos to %X/%X",
-					  LSN_FORMAT_ARGS(endpos));
-			return false;
-		}
-	}
-	else
-	{
-		/* use endpos parameter */
-		char *update = "update pgcopydb.sentinel set endpos = $1";
-
-		char endLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-		sformat(endLSN, sizeof(endLSN), "%X/%X", LSN_FORMAT_ARGS(endpos));
-
-		int paramCount = 1;
-		Oid paramTypes[1] = { LSNOID };
-		const char *paramValues[1] = { endLSN };
-
-		if (!pgsql_execute_with_params(pgsql, update,
-									   paramCount, paramTypes, paramValues,
-									   NULL, NULL))
-		{
-			log_error("Failed to update pgcopydb.sentinel endpos to %X/%X",
-					  LSN_FORMAT_ARGS(endpos));
-			return false;
-		}
+		log_error("Failed to escape identifier %s", src);
+		return NULL;
 	}
 
-	return true;
-}
+	/*
+	 * The PQescapeIdentifier function returns a string that is allocated
+	 * using C's malloc. However, we use libgc to manage memory with in
+	 * pgcopydb, so we need to copy the string into a new memory location
+	 * that is managed by libgc.
+	 *
+	 * Please note that the below strdup is a macro that uses libgc's
+	 * GC_strdup function which is defined in defaults.h.
+	 */
+	char *escapedIdentifierCopy = strdup(escapedIdentifier);
 
-
-/*
- * pgsql_update_sentinel_apply updates our pgcopydb sentinel table apply mode.
- */
-bool
-pgsql_update_sentinel_apply(PGSQL *pgsql, bool apply)
-{
-	char *update = "update pgcopydb.sentinel set apply = $1";
-
-	int paramCount = 1;
-	Oid paramTypes[1] = { BOOLOID };
-	const char *paramValues[1] = { apply ? "true" : "false" };
-
-	if (!pgsql_execute_with_params(pgsql, update,
-								   paramCount, paramTypes, paramValues,
-								   NULL, NULL))
+	if (escapedIdentifierCopy == NULL)
 	{
-		log_error("Failed to update pgcopydb.sentinel apply mode to %s",
-				  apply ? "true" : "false");
-		return false;
+		log_error("Failed to allocate memory for escaped identifier %s",
+				  escapedIdentifier);
+		return NULL;
 	}
 
-	return true;
-}
-
-
-/*
- * Use the same structure in three different contexts, so have all the fields
- * defined and ready to get used.
- */
-typedef struct SentinelContext
-{
-	char sqlstate[SQLSTATE_LENGTH];
-
-	char startLSN[PG_LSN_MAXLENGTH];
-	char endLSN[PG_LSN_MAXLENGTH];
-
-	char writeLSN[PG_LSN_MAXLENGTH];
-	char flushLSN[PG_LSN_MAXLENGTH];
-	char replayLSN[PG_LSN_MAXLENGTH];
-
-	uint64_t startpos;
-	uint64_t endpos;
-
-	uint64_t write_lsn;
-	uint64_t flush_lsn;
-	uint64_t replay_lsn;
-
-	bool apply;
-	bool parsedOK;
-} SentinelContext;
-
-
-/*
- * pgsql_get_sentinel fetches current sentinel values from the source database.
- */
-bool
-pgsql_get_sentinel(PGSQL *pgsql, CopyDBSentinel *sentinel)
-{
-	SentinelContext context = { 0 };
-
-	char *sql =
-		"select startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn "
-		"  from pgcopydb.sentinel";
-
-	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
-								   &context, &parseSentinel))
-	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
-		return false;
-	}
-
-	if (!context.parsedOK)
-	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
-		return false;
-	}
-
-	sentinel->apply = context.apply;
-	sentinel->startpos = context.startpos;
-	sentinel->endpos = context.endpos;
-
-	sentinel->write_lsn = context.write_lsn;
-	sentinel->flush_lsn = context.flush_lsn;
-	sentinel->replay_lsn = context.replay_lsn;
-
-	log_debug("pgsql_get_sentinel: replay_lsn %X/%X",
-			  LSN_FORMAT_ARGS(sentinel->replay_lsn));
-
-	return true;
-}
-
-
-/*
- * pgsql_sync_sentinel_recv updates the current sentinel values for write_lsn
- * and flush_lsn, and fetches the current value for replay_lsn, endpos, and
- * apply.
- */
-bool
-pgsql_sync_sentinel_recv(PGSQL *pgsql,
-						 uint64_t write_lsn, uint64_t flush_lsn,
-						 CopyDBSentinel *sentinel)
-{
-	SentinelContext context = { 0 };
-
-	char *sql =
-		"update pgcopydb.sentinel "
-		"set startpos = $2, write_lsn = $1, flush_lsn = $2 "
-		"returning startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn";
-
-	char writeLSN[PG_LSN_MAXLENGTH] = { 0 };
-	char flushLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-	sformat(writeLSN, sizeof(writeLSN), "%X/%X", LSN_FORMAT_ARGS(write_lsn));
-	sformat(flushLSN, sizeof(flushLSN), "%X/%X", LSN_FORMAT_ARGS(flush_lsn));
-
-	int paramCount = 2;
-	Oid paramTypes[2] = { LSNOID, LSNOID };
-	const char *paramValues[2] = { writeLSN, flushLSN };
-
-	if (!pgsql_execute_with_params(pgsql, sql,
-								   paramCount, paramTypes, paramValues,
-								   &context, &parseSentinel))
-	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
-		return false;
-	}
-
-	if (!context.parsedOK)
-	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
-		return false;
-	}
-
-	sentinel->apply = context.apply;
-	sentinel->startpos = context.startpos;
-	sentinel->endpos = context.endpos;
-
-	sentinel->write_lsn = context.write_lsn;
-	sentinel->flush_lsn = context.flush_lsn;
-	sentinel->replay_lsn = context.replay_lsn;
-
-	return true;
-}
-
-
-/*
- * pgsql_sync_sentinel_apply updates the current sentinel values for
- * replay_lsn, and fetches the current value for endpos and apply.
- */
-bool
-pgsql_sync_sentinel_apply(PGSQL *pgsql,
-						  uint64_t replay_lsn,
-						  CopyDBSentinel *sentinel)
-{
-	SentinelContext context = { 0 };
-
-	char *sql =
-		"update pgcopydb.sentinel "
-		"set replay_lsn = $1 "
-		"returning startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn";
-
-	char replayLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-	sformat(replayLSN, sizeof(replayLSN), "%X/%X", LSN_FORMAT_ARGS(replay_lsn));
-
-	int paramCount = 1;
-	Oid paramTypes[1] = { LSNOID };
-	const char *paramValues[1] = { replayLSN };
-
-	if (!pgsql_execute_with_params(pgsql, sql,
-								   paramCount, paramTypes, paramValues,
-								   &context, &parseSentinel))
-	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
-		return false;
-	}
-
-	if (!context.parsedOK)
-	{
-		log_error("Failed to fetch pgcopydb.sentinel current values");
-		return false;
-	}
-
-	sentinel->apply = context.apply;
-	sentinel->startpos = context.startpos;
-	sentinel->endpos = context.endpos;
-
-	sentinel->write_lsn = context.write_lsn;
-	sentinel->flush_lsn = context.flush_lsn;
-	sentinel->replay_lsn = context.replay_lsn;
-
-	return true;
-}
-
-
-/*
- * pgsql_send_sync_sentinel_apply sends a query to update the current sentinel
- * values for replay_lsn, and uses libpq async API to do that. Use the
- * associated function pgsql_fetch_sync_sentinel_apply to make sure the query
- * has been sent and fetch the current value for endpos and apply.
- */
-bool
-pgsql_send_sync_sentinel_apply(PGSQL *pgsql, uint64_t replay_lsn)
-{
-	char *sql =
-		"update pgcopydb.sentinel "
-		"set replay_lsn = $1 "
-		"returning startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn";
-
-	char replayLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-	sformat(replayLSN, sizeof(replayLSN), "%X/%X", LSN_FORMAT_ARGS(replay_lsn));
-
-	int paramCount = 1;
-	Oid paramTypes[1] = { LSNOID };
-	const char *paramValues[1] = { replayLSN };
-
-	if (!pgsql_send_with_params(pgsql, sql, paramCount, paramTypes, paramValues))
-	{
-		log_error("Failed to send pgcopydb.sentinel sync query");
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * pgsql_fetch_sync_sentinel_apply checks to see if results are available for
- * the pgsql_send_sync_sentinel_apply query that has been sent for async
- * processing on the server, and updates the given sentinel when the result is
- * ready.
- */
-bool
-pgsql_fetch_sync_sentinel_apply(PGSQL *pgsql,
-								bool *retry,
-								CopyDBSentinel *sentinel)
-{
-	bool done = false;
-	SentinelContext context = { 0 };
-
-	if (!pgsql_fetch_results(pgsql, &done, &context, &parseSentinel))
-	{
-		log_error("Failed to fetch sync sentinel results");
-		return false;
-	}
-
-	if (done)
-	{
-		*retry = false;
-
-		sentinel->apply = context.apply;
-		sentinel->startpos = context.startpos;
-		sentinel->endpos = context.endpos;
-
-		sentinel->write_lsn = context.write_lsn;
-		sentinel->flush_lsn = context.flush_lsn;
-		sentinel->replay_lsn = context.replay_lsn;
-
-		return true;
-	}
-	else
-	{
-		*retry = true;
-	}
-
-	return true;
-}
-
-
-/*
- * parseSentinel parses the result from a PostgreSQL query that fetches the
- * sentinel values for startpos, endpos, and apply.
- */
-static void
-parseSentinel(void *ctx, PGresult *result)
-{
-	SentinelContext *context = (SentinelContext *) ctx;
-
-	if (PQnfields(result) != 6)
-	{
-		log_error("Query returned %d columns, expected 6", PQnfields(result));
-		context->parsedOK = false;
-		return;
-	}
-
-	if (PQntuples(result) != 1)
-	{
-		log_error("Query returned %d rows, expected 1", PQntuples(result));
-		context->parsedOK = false;
-		return;
-	}
-
-	char *value = PQgetvalue(result, 0, 0);
-	strlcpy(context->startLSN, value, sizeof(context->startLSN));
-
-	if (!parseLSN(context->startLSN, &(context->startpos)))
-	{
-		log_error("Failed to parse sentinel start LSN %s", context->startLSN);
-		context->parsedOK = false;
-	}
-
-	value = PQgetvalue(result, 0, 1);
-	strlcpy(context->endLSN, value, sizeof(context->endLSN));
-
-	if (!parseLSN(context->endLSN, &(context->endpos)))
-	{
-		log_error("Failed to parse sentinel end LSN %s", context->endLSN);
-		context->parsedOK = false;
-	}
-
-	value = PQgetvalue(result, 0, 2);
-	context->apply = strcmp(value, "t") == 0;
-
-	value = PQgetvalue(result, 0, 3);
-	strlcpy(context->writeLSN, value, sizeof(context->writeLSN));
-
-	if (!parseLSN(context->writeLSN, &(context->write_lsn)))
-	{
-		log_error("Failed to parse sentinel end LSN %s", context->writeLSN);
-		context->parsedOK = false;
-	}
-
-	value = PQgetvalue(result, 0, 4);
-	strlcpy(context->flushLSN, value, sizeof(context->flushLSN));
-
-	if (!parseLSN(context->flushLSN, &(context->flush_lsn)))
-	{
-		log_error("Failed to parse sentinel end LSN %s", context->flushLSN);
-		context->parsedOK = false;
-	}
-
-	value = PQgetvalue(result, 0, 5);
-	strlcpy(context->replayLSN, value, sizeof(context->replayLSN));
-
-	if (!parseLSN(context->replayLSN, &(context->replay_lsn)))
-	{
-		log_error("Failed to parse sentinel end LSN %s", context->replayLSN);
-		context->parsedOK = false;
-	}
-
-	context->parsedOK = true;
+	/*
+	 * Free escapedIdentifier as we already copied the string into a memory
+	 * location managed by libgc.
+	 */
+	PQfreemem(escapedIdentifier);
+
+	return escapedIdentifierCopy;
 }

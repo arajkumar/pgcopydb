@@ -187,6 +187,8 @@ typedef struct RestoreOptions
 	bool noOwner;
 	bool noComments;
 	bool noACL;
+	bool noTableSpaces;
+	int jobs;
 } RestoreOptions;
 
 bool psql_version(PostgresPaths *pgPaths);
@@ -202,7 +204,7 @@ bool pg_dump_db(PostgresPaths *pgPaths,
 				const char *snapshot,
 				const char *section,
 				SourceFilters *filters,
-				SourceExtensionArray *extensionArray,
+				DatabaseCatalog *filtersDB,
 				const char *filename);
 
 bool pg_dumpall_roles(PostgresPaths *pgPaths,
@@ -238,7 +240,5 @@ bool parse_archive_extension(char *ptr, ArchiveContentItem *item);
 
 bool parse_archive_list_entry(ArchiveContentItem *item, const char *line);
 bool tokenize_archive_list_entry(ArchiveToken *token);
-
-bool FreeArchiveContentArray(ArchiveContentArray *contents);
 
 #endif /* PGCMD_H */

@@ -35,7 +35,6 @@
 static bool updateStreamCounters(StreamContext *context,
 								 LogicalMessageMetadata *metadata);
 
-
 /*
  * stream_init_specs initializes Change Data Capture streaming specifications
  * from a copyDBSpecs structure.
@@ -48,7 +47,7 @@ stream_init_specs(StreamSpecs *specs,
 				  char *origin,
 				  uint64_t endpos,
 				  LogicalStreamMode mode,
-				  SourceCatalog *catalog,
+				  DatabaseCatalog *sourceDB,
 				  bool stdin,
 				  bool stdout,
 				  bool logSQL)
@@ -62,7 +61,16 @@ stream_init_specs(StreamSpecs *specs,
 	specs->paths = *paths;
 	specs->endpos = endpos;
 
-	specs->catalog = catalog;
+	/*
+	 * Open the specified sourceDB catalog.
+	 */
+	specs->sourceDB = sourceDB;
+
+	if (!catalog_init(specs->sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	/*
 	 * Copy the given ReplicationSlot: it comes from command line parsing, or
@@ -92,14 +100,16 @@ stream_init_specs(StreamSpecs *specs,
 		case STREAM_PLUGIN_WAL2JSON:
 		{
 			KeyVal options = {
-				.count = 6,
+				/* we ignore the last keyword and value if the option is not set */
+				.count = specs->slot.wal2jsonNumericAsString ? 7 : 6,
 				.keywords = {
 					"format-version",
 					"include-xids",
 					"include-schemas",
 					"include-transaction",
 					"include-types",
-					"filter-tables"
+					"filter-tables",
+					"numeric-data-types-as-string"
 				},
 				.values = {
 					"2",
@@ -107,12 +117,12 @@ stream_init_specs(StreamSpecs *specs,
 					"true",
 					"true",
 					"true",
-					"pgcopydb.*"
+					"pgcopydb.*",
+					"true"
 				}
 			};
 
 			specs->pluginOptions = options;
-
 			break;
 		}
 
@@ -397,7 +407,7 @@ stream_init_context(StreamSpecs *specs)
 	privateContext->maxWrittenLSN = specs->startpos;
 
 	/* transform needs some catalog lookups (pkey, type oid) */
-	privateContext->catalog = specs->catalog;
+	privateContext->sourceDB = specs->sourceDB;
 
 	return true;
 }
@@ -578,17 +588,9 @@ streamCheckResumePosition(StreamSpecs *specs)
 	 * command line option (found in specs->endpos) prevails, but when it's not
 	 * been used, we have a look at the sentinel value.
 	 */
-	PGSQL src = { 0 };
-
-	if (!pgsql_init(&src, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	CopyDBSentinel sentinel = { 0 };
 
-	if (!pgsql_get_sentinel(&src, &sentinel))
+	if (!sentinel_get(specs->sourceDB, &sentinel))
 	{
 		/* errors have already been logged */
 		return false;
@@ -609,7 +611,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 					 LSN_FORMAT_ARGS(specs->endpos));
 		}
 
-		if (!pgsql_update_sentinel_endpos(&src, false, specs->endpos))
+		if (!sentinel_update_endpos(specs->sourceDB, specs->endpos))
 		{
 			/* errors have already been logged */
 			return false;
@@ -622,7 +624,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 				 LSN_FORMAT_ARGS(specs->endpos));
 	}
 
-	if (latestStreamedContent.count == 0)
+	if (latestStreamedContent.lbuf.count == 0)
 	{
 		if (specs->mode == STREAM_MODE_RECEIVE)
 		{
@@ -642,7 +644,7 @@ streamCheckResumePosition(StreamSpecs *specs)
 	else
 	{
 		/* lines are counted starting at zero */
-		int lastLineNb = latestStreamedContent.count - 1;
+		int lastLineNb = latestStreamedContent.lbuf.count - 1;
 
 		LogicalMessageMetadata *messages = latestStreamedContent.messages;
 		LogicalMessageMetadata *latest = &(messages[lastLineNb]);
@@ -654,8 +656,16 @@ streamCheckResumePosition(StreamSpecs *specs)
 				 LSN_FORMAT_ARGS(specs->startpos),
 				 latestStreamedContent.filename);
 
-		char *latestMessage = latestStreamedContent.lines[lastLineNb];
+		char *latestMessage = latestStreamedContent.lbuf.lines[lastLineNb];
 		log_notice("Resume replication from latest message: %s", latestMessage);
+	}
+
+	PGSQL src = { 0 };
+
+	if (!pgsql_init(&src, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
+	{
+		/* errors have already been logged */
+		return false;
 	}
 
 	bool flush = false;
@@ -879,7 +889,6 @@ stream_write_json(LogicalStreamContext *context, bool previous)
 	}
 
 	destroyPQExpBuffer(buffer);
-	free(metadata->jsonBuffer);
 
 	/*
 	 * Maintain the transaction progress based on the BEGIN and COMMIT messages
@@ -893,6 +902,7 @@ stream_write_json(LogicalStreamContext *context, bool previous)
 	{
 		privateContext->transactionInProgress = false;
 	}
+
 	/*
 	 * We are not expecting STREAM_ACTION_ROLLBACK here. It's a custom
 	 * message we write directly to the "latest" file using
@@ -1393,12 +1403,6 @@ streamFlush(LogicalStreamContext *context)
 {
 	StreamContext *privateContext = (StreamContext *) context->private;
 
-	/* when there is currently no file opened, just skip the flush operation */
-	if (privateContext->jsonFile == NULL)
-	{
-		return true;
-	}
-
 	log_debug("streamFlush: %X/%X %X/%X",
 			  LSN_FORMAT_ARGS(context->tracking->written_lsn),
 			  LSN_FORMAT_ARGS(context->cur_record_lsn));
@@ -1418,6 +1422,10 @@ streamFlush(LogicalStreamContext *context)
 			return false;
 		}
 
+		/*
+		 * streamKeepalive ensures we have a valid jsonFile by calling
+		 * streamRotateFile, so we can safely call fsync here.
+		 */
 		int fd = fileno(privateContext->jsonFile);
 
 		if (fsync(fd) != 0)
@@ -1434,6 +1442,12 @@ streamFlush(LogicalStreamContext *context)
 				  privateContext->partialFileName);
 	}
 
+	/* at flush time also update our internal sentinel tracking */
+	if (!stream_sync_sentinel(context))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 	return true;
 }
 
@@ -1529,14 +1543,12 @@ streamClose(LogicalStreamContext *context)
  *
  * This function is called when it's time to send feedback to the source
  * Postgres instance, include write_lsn, flush_lsn, and replay_lsn. Once in a
- * while we fetch the replay_lsn from the pgcopydb sentinel table on the source
- * database, and sync with the current progress.
+ * while we fetch the replay_lsn from the pgcopydb sentinel table and sync with
+ * the current progress.
  */
 bool
 streamFeedback(LogicalStreamContext *context)
 {
-	StreamContext *privateContext = (StreamContext *) context->private;
-
 	int feedbackInterval = 1 * 1000; /* 1s */
 
 	if (!context->forceFeedback)
@@ -1549,23 +1561,36 @@ streamFeedback(LogicalStreamContext *context)
 		}
 	}
 
-	PGSQL src = { 0 };
-	char *pguri = privateContext->connStrings->source_pguri;
-
-	if (!pgsql_init(&src, pguri, PGSQL_CONN_SOURCE))
+	if (!stream_sync_sentinel(context))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
+	/* mark that we just did a feedback sync */
+	context->lastFeedbackSync = context->now;
+
+	return true;
+}
+
+
+/*
+ * stream_sync_sentinel syncs the sentinel values in our internal catalogs with
+ * the current streaming protocol values.
+ */
+bool
+stream_sync_sentinel(LogicalStreamContext *context)
+{
+	StreamContext *privateContext = (StreamContext *) context->private;
 	CopyDBSentinel sentinel = { 0 };
 
-	if (!pgsql_sync_sentinel_recv(&src,
-								  context->tracking->written_lsn,
-								  context->tracking->flushed_lsn,
-								  &sentinel))
+	if (!sentinel_sync_recv(privateContext->sourceDB,
+							context->tracking->written_lsn,
+							context->tracking->flushed_lsn,
+							&sentinel))
 	{
-		/* errors have already been logged */
+		log_error("Failed to update sentinel at stream flush time, "
+				  "see above for details");
 		return false;
 	}
 
@@ -1580,10 +1605,9 @@ streamFeedback(LogicalStreamContext *context)
 	context->endpos = sentinel.endpos;
 	context->tracking->applied_lsn = sentinel.replay_lsn;
 
-	context->lastFeedbackSync = context->now;
-
-	log_debug("streamFeedback: written %X/%X flushed %X/%X applied %X/%X "
-			  " startpos %X/%X endpos %X/%X apply %s",
+	log_debug("stream_sync_sentinel: "
+			  "write_lsn %X/%X flush_lsn %X/%X apply_lsn %X/%X "
+			  "startpos %X/%X endpos %X/%X apply %s",
 			  LSN_FORMAT_ARGS(context->tracking->written_lsn),
 			  LSN_FORMAT_ARGS(context->tracking->flushed_lsn),
 			  LSN_FORMAT_ARGS(context->tracking->applied_lsn),
@@ -1909,8 +1933,8 @@ parseMessageMetadata(LogicalMessageMetadata *metadata,
 			if (strlcpy(metadata->timestamp, timestamp, n) >= n)
 			{
 				log_error("Failed to parse JSON message timestamp value \"%s\" "
-						  "which is %lu bytes long, "
-						  "pgcopydb only support timestamps up to %lu bytes",
+						  "which is %zu bytes long, "
+						  "pgcopydb only support timestamps up to %zu bytes",
 						  timestamp,
 						  strlen(timestamp),
 						  sizeof(metadata->timestamp));
@@ -1932,25 +1956,31 @@ bool
 stream_read_file(StreamContent *content)
 {
 	long size = 0L;
+	char *contents = NULL;
 
-	if (!read_file(content->filename, &(content->buffer), &size))
+	if (!read_file(content->filename, &contents, &size))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	content->count = countLines(content->buffer);
-	content->lines = (char **) calloc(content->count, sizeof(char *));
-	content->count = splitLines(content->buffer, content->lines, content->count);
-
-	if (content->lines == NULL)
+	if (!splitLines(&(content->lbuf), contents))
 	{
-		log_error(ALLOCATION_FAILED_ERROR);
+		/* errors have already been logged */
 		return false;
 	}
 
+	/*
+	 * If the file contains zero lines, we're done already, Also malloc(zero)
+	 * leads to "corrupted size vs. prev_size" run-time errors.
+	 */
+	if (content->lbuf.count == 0)
+	{
+		return true;
+	}
+
 	content->messages =
-		(LogicalMessageMetadata *) calloc(content->count,
+		(LogicalMessageMetadata *) calloc(content->lbuf.count,
 										  sizeof(LogicalMessageMetadata));
 
 	if (content->messages == NULL)
@@ -1959,9 +1989,9 @@ stream_read_file(StreamContent *content)
 		return false;
 	}
 
-	for (int i = 0; i < content->count; i++)
+	for (uint64_t i = 0; i < content->lbuf.count; i++)
 	{
-		char *message = content->lines[i];
+		char *message = content->lbuf.lines[i];
 		LogicalMessageMetadata *metadata = &(content->messages[i]);
 
 		JSON_Value *json = json_parse_string(message);
@@ -1969,11 +1999,8 @@ stream_read_file(StreamContent *content)
 		if (!parseMessageMetadata(metadata, message, json, false))
 		{
 			/* errors have already been logged */
-			json_value_free(json);
 			return false;
 		}
-
-		json_value_free(json);
 	}
 
 	return true;
@@ -2136,11 +2163,9 @@ buildReplicationURI(const char *pguri, char **repl_pguri)
 	if (!buildPostgresURIfromPieces(&params, repl_pguri))
 	{
 		log_error("Failed to produce the replication connection string");
-		freeURIParams(&params);
 		return false;
 	}
 
-	freeURIParams(&params);
 	return true;
 }
 
@@ -2521,78 +2546,67 @@ stream_create_sentinel(CopyDataSpec *copySpecs,
 		return true;
 	}
 
-	char *sql[] = {
-		"create schema if not exists pgcopydb",
-		"drop table if exists pgcopydb.sentinel",
-		"create table pgcopydb.sentinel"
-		"(startpos pg_lsn, endpos pg_lsn, apply bool, "
-		" write_lsn pg_lsn, flush_lsn pg_lsn, replay_lsn pg_lsn)",
-		NULL
-	};
+	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
 
-	char *index = "create unique index on pgcopydb.sentinel((1))";
+	if (!sentinel_setup(sourceDB, startpos, endpos))
+	{
+		log_error("Failed to create the sentinel table, see above for details");
+		return false;
+	}
 
-	PGSQL *pgsql = &(copySpecs->sourceSnapshot.pgsql);
+	return true;
+}
 
-	if (!pgsql_init(pgsql, copySpecs->connStrings.source_pguri, PGSQL_CONN_SOURCE))
+
+/*
+ * stream_fetch_current_source_lsn connects to the given Postgres service and
+ * fetches the current WAL LSN position by calling pg_current_wal_flush_lsn
+ * there, or the variant of that function that is supported by this Postgres
+ * version.
+ */
+bool
+stream_fetch_current_lsn(uint64_t *lsn,
+						 const char *pguri,
+						 ConnectionType connectionType)
+{
+	PGSQL src = { 0 };
+
+	if (!pgsql_init(&src, (char *) pguri, connectionType))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!pgsql_begin(pgsql))
+	/* limit the amount of logging of the apply process */
+	src.logSQL = false;
+
+	uint64_t flushLSN = InvalidXLogRecPtr;
+
+	if (!pgsql_begin(&src))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	/* create the schema and the table for pgcopydb.sentinel */
-	for (int i = 0; sql[i] != NULL; i++)
-	{
-		log_info("%s", sql[i]);
-
-		if (!pgsql_execute(pgsql, sql[i]))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-	}
-
-	/* now insert the sentinel values (startpos, endpos, false as apply) */
-	char *insert =
-		"insert into pgcopydb.sentinel "
-		"(startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn) "
-		"values($1, $2, $3, '0/0', '0/0', '0/0')";
-
-	char startLSN[PG_LSN_MAXLENGTH] = { 0 };
-	char endLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-	sformat(startLSN, sizeof(startLSN), "%X/%X", LSN_FORMAT_ARGS(startpos));
-	sformat(endLSN, sizeof(endLSN), "%X/%X", LSN_FORMAT_ARGS(endpos));
-
-	int paramCount = 3;
-	Oid paramTypes[3] = { LSNOID, LSNOID, BOOLOID };
-	const char *paramValues[3] = { startLSN, endLSN, "false" };
-
-	if (!pgsql_execute_with_params(pgsql, insert,
-								   paramCount, paramTypes, paramValues,
-								   NULL, NULL))
+	if (!pgsql_server_version(&src))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!pgsql_execute(pgsql, index))
+	if (!pgsql_current_wal_flush_lsn(&src, &flushLSN))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	if (!pgsql_commit(pgsql))
+	if (!pgsql_commit(&src))
 	{
 		/* errors have already been logged */
 		return false;
 	}
+
+	*lsn = flushLSN;
 
 	return true;
 }
@@ -2764,33 +2778,21 @@ stream_read_context(CDCPaths *paths,
 	if (!stringToUInt(wal_segment_size, WalSegSz))
 	{
 		/* errors have already been logged */
-		free(wal_segment_size);
-		free(tli);
-		free(history);
 		return false;
 	}
 
 	if (!stringToUInt(tli, &(system->timeline)))
 	{
 		/* errors have already been logged */
-		free(wal_segment_size);
-		free(tli);
-		free(history);
 		return false;
 	}
 
 	if (!parseTimeLineHistory(paths->tlihistfile, history, system))
 	{
 		/* errors have already been logged */
-		free(wal_segment_size);
-		free(tli);
-		free(history);
 		return false;
 	}
 
-	free(wal_segment_size);
-	free(tli);
-	free(history);
 
 	return true;
 }

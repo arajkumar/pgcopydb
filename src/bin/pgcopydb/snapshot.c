@@ -262,6 +262,21 @@ copydb_close_snapshot(CopyDataSpec *copySpecs)
 bool
 copydb_prepare_snapshot(CopyDataSpec *copySpecs)
 {
+	/*
+	 * Allow this function to be called within a context where a snapshot has
+	 * already been prepared. Typically copydb_fetch_schema_and_prepare_specs
+	 * needs to prepare the snapshot, but some higher-level functions already
+	 * did.
+	 */
+	if (copySpecs->sourceSnapshot.state != SNAPSHOT_STATE_UNKNOWN &&
+		copySpecs->sourceSnapshot.state != SNAPSHOT_STATE_CLOSED)
+	{
+		log_debug("copydb_prepare_snapshot: snapshot \"%s\" already prepared, "
+				  "skipping",
+				  copySpecs->sourceSnapshot.snapshot);
+		return true;
+	}
+
 	/* when --not-consistent is used, we have nothing to do here */
 	if (!copySpecs->consistent)
 	{
@@ -300,18 +315,21 @@ copydb_prepare_snapshot(CopyDataSpec *copySpecs)
 	}
 
 	/* store the snapshot in a file, to support --resume --snapshot ... */
-	if (!write_file(sourceSnapshot->snapshot,
-					strlen(sourceSnapshot->snapshot),
-					copySpecs->cfPaths.snfile))
+	if (!file_exists(copySpecs->cfPaths.snfile))
 	{
-		log_fatal("Failed to create the snapshot file \"%s\"",
-				  copySpecs->cfPaths.snfile);
-		return false;
-	}
+		if (!write_file(sourceSnapshot->snapshot,
+						strlen(sourceSnapshot->snapshot),
+						copySpecs->cfPaths.snfile))
+		{
+			log_fatal("Failed to create the snapshot file \"%s\"",
+					  copySpecs->cfPaths.snfile);
+			return false;
+		}
 
-	log_notice("Wrote snapshot \"%s\" to file \"%s\"",
-			   sourceSnapshot->snapshot,
-			   copySpecs->cfPaths.snfile);
+		log_notice("Wrote snapshot \"%s\" to file \"%s\"",
+				   sourceSnapshot->snapshot,
+				   copySpecs->cfPaths.snfile);
+	}
 
 	return true;
 }
@@ -448,6 +466,7 @@ snapshot_write_slot(const char *filename, ReplicationSlot *slot)
 	appendPQExpBuffer(contents, "%X/%X\n", LSN_FORMAT_ARGS(slot->lsn));
 	appendPQExpBuffer(contents, "%s\n", slot->snapshot);
 	appendPQExpBuffer(contents, "%s\n", OutputPluginToString(slot->plugin));
+	appendPQExpBuffer(contents, "%s\n", boolToString(slot->wal2jsonNumericAsString));
 
 	if (PQExpBufferBroken(contents))
 	{
@@ -487,69 +506,80 @@ snapshot_read_slot(const char *filename, ReplicationSlot *slot)
 	}
 
 	/* make sure to use only the first line of the file, without \n */
-	char *lines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(contents, lines, BUFSIZE);
+	LinesBuffer lbuf = { 0 };
 
-	if (lineCount != 4)
+	if (!splitLines(&lbuf, contents))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (lbuf.count != 5)
 	{
 		log_error("Failed to parse replication slot file \"%s\"", filename);
-		free(contents);
 		return false;
 	}
 
 	/* 1. slotName */
-	int length = strlcpy(slot->slotName, lines[0], sizeof(slot->slotName));
+	int length = strlcpy(slot->slotName, lbuf.lines[0], sizeof(slot->slotName));
 
 	if (length >= sizeof(slot->slotName))
 	{
 		log_error("Failed to read replication slot name \"%s\" from file \"%s\", "
 				  "length is %lld bytes which exceeds maximum %lld bytes",
-				  lines[0],
+				  lbuf.lines[0],
 				  filename,
-				  (long long) strlen(lines[0]),
+				  (long long) strlen(lbuf.lines[0]),
 				  (long long) sizeof(slot->slotName));
-		free(contents);
 		return false;
 	}
 
 	/* 2. LSN (consistent_point) */
-	if (!parseLSN(lines[1], &(slot->lsn)))
+	if (!parseLSN(lbuf.lines[1], &(slot->lsn)))
 	{
 		log_error("Failed to parse LSN \"%s\" from file \"%s\"",
-				  lines[1],
+				  lbuf.lines[1],
 				  filename);
-		free(contents);
 		return false;
 	}
 
 	/* 3. snapshot */
-	length = strlcpy(slot->snapshot, lines[2], sizeof(slot->snapshot));
+	length = strlcpy(slot->snapshot, lbuf.lines[2], sizeof(slot->snapshot));
 
 	if (length >= sizeof(slot->snapshot))
 	{
 		log_error("Failed to read replication snapshot \"%s\" from file \"%s\", "
 				  "length is %lld bytes which exceeds maximum %lld bytes",
-				  lines[2],
+				  lbuf.lines[2],
 				  filename,
-				  (long long) strlen(lines[2]),
+				  (long long) strlen(lbuf.lines[2]),
 				  (long long) sizeof(slot->snapshot));
-		free(contents);
 		return false;
 	}
 
 	/* 4. plugin */
-	slot->plugin = OutputPluginFromString(lines[3]);
+	slot->plugin = OutputPluginFromString(lbuf.lines[3]);
 
 	if (slot->plugin == STREAM_PLUGIN_UNKNOWN)
 	{
 		log_error("Failed to read plugin \"%s\" from file \"%s\"",
-				  lines[3],
+				  lbuf.lines[3],
 				  filename);
-		free(contents);
 		return false;
 	}
 
-	free(contents);
+	/* 5. wal2json-numeric-as-string */
+	parse_bool(lbuf.lines[4], &(slot->wal2jsonNumericAsString));
+
+	if (slot->wal2jsonNumericAsString &&
+		slot->plugin != STREAM_PLUGIN_WAL2JSON)
+	{
+		log_error("Failed to read wal2json-numeric-as-string \"%s\" from file \"%s\" "
+				  "because the plugin is not wal2json",
+				  lbuf.lines[4],
+				  filename);
+	}
+
 
 	log_notice("Read replication slot file \"%s\" with snapshot \"%s\", "
 			   "slot \"%s\", lsn %X/%X, and plugin \"%s\"",

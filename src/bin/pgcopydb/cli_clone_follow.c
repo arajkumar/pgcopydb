@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "catalog.h"
 #include "cli_common.h"
 #include "cli_root.h"
 #include "copydb.h"
@@ -20,42 +21,46 @@
 #include "parsing_utils.h"
 #include "pgsql.h"
 #include "progress.h"
+#include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
 #include "timescale.h"
 
 #define PGCOPYDB_CLONE_GETOPTS_HELP \
-	"  --source                   Postgres URI to the source database\n" \
-	"  --target                   Postgres URI to the target database\n" \
-	"  --dir                      Work directory to use\n" \
-	"  --table-jobs               Number of concurrent COPY jobs to run\n" \
-	"  --index-jobs               Number of concurrent CREATE INDEX jobs to run\n" \
-	"  --large-objects-jobs       Number of concurrent Large Objects jobs to run\n" \
-	"  --split-tables-larger-than Same-table concurrency size threshold\n" \
-	"  --drop-if-exists           On the target database, clean-up from a previous run first\n" \
-	"  --roles                    Also copy roles found on source to target\n" \
-	"  --no-role-passwords        Do not dump passwords for roles\n" \
-	"  --no-owner                 Do not set ownership of objects to match the original database\n" \
-	"  --no-acl                   Prevent restoration of access privileges (grant/revoke commands).\n" \
-	"  --no-comments              Do not output commands to restore comments\n" \
-	"  --skip-large-objects       Skip copying large objects (blobs)\n" \
-	"  --skip-extensions          Skip restoring extensions\n" \
-	"  --skip-ext-comments        Skip restoring COMMENT ON EXTENSION\n" \
-	"  --skip-collations          Skip restoring collations\n" \
-	"  --skip-vacuum              Skip running VACUUM ANALYZE\n" \
-	"  --requirements <filename>  List extensions requirements\n" \
-	"  --filters <filename>       Use the filters defined in <filename>\n" \
-	"  --fail-fast                Abort early in case of error\n" \
-	"  --restart                  Allow restarting when temp files exist already\n" \
-	"  --resume                   Allow resuming operations after a failure\n" \
-	"  --not-consistent           Allow taking a new snapshot on the source database\n" \
-	"  --snapshot                 Use snapshot obtained with pg_export_snapshot\n" \
-	"  --follow                   Implement logical decoding to replay changes\n" \
-	"  --plugin                   Output plugin to use (test_decoding, wal2json)\n" \
-	"  --slot-name                Use this Postgres replication slot name\n" \
-	"  --create-slot              Create the replication slot\n" \
-	"  --origin                   Use this Postgres replication origin node name\n" \
-	"  --endpos                   Stop replaying changes when reaching this LSN\n" \
+	"  --source                      Postgres URI to the source database\n" \
+	"  --target                      Postgres URI to the target database\n" \
+	"  --dir                         Work directory to use\n" \
+	"  --table-jobs                  Number of concurrent COPY jobs to run\n" \
+	"  --index-jobs                  Number of concurrent CREATE INDEX jobs to run\n" \
+	"  --restore-jobs                Number of concurrent jobs for pg_restore\n" \
+	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
+	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \
+	"  --drop-if-exists              On the target database, clean-up from a previous run first\n" \
+	"  --roles                       Also copy roles found on source to target\n" \
+	"  --no-role-passwords           Do not dump passwords for roles\n" \
+	"  --no-owner                    Do not set ownership of objects to match the original database\n" \
+	"  --no-acl                      Prevent restoration of access privileges (grant/revoke commands).\n" \
+	"  --no-comments                 Do not output commands to restore comments\n" \
+	"  --no-tablespaces              Do not output commands to select tablespaces\n" \
+	"  --skip-large-objects          Skip copying large objects (blobs)\n" \
+	"  --skip-extensions             Skip restoring extensions\n" \
+	"  --skip-ext-comments           Skip restoring COMMENT ON EXTENSION\n" \
+	"  --skip-collations             Skip restoring collations\n" \
+	"  --skip-vacuum                 Skip running VACUUM ANALYZE\n" \
+	"  --requirements <filename>     List extensions requirements\n" \
+	"  --filters <filename>          Use the filters defined in <filename>\n" \
+	"  --fail-fast                   Abort early in case of error\n" \
+	"  --restart                     Allow restarting when temp files exist already\n" \
+	"  --resume                      Allow resuming operations after a failure\n" \
+	"  --not-consistent              Allow taking a new snapshot on the source database\n" \
+	"  --snapshot                    Use snapshot obtained with pg_export_snapshot\n" \
+	"  --follow                      Implement logical decoding to replay changes\n" \
+	"  --plugin                      Output plugin to use (test_decoding, wal2json)\n" \
+	"  --wal2json-numeric-as-string  Print numeric data type as string when using wal2json output plugin\n" \
+	"  --slot-name                   Use this Postgres replication slot name\n" \
+	"  --create-slot                 Create the replication slot\n" \
+	"  --origin                      Use this Postgres replication origin node name\n" \
+	"  --endpos                      Stop replaying changes when reaching this LSN\n" \
 
 CommandLine clone_command =
 	make_command(
@@ -75,35 +80,26 @@ CommandLine fork_command =
 		cli_copy_db_getopts,
 		cli_clone);
 
-/* pgcopydb copy db is an alias for pgcopydb clone */
-CommandLine copy__db_command =
-	make_command(
-		"copy-db",
-		"Clone an entire database from source to target",
-		" --source ... --target ... [ --table-jobs ... --index-jobs ... ] ",
-		PGCOPYDB_CLONE_GETOPTS_HELP,
-		cli_copy_db_getopts,
-		cli_clone);
-
 
 CommandLine follow_command =
 	make_command(
 		"follow",
 		"Replay changes from the source database to the target database",
 		" --source ... --target ...  ",
-		"  --source              Postgres URI to the source database\n"
-		"  --target              Postgres URI to the target database\n"
-		"  --dir                 Work directory to use\n"
-		"  --filters <filename>  Use the filters defined in <filename>\n"
-		"  --restart             Allow restarting when temp files exist already\n"
-		"  --resume              Allow resuming operations after a failure\n"
-		"  --not-consistent      Allow taking a new snapshot on the source database\n"
-		"  --snapshot            Use snapshot obtained with pg_export_snapshot\n"
-		"  --plugin              Output plugin to use (test_decoding, wal2json)\n" \
-		"  --slot-name           Use this Postgres replication slot name\n"
-		"  --create-slot         Create the replication slot\n"
-		"  --origin              Use this Postgres replication origin node name\n"
-		"  --endpos              Stop replaying changes when reaching this LSN\n",
+		"  --source                      Postgres URI to the source database\n"
+		"  --target                      Postgres URI to the target database\n"
+		"  --dir                         Work directory to use\n"
+		"  --filters <filename>          Use the filters defined in <filename>\n"
+		"  --restart                     Allow restarting when temp files exist already\n"
+		"  --resume                      Allow resuming operations after a failure\n"
+		"  --not-consistent              Allow taking a new snapshot on the source database\n"
+		"  --snapshot                    Use snapshot obtained with pg_export_snapshot\n"
+		"  --plugin                      Output plugin to use (test_decoding, wal2json)\n"
+		"  --wal2json-numeric-as-string  Print numeric data type as string when using wal2json output plugin\n"
+		"  --slot-name                   Use this Postgres replication slot name\n"
+		"  --create-slot                 Create the replication slot\n"
+		"  --origin                      Use this Postgres replication origin node name\n"
+		"  --endpos                      Stop replaying changes when reaching this LSN\n",
 		cli_copy_db_getopts,
 		cli_follow);
 
@@ -208,7 +204,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 						   copyDBoptions.origin,
 						   copyDBoptions.endpos,
 						   STREAM_MODE_CATCHUP,
-						   &(copySpecs->catalog),
+						   &(copySpecs->catalogs.source),
 						   copyDBoptions.stdIn,
 						   copyDBoptions.stdOut,
 						   logSQL))
@@ -256,6 +252,24 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	 * the source and target database for Change Data Capture.
 	 */
 	if (!follow_setup_databases(copySpecs, &streamSpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/*
+	 * We fetch the schema here, rather than later in the clone subprocess,
+	 * which simply reuses this cached data. This is done to avoid lock
+	 * contention between the clone and follow subprocesses, as they both try to
+	 * write concurrently to the source.db SQLite database, leading one to
+	 * failure. This is also necessary for plugins like test_decoding, which
+	 * require information such as primary keys.
+	 *
+	 * In the future, if the follow subprocess doesn't need a catalog (e.g. if
+	 * we remove test_decoding), we should separate out tables for the follow
+	 * subprocess into their own database.
+	 */
+	if (!copydb_fetch_schema_and_prepare_specs(copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -375,7 +389,7 @@ cli_follow(int argc, char **argv)
 						   copyDBoptions.origin,
 						   copyDBoptions.endpos,
 						   STREAM_MODE_CATCHUP,
-						   &(copySpecs.catalog),
+						   &(copySpecs.catalogs.source),
 						   copyDBoptions.stdIn,
 						   copyDBoptions.stdOut,
 						   logSQL))
@@ -528,14 +542,31 @@ cloneDB(CopyDataSpec *copySpecs)
 	 * the work is split into a clone sub-process and a follow sub-process that
 	 * work concurrently.
 	 */
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
+	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
 
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
+	/* grab startTime before opening the catalogs */
+	TopLevelTiming *timing = &(topLevelTimingArray[TIMING_SECTION_TOTAL]);
+	(void) catalog_start_timing(timing);
+
+	/* fetch schema information from source catalogs, including filtering */
+	log_info("STEP 1: fetch source database tables, indexes, and sequences");
+
+	if (!copydb_fetch_schema_and_prepare_specs(copySpecs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now register in the catalogs the already known startTime */
+	if (!summary_start_timing(sourceDB, TIMING_SECTION_TOTAL))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	if (copySpecs->roles)
 	{
-		log_info("STEP 0: copy the source database roles");
+		log_info("Copy the source database roles, per --roles");
 
 		if (!pg_copy_roles(&(copySpecs->pgPaths),
 						   &(copySpecs->connStrings),
@@ -559,33 +590,7 @@ cloneDB(CopyDataSpec *copySpecs)
 	/* swap the new instance in place of the previous one */
 	copySpecs->sourceSnapshot = snapshot;
 
-	if (!copydb_set_snapshot(copySpecs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* fetch schema information from source catalogs, including filtering */
-	log_info("STEP 1: fetch source database tables, indexes, and sequences");
-
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_SCHEMA_FETCH);
-
-	if (!copydb_fetch_schema_and_prepare_specs(copySpecs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* prepare the schema JSON file with all the migration details */
-	if (!copydb_prepare_schema_json_file(copySpecs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	log_info("STEP 2: dump the source database schema (pre/post data)");
-
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_SCHEMA_DUMP);
 
 	if (!copydb_dump_source_schema(copySpecs,
 								   copySpecs->sourceSnapshot.snapshot,
@@ -597,15 +602,12 @@ cloneDB(CopyDataSpec *copySpecs)
 
 	log_info("STEP 3: restore the pre-data section to the target database");
 
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_PREPARE_SCHEMA);
-
 	if (!copydb_target_prepare_schema(copySpecs))
 	{
-		/* errors have already been logged */
+		log_error("Failed to prepare schema on the target database, "
+				  "see above for details");
 		return false;
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_AFTER_PREPARE_SCHEMA);
 
 	/* STEPs 4, 5, 6, 7, 8, and 9 are printed when starting the sub-processes */
 	if (!copydb_copy_all_table_data(copySpecs))
@@ -614,16 +616,12 @@ cloneDB(CopyDataSpec *copySpecs)
 		return false;
 	}
 
-	/* close our snapshot: commit transaction and finish connection */
-	(void) copydb_close_snapshot(copySpecs);
-
 	log_info("STEP 10: restore the post-data section to the target database");
-
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_FINALIZE_SCHEMA);
 
 	if (!copydb_target_finalize_schema(copySpecs))
 	{
-		/* errors have already been logged */
+		log_error("Failed to finalize schema on the target database, "
+				  "see above for details");
 		return false;
 	}
 
@@ -633,29 +631,32 @@ cloneDB(CopyDataSpec *copySpecs)
 	 */
 	if (copySpecs->follow)
 	{
-		PGSQL pgsql = { 0 };
-
 		log_info("Updating the pgcopydb.sentinel to enable applying changes");
 
-		if (!pgsql_init(&pgsql,
-						copySpecs->connStrings.source_pguri,
-						PGSQL_CONN_SOURCE))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (!pgsql_update_sentinel_apply(&pgsql, true))
+		if (!sentinel_update_apply(sourceDB, true))
 		{
 			/* errors have already been logged */
 			return false;
 		}
 	}
 
-	(void) summary_set_current_time(timings, TIMING_STEP_AFTER_FINALIZE_SCHEMA);
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
+	/* stop the timing wall-clock, and print the top-level summary */
+	if (!summary_stop_timing(sourceDB, TIMING_SECTION_TOTAL))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
-	(void) print_summary(&summary, copySpecs);
+	log_info("All step are now done, %s elapsed", timing->ppDuration);
+
+	(void) print_summary(copySpecs);
+
+	/* time to close the catalogs now */
+	if (!catalog_close_from_specs(copySpecs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	return true;
 }
@@ -761,16 +762,27 @@ cli_clone_follow_wait_subprocess(const char *name, pid_t pid)
 
 		if (exited)
 		{
-			log_level(returnCode == 0 ? LOG_DEBUG : LOG_ERROR,
-					  "%s process %d has terminated [%d]",
+			char details[BUFSIZE] = { 0 };
+			bool exitedSuccessfully = returnCode == 0 && signal_is_handled(sig);
+
+			if (sig != 0)
+			{
+				sformat(details, sizeof(details), " (%s [%d])",
+						signal_to_string(sig),
+						sig);
+			}
+
+			log_level(exitedSuccessfully ? LOG_DEBUG : LOG_ERROR,
+					  "%s process %d has terminated [%d]%s",
 					  name,
 					  pid,
-					  returnCode);
+					  returnCode,
+					  details);
 		}
 
 		/* avoid busy looping, wait for 150ms before checking again */
 		pg_usleep(150 * 1000);
 	}
 
-	return returnCode == 0;
+	return returnCode == 0 && signal_is_handled(sig);
 }

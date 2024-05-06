@@ -18,6 +18,7 @@
 #include "lock_utils.h"
 #include "log.h"
 #include "pidfile.h"
+#include "signals.h"
 #include "string_utils.h"
 
 
@@ -239,7 +240,6 @@ semaphore_cleanup(const char *pidfile)
 
 	long fileSize = 0L;
 	char *fileContents = NULL;
-	char *fileLines[BUFSIZE] = { 0 };
 
 	if (!file_exists(pidfile))
 	{
@@ -251,27 +251,29 @@ semaphore_cleanup(const char *pidfile)
 		return false;
 	}
 
-	int lineCount = splitLines(fileContents, fileLines, BUFSIZE);
+	LinesBuffer lbuf = { 0 };
 
-	if (lineCount < PIDFILE_LINE_SEM_ID)
-	{
-		log_debug("Failed to cleanup the semaphore from stale pid file \"%s\": "
-				  "it contains %d lines, semaphore id is expected in line %d",
-				  pidfile,
-				  lineCount,
-				  PIDFILE_LINE_SEM_ID);
-		free(fileContents);
-		return false;
-	}
-
-	if (!stringToInt(fileLines[PIDFILE_LINE_SEM_ID], &(semaphore.semId)))
+	if (!splitLines(&lbuf, fileContents))
 	{
 		/* errors have already been logged */
-		free(fileContents);
 		return false;
 	}
 
-	free(fileContents);
+	if (lbuf.count < PIDFILE_LINE_SEM_ID)
+	{
+		log_debug("Failed to cleanup the semaphore from stale pid file \"%s\": "
+				  "it contains %lld lines, semaphore id is expected in line %d",
+				  pidfile,
+				  (long long) lbuf.count,
+				  PIDFILE_LINE_SEM_ID);
+		return false;
+	}
+
+	if (!stringToInt(lbuf.lines[PIDFILE_LINE_SEM_ID], &(semaphore.semId)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	log_trace("Read semaphore id %d from stale pidfile", semaphore.semId);
 
@@ -286,23 +288,38 @@ semaphore_cleanup(const char *pidfile)
 bool
 semaphore_lock(Semaphore *semaphore)
 {
-	int errStatus;
+	if (semaphore->reentrant && semaphore->depth > 0)
+	{
+		int sempid = semctl(semaphore->semId, 0, GETPID, 0);
+		int semval = semctl(semaphore->semId, 0, GETVAL, 0);
+
+		/* semval is only zero if we're in the critical section already */
+		if (sempid == getpid() && semval == 0)
+		{
+			++semaphore->depth;
+			return true;
+		}
+	}
+
+	/*
+	 * Note: if errStatus is -1 and errno == EINTR then it means we returned
+	 * from the operation prematurely because we were sent a signal.  So we
+	 * try and lock the semaphore again.
+	 */
+	int errStatus = 0;
 	struct sembuf sops;
 
 	sops.sem_op = -1;           /* decrement */
 	sops.sem_flg = SEM_UNDO;
 	sops.sem_num = 0;
 
-	/*
-	 * Note: if errStatus is -1 and errno == EINTR then it means we returned
-	 * from the operation prematurely because we were sent a signal.  So we
-	 * try and lock the semaphore again.
-	 *
-	 * We used to check interrupts here, but that required servicing
-	 * interrupts directly from signal handlers. Which is hard to do safely
-	 * and portably.
-	 */
 	do {
+		if (errStatus < 0 &&
+			(asked_to_stop || asked_to_stop_fast || asked_to_quit))
+		{
+			return false;
+		}
+
 		errStatus = semop(semaphore->semId, &sops, 1);
 	} while (errStatus < 0 && errno == EINTR);
 
@@ -315,6 +332,9 @@ semaphore_lock(Semaphore *semaphore)
 		return false;
 	}
 
+	/* always maintain the depth, even for non-reentrant semaphores */
+	++semaphore->depth;
+
 	return true;
 }
 
@@ -325,20 +345,37 @@ semaphore_lock(Semaphore *semaphore)
 bool
 semaphore_unlock(Semaphore *semaphore)
 {
-	int errStatus;
+	/* unlocking a reentrant semaphore skips an actual semop() call */
+	if (semaphore->reentrant && semaphore->depth > 1)
+	{
+		int sempid = semctl(semaphore->semId, 0, GETPID, 0);
+
+		if (sempid == getpid())
+		{
+			--semaphore->depth;
+			return true;
+		}
+	}
+
+	/*
+	 * Note: if errStatus is -1 and errno == EINTR then it means we returned
+	 * from the operation prematurely because we were sent a signal. So we try
+	 * and unlock the semaphore again.
+	 */
+	int errStatus = 0;
 	struct sembuf sops;
 
 	sops.sem_op = 1;            /* increment */
 	sops.sem_flg = SEM_UNDO;
 	sops.sem_num = 0;
 
-	/*
-	 * Note: if errStatus is -1 and errno == EINTR then it means we returned
-	 * from the operation prematurely because we were sent a signal.  So we
-	 * try and unlock the semaphore again. Not clear this can really happen,
-	 * but might as well cope.
-	 */
 	do {
+		if (errStatus < 0 &&
+			(asked_to_stop || asked_to_stop_fast || asked_to_quit))
+		{
+			return false;
+		}
+
 		errStatus = semop(semaphore->semId, &sops, 1);
 	} while (errStatus < 0 && errno == EINTR);
 
@@ -349,6 +386,8 @@ semaphore_unlock(Semaphore *semaphore)
 				semaphore->semId);
 		return false;
 	}
+
+	--semaphore->depth;
 
 	return true;
 }

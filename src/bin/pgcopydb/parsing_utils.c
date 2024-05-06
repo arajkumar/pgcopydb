@@ -86,7 +86,7 @@ regexp_first_match(const char *string, const char *regex)
 		regoff_t start = m[1].rm_so;
 		regoff_t finish = m[1].rm_eo;
 		int length = finish - start + 1;
-		char *result = (char *) malloc(length * sizeof(char));
+		char *result = (char *) calloc(length, sizeof(char));
 
 		if (result == NULL)
 		{
@@ -127,11 +127,9 @@ parse_version_number(const char *version_string,
 	if (!parse_pg_version_string(pg_version_string, pg_version))
 	{
 		/* errors have already been logged */
-		free(match);
 		return false;
 	}
 
-	free(match);
 	return true;
 }
 
@@ -687,15 +685,14 @@ parse_pguri_info_key_vals(const char *pguri,
 
 
 /*
- * buildPostgresURIfromPieces builds a Postgres connection string from keywords
- * and values, in a user friendly way.
+ * buildPostgresBareURIfromPieces builds a Postgres connection string from
+ * keywords and values, in a user friendly way. It omits any option other than
+ * the connection string basis: host, port, user, dbname.
  */
 bool
-buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
+buildPostgresBareURIfromPieces(URIParams *uriParams, char **pguri)
 {
 	PQExpBuffer uri = createPQExpBuffer();
-
-	int index = 0;
 
 	/* prepare the mandatory part of the Postgres URI */
 	appendPQExpBufferStr(uri, "postgres://");
@@ -711,7 +708,6 @@ buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
 			return false;
 		}
 		appendPQExpBuffer(uri, "%s@", escaped);
-		free(escaped);
 	}
 
 	if (uriParams->hostname)
@@ -725,7 +721,6 @@ buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
 			return false;
 		}
 		appendPQExpBuffer(uri, "%s", escaped);
-		free(escaped);
 	}
 
 	if (uriParams->port)
@@ -747,11 +742,42 @@ buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
 			return false;
 		}
 		appendPQExpBuffer(uri, "%s", escaped);
-		free(escaped);
 	}
 
+	if (PQExpBufferBroken(uri))
+	{
+		log_error("Failed to build Postgres URI: out of memory");
+		destroyPQExpBuffer(uri);
+		return false;
+	}
+
+	*pguri = strdup(uri->data);
+	destroyPQExpBuffer(uri);
+
+	return true;
+}
+
+
+/*
+ * buildPostgresURIfromPieces builds a Postgres connection string from keywords
+ * and values, in a user friendly way.
+ */
+bool
+buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
+{
+	if (!buildPostgresBareURIfromPieces(uriParams, pguri))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	PQExpBuffer uri = createPQExpBuffer();
+
+	/* prepare the mandatory part of the Postgres URI */
+	appendPQExpBufferStr(uri, *pguri);
+
 	/* now add optional parameters to the Postgres URI */
-	for (index = 0; index < uriParams->parameters.count; index++)
+	for (int index = 0; index < uriParams->parameters.count; index++)
 	{
 		char *keyword = uriParams->parameters.keywords[index];
 		char *value = uriParams->parameters.values[index];
@@ -780,8 +806,6 @@ buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
 							  index == 0 ? "?" : "&",
 							  keyword,
 							  escapedValue);
-
-			free(escapedValue);
 		}
 		else
 		{
@@ -797,6 +821,7 @@ buildPostgresURIfromPieces(URIParams *uriParams, char **pguri)
 	}
 
 	*pguri = strdup(uri->data);
+
 	destroyPQExpBuffer(uri);
 
 	return true;
@@ -871,6 +896,7 @@ escapeWithPercentEncoding(const char *str, char **dst)
 		return false;
 	}
 
+	/* minimum computed size is 1 (for string terminator char \0) */
 	size_t size = computePercentEncodedSize(str);
 	char *escaped = (char *) calloc(size, sizeof(char));
 
@@ -1030,53 +1056,34 @@ parse_and_scrub_connection_string(const char *pguri, SafeURI *safeURI)
 
 
 /*
- * freeSafeURI frees the dynamic memory allocated for handling the safe URI.
+ * bareConnectionString builds a connection string with zero option.
  */
-void
-freeSafeURI(SafeURI *safeURI)
+bool
+bareConnectionString(const char *pguri, SafeURI *safeURI)
 {
-	free(safeURI->pguri);
-	free(safeURI->password);
-	freeURIParams(&(safeURI->uriParams));
+	URIParams *uriParams = &(safeURI->uriParams);
 
-	safeURI->pguri = NULL;
-	safeURI->password = NULL;
-}
+	KeyVal overrides = { 0 };
 
-
-/*
- * freeURIParams frees the dynamic memory allocated for handling URI params.
- */
-void
-freeURIParams(URIParams *params)
-{
-	free(params->username);
-	free(params->hostname);
-	free(params->port);
-	free(params->dbname);
-	freeKeyVal(&(params->parameters));
-
-	params->username = NULL;
-	params->hostname = NULL;
-	params->port = NULL;
-	params->dbname = NULL;
-}
-
-
-/*
- * freeKeyVal frees the dynamic memory allocated for handling KeyVal parameters
- */
-void
-freeKeyVal(KeyVal *parameters)
-{
-	for (int i = 0; i < parameters->count; i++)
+	if (pguri == NULL)
 	{
-		free(parameters->keywords[i]);
-		free(parameters->values[i]);
-
-		parameters->keywords[i] = NULL;
-		parameters->values[i] = NULL;
+		safeURI->pguri = NULL;
+		return true;
 	}
 
-	parameters->count = 0;
+	bool checkForCompleteURI = false;
+
+	if (!parse_pguri_info_key_vals(pguri,
+								   &connStringDefaults,
+								   &overrides,
+								   uriParams,
+								   checkForCompleteURI))
+	{
+		return false;
+	}
+
+	/* build the bare connection string: no options */
+	buildPostgresBareURIfromPieces(uriParams, &(safeURI->pguri));
+
+	return true;
 }

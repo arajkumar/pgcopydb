@@ -25,6 +25,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     valgrind \
     build-essential \
     libedit-dev \
+    libgc-dev \
     libicu-dev \
     libkrb5-dev \
     liblz4-dev \
@@ -37,6 +38,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     libssl-dev \
 	libzstd-dev \
     libxslt1-dev \
+    libzstd-dev \
     lsof \
     psmisc \
     gdb \
@@ -83,6 +85,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     sudo \
     passwd \
     ca-certificates \
+    libgc1 \
     libpq5 \
     lsof \
     tmux \

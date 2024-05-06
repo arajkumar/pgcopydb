@@ -133,7 +133,7 @@ cli_dump_schema_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:D:PrRCNVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:D:PrReCNVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -401,24 +401,13 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 	{
 		log_info("Using pg_dumpall for Postgres \"%s\" at \"%s\"",
 				 pgPaths->pg_version,
-				 pgPaths->pg_dump);
+				 pgPaths->pg_dumpall);
 	}
 	else
 	{
 		log_info("Using pg_dump for Postgres \"%s\" at \"%s\"",
 				 pgPaths->pg_version,
-				 pgPaths->pg_dumpall);
-	}
-
-	/*
-	 * First, we need to open a snapshot that we're going to re-use in all our
-	 * connections to the source database. When the --snapshot option has been
-	 * used, instead of exporting a new snapshot, we can just re-use it.
-	 */
-	if (!copydb_prepare_snapshot(&copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
+				 pgPaths->pg_dump);
 	}
 
 	/*
@@ -455,13 +444,5 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 			/* errors have already been logged */
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
-	}
-
-	if (!copydb_close_snapshot(&copySpecs))
-	{
-		log_fatal("Failed to close snapshot \"%s\" on \"%s\"",
-				  copySpecs.sourceSnapshot.snapshot,
-				  copySpecs.sourceSnapshot.pguri);
-		exit(EXIT_CODE_SOURCE);
 	}
 }

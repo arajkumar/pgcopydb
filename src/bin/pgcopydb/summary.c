@@ -6,9 +6,11 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <unistd.h>
 
 #include "parson.h"
 
+#include "catalog.h"
 #include "copydb.h"
 #include "env_utils.h"
 #include "log.h"
@@ -19,52 +21,2427 @@
 #include "summary.h"
 
 
+/*
+ * topLevelTimingArray is a global variable that allows measuring time spent in
+ * several pgcopydb steps and operations. The array is set-up so that the
+ * section enum value is also the array index.
+ */
+TopLevelTiming topLevelTimingArray[] = {
+	{
+		.section = TIMING_SECTION_UNKNOWN,
+		.label = "Unknown Top Level Timing Section",
+		.conn = "both"
+	},
+	{
+		.section = TIMING_SECTION_CATALOG_QUERIES,
+		.label = "Catalog Queries (table ordering, filtering, etc)",
+		.conn = "source",
+		.jobsMask = TIMING_SINGLE_JOB
+	},
+	{
+		.section = TIMING_SECTION_DUMP_SCHEMA,
+		.label = "Dump Schema",
+		.conn = "source",
+		.jobsMask = TIMING_SINGLE_JOB
+	},
+	{
+		.section = TIMING_SECTION_PREPARE_SCHEMA,
+		.label = "Prepare Schema",
+		.conn = "target",
+		.jobsMask = TIMING_SINGLE_JOB
+	},
+	{
+		.section = TIMING_SECTION_TOTAL_DATA,
+		.label = "COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)",
+		.conn = "both",
+		.jobsMask = TIMING_TABLE_JOBS | TIMING_INDEX_JOBS | TIMING_VACUUM_JOBS
+	},
+	{
+		.section = TIMING_SECTION_COPY_DATA,
+		.label = "COPY (cumulative)",
+		.cumulative = true,
+		.conn = "both",
+		.jobsMask = TIMING_TABLE_JOBS
+	},
+	{
+		.section = TIMING_SECTION_CREATE_INDEX,
+		.label = "CREATE INDEX (cumulative)",
+		.cumulative = true,
+		.conn = "target",
+		.jobsMask = TIMING_INDEX_JOBS
+	},
+	{
+		.section = TIMING_SECTION_ALTER_TABLE,
+		.label = "CONSTRAINTS (cumulative)",
+		.cumulative = true,
+		.conn = "target",
+		.jobsMask = TIMING_INDEX_JOBS
+	},
+	{
+		.section = TIMING_SECTION_VACUUM,
+		.label = "VACUUM (cumulative)",
+		.cumulative = true,
+		.conn = "target",
+		.jobsMask = TIMING_VACUUM_JOBS
+	},
+	{
+		.section = TIMING_SECTION_SET_SEQUENCES,
+		.label = "Reset Sequences",
+		.conn = "both",
+		.jobsMask = TIMING_SINGLE_JOB
+	},
+	{
+		.section = TIMING_SECTION_LARGE_OBJECTS,
+		.label = "Large Objects (cumulative)",
+		.cumulative = true,
+		.conn = "both",
+		.jobsMask = TIMING_LOBJECTS_JOBS
+	},
+	{
+		.section = TIMING_SECTION_FINALIZE_SCHEMA,
+		.label = "Finalize Schema",
+		.conn = "both",
+		.jobsMask = TIMING_RESTORE_JOBS
+	},
+	{
+		.section = TIMING_SECTION_TOTAL,
+		.label = "Total Wall Clock Duration",
+		.conn = "both",
+		.jobsMask = TIMING_ALL_JOBS
+	}
+};
+
+int topLevelTimingArrayCount =
+	sizeof(topLevelTimingArray) / sizeof(topLevelTimingArray[0]);
+
+
 static void prepareLineSeparator(char dashes[], int size);
+
+static bool prepare_summary_table_hook(void *context, SourceTable *table);
+static bool prepare_summary_table_index_hook(void *ctx, SourceIndex *index);
+static bool summary_prepare_toplevel_durations_hook(void *ctx,
+													TopLevelTiming *timing);
 
 
 /*
- * create_table_summary creates a summary file for the copy operation of a
- * given table. The summary file contains identification information and
- * duration information and can be used both as a lock file and as a resource
- * file to display what's happening.
+ * summary_lookup_oid looks-up for a table summary in our catalogs.
+ *
+ * This is used in the context of pg_dump/pg_restore filtering, which concerns
+ * index and constraint oids. See copydb_objectid_has_been_processed_already.
  */
 bool
-write_table_summary(CopyTableSummary *summary, char *filename)
+summary_lookup_oid(DatabaseCatalog *catalog, uint32_t oid, bool *done)
 {
-	JSON_Value *js = json_value_init_object();
-	JSON_Object *jsObj = json_value_get_object(js);
+	sqlite3 *db = catalog->db;
 
-	char bytesPretty[BUFSIZE] = { 0 };
-	pretty_print_bytes(bytesPretty, BUFSIZE, summary->bytesTransmitted);
-
-	char transmitRate[BUFSIZE] = { 0 };
-	pretty_print_bytes_per_second(transmitRate, BUFSIZE, summary->bytesTransmitted,
-								  summary->durationMs);
-
-	json_object_set_number(jsObj, "pid", summary->pid);
-	json_object_dotset_number(jsObj, "table.oid", summary->table->oid);
-	json_object_dotset_string(jsObj, "table.nspname", summary->table->nspname);
-	json_object_dotset_string(jsObj, "table.relname", summary->table->relname);
-	json_object_set_number(jsObj, "start-time-epoch", summary->startTime);
-	json_object_set_number(jsObj, "done-time-epoch", summary->doneTime);
-	json_object_set_number(jsObj, "duration", summary->durationMs);
-	json_object_dotset_number(jsObj, "network.bytes", summary->bytesTransmitted);
-	json_object_dotset_string(jsObj, "network.bytes-pretty", bytesPretty);
-	json_object_dotset_string(jsObj, "network.transmit-rate", transmitRate);
-	json_object_set_string(jsObj, "command", summary->command);
-
-	char *serialized_string = json_serialize_to_string_pretty(js);
-	size_t len = strlen(serialized_string);
-
-	/* write the summary to the doneFile */
-	bool success = write_file(serialized_string, len, filename);
-
-	json_free_serialized_string(serialized_string);
-	json_value_free(js);
-
-	if (!success)
+	if (db == NULL)
 	{
-		log_error("Failed to write table summary file \"%s\"", filename);
+		log_error("BUG: summary_lookup_oid: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select pid, start_time_epoch, done_time_epoch, duration "
+		"    from summary "
+		"   where indexoid = $1 or conoid = $2 ";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	CopyOidSummary s = { 0 };
+
+	SQLiteQuery query = {
+		.context = &s,
+		.fetchFunction = &summary_oid_done_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "oid", oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	*done = s.pid > 0 && s.doneTime > 0;
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_pid_done_fetch fetches a generic CopyOidSummary from a SQLiteQuery
+ * result.
+ */
+bool
+summary_oid_done_fetch(SQLiteQuery *query)
+{
+	CopyOidSummary *s = (CopyOidSummary *) query->context;
+
+	s->pid = sqlite3_column_int64(query->ppStmt, 0);
+	s->startTime = sqlite3_column_int64(query->ppStmt, 1);
+	s->doneTime = sqlite3_column_int64(query->ppStmt, 2);
+	s->durationMs = sqlite3_column_int64(query->ppStmt, 3);
+
+	return true;
+}
+
+
+/*
+ * summary_lookup_table looks-up for a table summary in our catalogs, in case
+ * the given table (partition) has already been done in a previous run.
+ */
+bool
+summary_lookup_table(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_lookup_table: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+	CopyTableSummary *tableSummary = &(tableSpecs->summary);
+
+	tableSummary->table = tableSpecs->sourceTable;
+
+	char *sql =
+		"  select pid, start_time_epoch, done_time_epoch, duration, "
+		"         bytes, command "
+		"    from summary "
+		"   where tableoid = $1 and partnum = $2";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = tableSummary,
+		.fetchFunction = &summary_table_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+
+		{ BIND_PARAMETER_TYPE_TEXT, "partnum",
+		  table->partition.partNumber, NULL },
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * table_summary_fetch fetches a CopyTableSummary entry from a SQLite ppStmt
+ * result set.
+ */
+bool
+summary_table_fetch(SQLiteQuery *query)
+{
+	CopyTableSummary *tableSummary = (CopyTableSummary *) query->context;
+
+	tableSummary->pid = sqlite3_column_int64(query->ppStmt, 0);
+	tableSummary->startTime = sqlite3_column_int64(query->ppStmt, 1);
+	tableSummary->doneTime = sqlite3_column_int64(query->ppStmt, 2);
+	tableSummary->durationMs = sqlite3_column_int64(query->ppStmt, 3);
+	tableSummary->bytesTransmitted = sqlite3_column_int64(query->ppStmt, 4);
+
+	if (sqlite3_column_type(query->ppStmt, 5) == SQLITE_NULL)
+	{
+		tableSummary->command = NULL;
+	}
+	else
+	{
+		int len = sqlite3_column_bytes(query->ppStmt, 5);
+		int bytes = len + 1;
+
+		tableSummary->command = (char *) calloc(bytes, sizeof(char));
+
+		if (tableSummary->command == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(tableSummary->command,
+				(char *) sqlite3_column_text(query->ppStmt, 5),
+				bytes);
+	}
+
+	/* no serialization for that internal in-memory only data */
+	tableSummary->startTimeInstr = (instr_time) {
+		0
+	};
+	tableSummary->durationInstr = (instr_time) {
+		0
+	};
+
+	INSTR_TIME_SET_CURRENT(tableSummary->startTimeInstr);
+
+	return true;
+}
+
+
+/*
+ * summary_delete_table DELETEs the summary entry for the given table.
+ */
+bool
+summary_delete_table(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_delete_table: db is NULL");
+		return false;
+	}
+
+	char *sql = "delete from summary where tableoid = $1 and partnumber = $2";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid",
+		  tableSpecs->sourceTable->oid, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "partnum",
+		  tableSpecs->sourceTable->partition.partNumber, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_add_table INSERTs a SourceTable summary entry to our internal
+ * catalogs database.
+ */
+bool
+summary_add_table(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_table: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+	CopyTableSummary *tableSummary = &(tableSpecs->summary);
+
+	tableSummary->pid = getpid();
+	tableSummary->table = tableSpecs->sourceTable;
+
+	if (!table_summary_init(tableSummary))
+	{
+		log_error("Failed to initialize table summary for pid %d and "
+				  "table %s",
+				  getpid(),
+				  table->qname);
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into summary(pid, tableoid, partnum, start_time_epoch, command)"
+		"values($1, $2, $3, $4, $5)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "pid", tableSummary->pid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "partnum",
+		  table->partition.partNumber, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "start_time_epoch",
+		  tableSummary->startTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_TEXT, "command",
+		  0, (char *) tableSummary->command }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_finish_table UPDATEs a SourceTable summary entry to our internal
+ * catalogs database.
+ */
+bool
+summary_finish_table(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_finish_table: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+	CopyTableSummary *tableSummary = &(tableSpecs->summary);
+
+	if (!table_summary_finish(tableSummary))
+	{
+		log_error("Failed to finish summary for table %s", table->qname);
+		return false;
+	}
+
+	char *sql =
+		"update summary set done_time_epoch = $1, duration = $2, bytes = $3 "
+		"where pid = $4 and tableoid = $5 and partnum = $6";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "done_time_epoch",
+		  tableSummary->doneTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "duration",
+		  tableSummary->durationMs, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "bytes",
+		  tableSummary->bytesTransmitted, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "partnum",
+		  table->partition.partNumber, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_table_all_parts_done sets tableSpecs->allPartsAreDone to true when
+ * all the parts have already been done in the summary table of our internal
+ * catalogs.
+ */
+bool
+summary_table_count_parts_done(DatabaseCatalog *catalog,
+							   CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_table_count_parts_done: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	char *sql =
+		"select count(s.oid) "
+		" from s_table t "
+		"      join s_table_part p on t.oid = p.oid "
+		"      left join summary s "
+		"             on s.tableoid = p.oid "
+		"            and s.partnum = p.partnum "
+		"where tableoid = $1 "
+		"  and s.pid > 0 and s.done_time_epoch > 0";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = tableSpecs,
+		.fetchFunction = &summary_table_fetch_count_parts_done
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_table_fetch_count_parts_done fetches the count of parts already done
+ * in our summary from a SQLiteQuere ppStmt result.
+ */
+bool
+summary_table_fetch_count_parts_done(SQLiteQuery *query)
+{
+	CopyTableDataSpec *tableSpecs = (CopyTableDataSpec *) query->context;
+
+	tableSpecs->countPartsDone = sqlite3_column_int(query->ppStmt, 0);
+
+	return true;
+}
+
+
+/*
+ * summary_add_table_parts_done registers the first pid that sees all tables
+ * parts aredone, using SQLite insert-or-ignore returning facility to ensure
+ * concurrency control.
+ */
+bool
+summary_add_table_parts_done(DatabaseCatalog *catalog,
+							 CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_table_parts_done: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	char *sql =
+		"insert or ignore into s_table_parts_done(tableoid, pid) "
+		"values($1, $2)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_lookup_table_parts_done selects the PID that went there first.
+ *
+ * We could use insert or ignore ... returning ... but that's supported by
+ * SQLite since version 3.35.0 (2021-03-12) and debian oldstable (bullseye) is
+ * still around with Package: libsqlite3-0 (3.34.1-3).
+ */
+bool
+summary_lookup_table_parts_done(DatabaseCatalog *catalog,
+								CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_lookup_table_parts_done: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	char *sql = "select pid from s_table_parts_done where tableoid = $1 ";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = tableSpecs,
+		.fetchFunction = &summary_table_parts_done_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_table_parts_done_fetch fetches a row from s_table_parts_done.
+ */
+bool
+summary_table_parts_done_fetch(SQLiteQuery *query)
+{
+	CopyTableDataSpec *tableSpecs = (CopyTableDataSpec *) query->context;
+
+	tableSpecs->partsDonePid = sqlite3_column_int(query->ppStmt, 0);
+
+	return true;
+}
+
+
+/*
+ * summary_add_vacuum INSERTs a SourceTable vacuum summary entry to our
+ * internal catalogs database.
+ */
+bool
+summary_add_vacuum(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_vacuum: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+	CopyVacuumTableSummary *vacuumSummary = &(tableSpecs->vSummary);
+
+	vacuumSummary->pid = getpid();
+	vacuumSummary->table = tableSpecs->sourceTable;
+
+	if (!table_vacuum_summary_init(vacuumSummary))
+	{
+		log_error("Failed to initialize table vacuum summary for pid %d and "
+				  "table %s",
+				  getpid(),
+				  table->qname);
+		return false;
+	}
+
+	char *sql =
+		"insert into vacuum_summary(pid, tableoid, start_time_epoch)"
+		"values($1, $2, $3)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "pid", vacuumSummary->pid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "start_time_epoch",
+		  vacuumSummary->startTime, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_finish_vacuum UPDATEs a SourceTable vacuum summary entry to our
+ * internal catalogs database.
+ */
+bool
+summary_finish_vacuum(DatabaseCatalog *catalog, CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_finish_table: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+	CopyVacuumTableSummary *vacuumSummary = &(tableSpecs->vSummary);
+
+	if (!table_vacuum_summary_finish(vacuumSummary))
+	{
+		log_error("Failed to finish summary for table %s", table->qname);
+		return false;
+	}
+
+	char *sql =
+		"update vacuum_summary "
+		"set done_time_epoch = $1, duration = $2 "
+		"where pid = $3 and tableoid = $4";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "done_time_epoch",
+		  vacuumSummary->doneTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "duration",
+		  vacuumSummary->durationMs, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_lookup_index looks-up for an index summary in our catalogs, in case
+ * the given index has already been done in a previous run.
+ */
+bool
+summary_lookup_index(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_lookup_index: db is NULL");
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+	CopyIndexSummary *indexSummary = &(indexSpecs->summary);
+
+	indexSummary->index = indexSpecs->sourceIndex;
+
+	char *sql =
+		"  select pid, start_time_epoch, done_time_epoch, duration, command "
+		"    from summary "
+		"   where indexoid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = indexSummary,
+		.fetchFunction = &summary_index_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "indexoid", index->indexOid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_lookup_constraint looks-up for an constraint summary in our
+ * catalogs.
+ */
+bool
+summary_lookup_constraint(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_lookup_constraint: db is NULL");
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+	CopyIndexSummary *indexSummary = &(indexSpecs->summary);
+
+	indexSummary->index = indexSpecs->sourceIndex;
+
+	char *sql =
+		"  select pid, start_time_epoch, done_time_epoch, duration, command "
+		"    from summary "
+		"   where conoid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = indexSummary,
+		.fetchFunction = &summary_index_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", index->constraintOid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * index_summary_fetch fetches a CopyIndexSummary entry from a SQLite ppStmt
+ * result set.
+ */
+bool
+summary_index_fetch(SQLiteQuery *query)
+{
+	CopyIndexSummary *indexSummary = (CopyIndexSummary *) query->context;
+
+	indexSummary->pid = sqlite3_column_int64(query->ppStmt, 0);
+	indexSummary->startTime = sqlite3_column_int64(query->ppStmt, 1);
+	indexSummary->doneTime = sqlite3_column_int64(query->ppStmt, 2);
+	indexSummary->durationMs = sqlite3_column_int64(query->ppStmt, 3);
+
+	if (sqlite3_column_type(query->ppStmt, 4) == SQLITE_NULL)
+	{
+		indexSummary->command = NULL;
+	}
+	else
+	{
+		int len = sqlite3_column_bytes(query->ppStmt, 4);
+		int bytes = len + 1;
+
+		indexSummary->command = (char *) calloc(bytes, sizeof(char));
+
+		if (indexSummary->command == NULL)
+		{
+			log_fatal(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		strlcpy(indexSummary->command,
+				(char *) sqlite3_column_text(query->ppStmt, 4),
+				bytes);
+	}
+
+	/* no serialization for that internal in-memory only data */
+	indexSummary->startTimeInstr = (instr_time) {
+		0
+	};
+	indexSummary->durationInstr = (instr_time) {
+		0
+	};
+
+	INSTR_TIME_SET_CURRENT(indexSummary->startTimeInstr);
+
+	return true;
+}
+
+
+/*
+ * summary_delete_index DELETEs the summary entry for the given index.
+ */
+bool
+summary_delete_index(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_delete_index: db is NULL");
+		return false;
+	}
+
+	char *sql = "delete from summary where indexoid = $1";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "indexoid", index->indexOid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_add_index INSERTs a SourceIndex summary entry to our internal
+ * catalogs database.
+ */
+bool
+summary_add_index(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_index: db is NULL");
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+	CopyIndexSummary *indexSummary = &(indexSpecs->summary);
+
+	indexSummary->pid = getpid();
+	indexSummary->index = indexSpecs->sourceIndex;
+
+	if (!index_summary_init(indexSummary))
+	{
+		log_error("Failed to initialize index summary for pid %d and "
+				  "index %s",
+				  getpid(),
+				  index->indexQname);
+		return false;
+	}
+
+	char *sql =
+		"insert into summary(pid, indexoid, start_time_epoch, command)"
+		"values($1, $2, $3, $4)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "pid", indexSummary->pid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "indexoid", index->indexOid, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "start_time_epoch",
+		  indexSummary->startTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_TEXT, "command",
+		  0, (char *) indexSummary->command }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_finish_index UPDATEs a SourceIndex summary entry to our internal
+ * catalogs database.
+ */
+bool
+summary_finish_index(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_index: db is NULL");
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+	CopyIndexSummary *indexSummary = &(indexSpecs->summary);
+
+	if (!index_summary_finish(indexSummary))
+	{
+		log_error("Failed to finish summary for index %s", index->indexQname);
+		return false;
+	}
+
+	char *sql =
+		"update summary set done_time_epoch = $1, duration = $2 "
+		"where pid = $3 and indexoid = $4";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "done_time_epoch",
+		  indexSummary->doneTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "duration",
+		  indexSummary->durationMs, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "indexoid", index->indexOid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_add_constraint INSERTs a SourceIndex summary entry to our internal
+ * catalogs database.
+ */
+bool
+summary_add_constraint(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_constraint: db is NULL");
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+	CopyIndexSummary *indexSummary = &(indexSpecs->summary);
+
+	indexSummary->pid = getpid();
+	indexSummary->index = indexSpecs->sourceIndex;
+
+	if (!index_summary_init(indexSummary))
+	{
+		log_error("Failed to initialize constraint summary for pid %d and "
+				  "constraint %s",
+				  getpid(),
+				  index->constraintName);
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into summary(pid, conoid, start_time_epoch, command)"
+		"values($1, $2, $3, $4)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "pid", indexSummary->pid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", index->constraintOid, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "start_time_epoch",
+		  indexSummary->startTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_TEXT, "command",
+		  0, (char *) indexSummary->command }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_finish_constraint UPDATEs a SourceIndex summary entry to our internal
+ * catalogs database.
+ */
+bool
+summary_finish_constraint(DatabaseCatalog *catalog, CopyIndexSpec *indexSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_finish_constraint: db is NULL");
+		return false;
+	}
+
+	SourceIndex *index = indexSpecs->sourceIndex;
+	CopyIndexSummary *indexSummary = &(indexSpecs->summary);
+
+	if (!index_summary_finish(indexSummary))
+	{
+		log_error("Failed to finish summary for constraint %s",
+				  index->constraintName);
+		return false;
+	}
+
+	char *sql =
+		"update summary set done_time_epoch = $1, duration = $2 "
+		"where pid = $3 and conoid = $4";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "done_time_epoch",
+		  indexSummary->doneTime, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "duration",
+		  indexSummary->durationMs, NULL },
+
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "conoid", index->constraintOid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_table_all_indexes_done sets tableSpecs->allIndexesAreDone to true
+ * when all the indexes have already been done in the summary table of our
+ * internal catalogs.
+ */
+bool
+summary_table_count_indexes_left(DatabaseCatalog *catalog,
+								 CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_table_count_indexes_left: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	/*
+	 * When asked to create an index for a constraint and the index is neither
+	 * a UNIQUE nor a PRIMARY KEY index, then we can't use the ALTER TABLE ...
+	 * ADD CONSTRAINT ... USING INDEX ... command, because this only works with
+	 * UNIQUE and PRIMARY KEY indexes.
+	 *
+	 * This means that we have to skip creating the index first, and will only
+	 * then create it during the constraint phase, as part of the "plain" ALTER
+	 * TABLE ... ADD CONSTRAINT ... command.
+	 *
+	 * So when counting the indexes that are left to be created before we can
+	 * install the constraints, we should also skip counting these.
+	 */
+	char *sql =
+		"with idx(indexoid) as"
+		" ("
+		"  select i.oid as indexoid "
+		"    from s_table t join s_index i on i.tableoid = t.oid"
+		"   where tableoid = $1 "
+		" ), "
+		" skipidx(indexoid) as "
+		" ("
+		"  select i.oid as indexoid "
+		"    from s_table t "
+		"         join s_index i on i.tableoid = t.oid "
+		"         join s_constraint c on c.indexoid = i.oid "
+		"   where not i.isprimary and not i.isunique"
+		"     and tableoid = $2 "
+		" ),"
+		" indexlist(indexoid) as"
+		" ( "
+		"  select indexoid from idx "
+		"  except "
+		"  select indexoid from skipidx "
+		" ) "
+		" select count(l.indexoid) "
+		"   from indexlist l "
+		"  where not exists "
+		"        ( "
+		"          select 1 "
+		"            from summary s "
+		"           where s.indexoid = l.indexoid "
+		"             and s.pid > 0 and s.done_time_epoch > 0"
+		"        ) ";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = tableSpecs,
+		.fetchFunction = &summary_table_fetch_count_indexes_left
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_table_fetch_count_indexes_left fetches the count of indexes already
+ * done in our summary from a SQLiteQuere ppStmt result.
+ */
+bool
+summary_table_fetch_count_indexes_left(SQLiteQuery *query)
+{
+	CopyTableDataSpec *tableSpecs = (CopyTableDataSpec *) query->context;
+
+	tableSpecs->countIndexesLeft = sqlite3_column_int(query->ppStmt, 0);
+
+	return true;
+}
+
+
+/*
+ * summary_add_table_indexes_done registers the first pid that sees all tables
+ * indexes are done, using SQLite insert-or-ignore returning facility to ensure
+ * concurrency control.
+ */
+bool
+summary_add_table_indexes_done(DatabaseCatalog *catalog,
+							   CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_table_indexes_done: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	char *sql =
+		"insert or ignore into s_table_indexes_done(tableoid, pid) "
+		"values($1, $2)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_lookup_table_indexes_done selects the PID that went there first.
+ *
+ * We could use insert or ignore ... returning ... but that's supported by
+ * SQLite since version 3.35.0 (2021-03-12) and debian oldstable (bullseye) is
+ * still around with Package: libsqlite3-0 (3.34.1-3).
+ */
+bool
+summary_lookup_table_indexes_done(DatabaseCatalog *catalog,
+								  CopyTableDataSpec *tableSpecs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_add_table: db is NULL");
+		return false;
+	}
+
+	SourceTable *table = tableSpecs->sourceTable;
+
+	char *sql = "select pid from s_table_indexes_done where tableoid = $1 ";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = tableSpecs,
+		.fetchFunction = &summary_table_indexes_done_fetch
+	};
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_table_indexes_done_fetch fetches a row from s_table_indexes_done.
+ */
+bool
+summary_table_indexes_done_fetch(SQLiteQuery *query)
+{
+	CopyTableDataSpec *tableSpecs = (CopyTableDataSpec *) query->context;
+
+	tableSpecs->indexesDonePid = sqlite3_column_int(query->ppStmt, 0);
+
+	return true;
+}
+
+
+/*
+ * summary_start_timing registers the start time for the given section.
+ */
+bool
+summary_start_timing(DatabaseCatalog *catalog, TimingSection section)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_start_timing: db is NULL");
+		return false;
+	}
+
+	TopLevelTiming *timing = &(topLevelTimingArray[section]);
+	(void) catalog_start_timing(timing);
+
+	char *sql =
+		"insert or replace into timings(id, label, start_time_epoch)"
+		"values($1, $2, $3)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT, "id", timing->section, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "label", 0, (char *) timing->label },
+		{ BIND_PARAMETER_TYPE_INT64, "start", timing->startTime, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_stop_timing registers the start time for the given section.
+ */
+bool
+summary_stop_timing(DatabaseCatalog *catalog, TimingSection section)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_stop_timing: db is NULL");
+		return false;
+	}
+
+	TopLevelTiming *timing = &(topLevelTimingArray[section]);
+	(void) catalog_stop_timing(timing);
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	/* bind our parameters now */
+	if (timing->cumulative)
+	{
+		/*
+		 * Cumulative timings update their pretty-printed values at stop time.
+		 */
+		uint64_t doneTime = timing->doneTime;
+
+		if (!summary_lookup_timing(catalog, timing, section))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!summary_pretty_print_timing(catalog, timing))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		const char *sql =
+			"update timings "
+			"set done_time_epoch = $1, bytes_pretty = $2, duration_pretty = $3 "
+			"where id = $4";
+
+		if (!catalog_sql_prepare(db, sql, &query))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
+			return false;
+		}
+
+		BindParam params[] = {
+			{ BIND_PARAMETER_TYPE_INT64, "done", doneTime, NULL },
+			{ BIND_PARAMETER_TYPE_TEXT, "ppBytes", 0, timing->ppBytes },
+			{ BIND_PARAMETER_TYPE_TEXT, "ppDuration", 0, timing->ppDuration },
+			{ BIND_PARAMETER_TYPE_INT, "id", timing->section, NULL }
+		};
+
+		int count = sizeof(params) / sizeof(params[0]);
+
+		if (!catalog_sql_bind(&query, params, count))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
+			return false;
+		}
+	}
+	else
+	{
+		char *sql =
+			"update timings "
+			"set done_time_epoch = $1, duration = $2, duration_pretty = $3 "
+			"where id = $4";
+
+		if (!catalog_sql_prepare(db, sql, &query))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
+			return false;
+		}
+
+		BindParam params[] = {
+			{ BIND_PARAMETER_TYPE_INT64, "done", timing->doneTime, NULL },
+			{ BIND_PARAMETER_TYPE_INT64, "duration", timing->durationMs, NULL },
+			{ BIND_PARAMETER_TYPE_TEXT, "d_pretty", 0, timing->ppDuration },
+			{ BIND_PARAMETER_TYPE_INT, "id", timing->section, NULL }
+		};
+
+		int count = sizeof(params) / sizeof(params[0]);
+
+		if (!catalog_sql_bind(&query, params, count))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(catalog->sema));
+			return false;
+		}
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_increment_timing increments the given section (typically a
+ * "cumulative" section) by the given durationMs.
+ */
+bool
+summary_increment_timing(DatabaseCatalog *catalog,
+						 TimingSection section,
+						 uint64_t count,
+						 uint64_t bytes,
+						 uint64_t durationMs)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_increment_timing: db is NULL");
+		return false;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	TopLevelTiming *timing = &(topLevelTimingArray[section]);
+
+	char *sql =
+		"update timings "
+		"set count = coalesce(count, 0) + $1, "
+		"    bytes = coalesce(bytes, 0) + $2, "
+		"    duration = coalesce(duration, 0) + $3 "
+		"where id = $4";
+
+	SQLiteQuery query = { .errorOnZeroRows = true };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "count", count, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "bytes", bytes, NULL },
+		{ BIND_PARAMETER_TYPE_INT64, "duration", durationMs, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "id", timing->section, NULL }
+	};
+
+	int pCount = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, pCount))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	/*
+	 * Because SQLite does not always have support for RETURNING clause
+	 * (depending on the version), run another query to fetch the updated
+	 * values for the top-level timing.
+	 */
+	if (!summary_lookup_timing(catalog, timing, section))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * summary_set_timing_count updates the summary top-level entry count.
+ */
+bool
+summary_set_timing_count(DatabaseCatalog *catalog,
+						 TimingSection section,
+						 uint64_t count)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_set_timing_count: db is NULL");
+		return false;
+	}
+
+	TopLevelTiming *timing = &(topLevelTimingArray[section]);
+	timing->count = count;
+
+	char *sql = "update timings set count = $1 where id = $2";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "count", timing->count, NULL },
+		{ BIND_PARAMETER_TYPE_INT, "id", timing->section, NULL }
+	};
+
+	int pCount = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, pCount))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_pretty_print_timing computes the pretty-printed versions of the
+ * bytes and duration values in a given Top-Level Timing section.
+ */
+bool
+summary_pretty_print_timing(DatabaseCatalog *catalog, TopLevelTiming *timing)
+{
+	pretty_print_bytes(timing->ppBytes,
+					   sizeof(timing->ppBytes),
+					   timing->bytes);
+
+	IntervalToString(timing->durationMs,
+					 timing->ppDuration,
+					 INTSTRING_MAX_DIGITS);
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_timing fetches a TopLevelTiming entry from our catalogs.
+ */
+bool
+summary_lookup_timing(DatabaseCatalog *catalog,
+					  TopLevelTiming *timing,
+					  TimingSection section)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: summary_lookup_timing: db is NULL");
+		return false;
+	}
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = timing,
+		.fetchFunction = &catalog_timing_fetch
+	};
+
+	char *sql =
+		"  select id, label, start_time_epoch, done_time_epoch, duration, "
+		"         duration_pretty, count, bytes, bytes_pretty "
+		"    from timings "
+		"   where id = $1";
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "id", section, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * summary_iter_timing iterates over the list of sequences in our catalogs.
+ */
+bool
+summary_iter_timing(DatabaseCatalog *catalog,
+					void *context,
+					TimingIterFun *callback)
+{
+	TimingIterator *iter =
+		(TimingIterator *) calloc(1, sizeof(TimingIterator));
+
+	iter->catalog = catalog;
+
+	if (!summary_iter_timing_init(iter))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (;;)
+	{
+		if (!summary_iter_timing_next(iter))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		TopLevelTiming *timing = iter->timing;
+
+		if (timing == NULL)
+		{
+			if (!summary_iter_timing_finish(iter))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			break;
+		}
+
+		/* now call the provided callback */
+		if (!(*callback)(context, timing))
+		{
+			log_error("Failed to iterate over list of timings, "
+					  "see above for details");
+			return false;
+		}
+	}
+
+
+	return true;
+}
+
+
+/*
+ * summary_iter_timing_init initializes an Interator over our catalog of
+ * TopLevelTiming entries.
+ */
+bool
+summary_iter_timing_init(TimingIterator *iter)
+{
+	sqlite3 *db = iter->catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: Failed to initialize timing iterator: db is NULL");
+		return false;
+	}
+
+	iter->timing = (TopLevelTiming *) calloc(1, sizeof(TopLevelTiming));
+
+	if (iter->timing == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	char *sql =
+		"  select id, label, start_time_epoch, done_time_epoch, duration, "
+		"         duration_pretty, count, bytes, bytes_pretty "
+		"    from timings "
+		"order by id";
+
+	SQLiteQuery *query = &(iter->query);
+
+	query->context = iter->timing;
+	query->fetchFunction = &catalog_timing_fetch;
+
+	if (!catalog_sql_prepare(db, sql, query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * summary_iter_timing_next fetches the next TopLevelTiming entry in our catalogs.
+ */
+bool
+summary_iter_timing_next(TimingIterator *iter)
+{
+	SQLiteQuery *query = &(iter->query);
+
+	int rc = catalog_sql_step(query);
+
+	if (rc == SQLITE_DONE)
+	{
+		iter->timing = NULL;
+
+		return true;
+	}
+
+	if (rc != SQLITE_ROW)
+	{
+		log_error("Failed to step through statement: %s", query->sql);
+		log_error("[SQLite] %s", sqlite3_errmsg(query->db));
+		return false;
+	}
+
+	return catalog_timing_fetch(query);
+}
+
+
+/*
+ * catalog_timing_fetch fetches a TopLevelTiming entry from a SQLite ppStmt
+ * result set.
+ */
+bool
+catalog_timing_fetch(SQLiteQuery *query)
+{
+	TopLevelTiming *timing = (TopLevelTiming *) query->context;
+
+	/* cleanup the memory area before re-use */
+	bzero(timing, sizeof(TopLevelTiming));
+
+	/* the section is an Enum in memory, an integer value on-disk */
+	timing->section = sqlite3_column_int(query->ppStmt, 0);
+
+	if (sqlite3_column_type(query->ppStmt, 1) == SQLITE_NULL)
+	{
+		timing->label = NULL;
+	}
+	else
+	{
+		timing->label = strdup((char *) sqlite3_column_text(query->ppStmt, 1));
+	}
+
+	timing->startTime = sqlite3_column_int64(query->ppStmt, 2);
+	timing->doneTime = sqlite3_column_int64(query->ppStmt, 3);
+	timing->durationMs = sqlite3_column_int64(query->ppStmt, 4);
+
+	if (sqlite3_column_type(query->ppStmt, 5) != SQLITE_NULL)
+	{
+		strlcpy(timing->ppDuration,
+				(char *) sqlite3_column_text(query->ppStmt, 5),
+				sizeof(timing->ppDuration));
+	}
+
+	timing->count = sqlite3_column_int64(query->ppStmt, 6);
+	timing->bytes = sqlite3_column_int64(query->ppStmt, 7);
+
+	if (sqlite3_column_type(query->ppStmt, 8) != SQLITE_NULL)
+	{
+		strlcpy(timing->ppBytes,
+				(char *) sqlite3_column_text(query->ppStmt, 8),
+				sizeof(timing->ppBytes));
+	}
+
+	return true;
+}
+
+
+/*
+ * summary_iter_timing_finish cleans-up the internal memory used for the
+ * iteration.
+ */
+bool
+summary_iter_timing_finish(TimingIterator *iter)
+{
+	SQLiteQuery *query = &(iter->query);
+
+	/* in case we finish before reaching the DONE step */
+	if (iter->timing != NULL)
+	{
+		iter->timing = NULL;
+	}
+
+	if (!catalog_sql_finalize(query))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -127,71 +2504,10 @@ prepare_table_summary_as_json(CopyTableSummary *summary,
 
 
 /*
- * read_table_summary reads a summary on-disk and parses the content of the
- * file, and populates the given summary with what we read in the on-disk file.
- *
- * Couple notes:
- *
- *  1. the summary->table SourceTable pointer should point to allocated memory,
- *
- *  2. the instr_time fields can't be read from their on-disk representation
- *     and are set to zero instead.
+ * table_summary_init initializes the time elements of a table summary.
  */
 bool
-read_table_summary(CopyTableSummary *summary, const char *filename)
-{
-	JSON_Value *json = json_parse_file(filename);
-
-	if (json == NULL)
-	{
-		log_error("Failed to parse summary file \"%s\"", filename);
-		return false;
-	}
-
-	JSON_Object *jsObj = json_value_get_object(json);
-
-	summary->pid = json_object_get_number(jsObj, "pid");
-
-	summary->table->oid = json_object_dotget_number(jsObj, "table.oid");
-
-	char *schema = (char *) json_object_dotget_string(jsObj, "table.nspname");
-	char *name = (char *) json_object_dotget_string(jsObj, "table.relname");
-
-	strlcpy(summary->table->nspname, schema, sizeof(summary->table->nspname));
-	strlcpy(summary->table->relname, name, sizeof(summary->table->relname));
-
-	summary->startTime = json_object_get_number(jsObj, "start-time-epoch");
-	summary->doneTime = json_object_get_number(jsObj, "done-time-epoch");
-	summary->durationMs = json_object_get_number(jsObj, "duration");
-	summary->bytesTransmitted = json_object_dotget_number(jsObj, "network.bytes");
-	summary->command = strdup(json_object_get_string(jsObj, "command"));
-
-	if (summary->command == NULL)
-	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		json_value_free(json);
-		return false;
-	}
-
-	/* we can't provide instr_time readers */
-	summary->startTimeInstr = (instr_time) {
-		0
-	};
-	summary->durationInstr = (instr_time) {
-		0
-	};
-
-	json_value_free(json);
-	return true;
-}
-
-
-/*
- * open_table_summary initializes the time elements of a table summary and
- * writes the summary in the given filename. Typically, the lockFile.
- */
-bool
-open_table_summary(CopyTableSummary *summary, char *filename)
+table_summary_init(CopyTableSummary *summary)
 {
 	summary->startTime = time(NULL);
 	summary->doneTime = 0;
@@ -205,16 +2521,15 @@ open_table_summary(CopyTableSummary *summary, char *filename)
 
 	INSTR_TIME_SET_CURRENT(summary->startTimeInstr);
 
-	return write_table_summary(summary, filename);
+	return true;
 }
 
 
 /*
- * finish_table_summary sets the duration of the summary fields and writes the
- * summary in the given filename. Typically, the doneFile.
+ * table_summary_finish sets the duration of the summary fields.
  */
 bool
-finish_table_summary(CopyTableSummary *summary, char *filename)
+table_summary_finish(CopyTableSummary *summary)
 {
 	summary->doneTime = time(NULL);
 
@@ -223,227 +2538,20 @@ finish_table_summary(CopyTableSummary *summary, char *filename)
 
 	summary->durationMs = INSTR_TIME_GET_MILLISEC(summary->durationInstr);
 
-	return write_table_summary(summary, filename);
-}
-
-
-/*
- * create_table_index_file creates a file with one line per index attached to a
- * table. Each line contains only the index oid, from which we can find the
- * index doneFile.
- */
-bool
-create_table_index_file(SourceTable *table, char *filename)
-{
-	PQExpBuffer content = createPQExpBuffer();
-
-	if (content == NULL)
-	{
-		log_fatal("Failed to allocate memory to create the "
-				  " index list file \"%s\"", filename);
-		return false;
-	}
-
-	SourceIndexList *indexListEntry = table->firstIndex;
-
-	for (; indexListEntry != NULL; indexListEntry = indexListEntry->next)
-	{
-		SourceIndex *index = indexListEntry->index;
-
-		appendPQExpBuffer(content, "%u\n", index->indexOid);
-		appendPQExpBuffer(content, "%u\n", index->constraintOid);
-	}
-
-	/* memory allocation could have failed while building string */
-	if (PQExpBufferBroken(content))
-	{
-		log_error("Failed to create file \"%s\": out of memory", filename);
-		destroyPQExpBuffer(content);
-		return false;
-	}
-
-	if (!write_file(content->data, content->len, filename))
-	{
-		log_error("Failed to write file \"%s\"", filename);
-		destroyPQExpBuffer(content);
-		return false;
-	}
-
-	destroyPQExpBuffer(content);
-
 	return true;
 }
 
 
 /*
- * read_table_index_file reads an index list file and populates an array of
- * indexes with only the indexOid information. The actual array memory
- * allocation is done in the function.
+ * table_vacuum_summary_init initializes the time elements of a table vacuum
+ * summary.
  */
 bool
-read_table_index_file(SourceIndexArray *indexArray, char *filename)
+table_vacuum_summary_init(CopyVacuumTableSummary *summary)
 {
-	char *fileContents = NULL;
-	long fileSize = 0L;
-
-	if (!file_exists(filename))
-	{
-		indexArray->count = 0;
-		indexArray->array = NULL;
-		return true;
-	}
-
-	if (!read_file(filename, &fileContents, &fileSize))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	char *fileLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(fileContents, fileLines, BUFSIZE);
-
-	/*
-	 * We expect to have alternate lines with first indexOid and then
-	 * constraintOid (which could be zero). No comments, etc.
-	 */
-	indexArray->count = 0;
-	indexArray->array = (SourceIndex *) calloc(lineCount, sizeof(SourceIndex));
-
-	if (indexArray->array == NULL)
-	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		return false;
-	}
-
-	for (int i = 0; i < lineCount; i++)
-	{
-		SourceIndex *index = &(indexArray->array[indexArray->count]);
-
-		uint32_t *target =
-			i % 2 == 0 ? &(index->indexOid) : &(index->constraintOid);
-
-		if (!stringToUInt32(fileLines[i], target))
-		{
-			log_error("Failed to read the index oid \"%s\" "
-					  "in file \"%s\" at line %d",
-					  fileLines[i],
-					  filename,
-					  i);
-			return false;
-		}
-
-		/* one index entry (indexOid, constraintOid) spans two lines */
-		if (i % 2 == 1)
-		{
-			++(indexArray->count);
-		}
-	}
-
-	return true;
-}
-
-
-/*
- * write_index_summary writes the current Index Summary to given filename. The
- * constraint bool allows to write the constraint definition instead of the
- * index definition.
- */
-bool
-write_index_summary(CopyIndexSummary *summary, char *filename, bool constraint)
-{
-	JSON_Value *js = json_value_init_object();
-	JSON_Object *jsObj = json_value_get_object(js);
-
-	uint32_t oid =
-		constraint
-		? summary->index->constraintOid
-		: summary->index->indexOid;
-
-	char *name =
-		constraint
-		? summary->index->constraintName
-		: summary->index->indexRelname;
-
-	json_object_set_number(jsObj, "pid", summary->pid);
-
-	json_object_dotset_number(jsObj, "index.oid", oid);
-	json_object_dotset_string(jsObj, "index.nspname",
-							  summary->index->indexNamespace);
-	json_object_dotset_string(jsObj, "index.relname", name);
-
-	json_object_set_number(jsObj, "start-time-epoch", summary->startTime);
-	json_object_set_number(jsObj, "done-time-epoch", summary->doneTime);
-	json_object_set_number(jsObj, "duration", summary->durationMs);
-	json_object_set_string(jsObj, "command", summary->command);
-
-	char *serialized_string = json_serialize_to_string_pretty(js);
-	size_t len = strlen(serialized_string);
-
-	/* write the summary to the doneFile */
-	bool success = write_file(serialized_string, len, filename);
-
-	json_free_serialized_string(serialized_string);
-	json_value_free(js);
-
-	if (!success)
-	{
-		log_error("Failed to write table summary file \"%s\"", filename);
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
- * read_index_summary reads back in-memory a summary from disk.
- */
-bool
-read_index_summary(CopyIndexSummary *summary, const char *filename)
-{
-	JSON_Value *json = json_parse_file(filename);
-
-	if (json == NULL)
-	{
-		log_error("Failed to parse summary file \"%s\"", filename);
-		return false;
-	}
-
-	JSON_Object *jsObj = json_value_get_object(json);
-
-	summary->pid = json_object_get_number(jsObj, "pid");
-
-	summary->index->indexOid = json_object_dotget_number(jsObj, "index.oid");
-
-	char *schema = (char *) json_object_dotget_string(jsObj, "index.nspname");
-	char *name = (char *) json_object_dotget_string(jsObj, "index.relname");
-
-	strlcpy(summary->index->indexNamespace,
-			schema,
-			sizeof(summary->index->indexNamespace));
-
-	strlcpy(summary->index->indexRelname,
-			name,
-			sizeof(summary->index->indexRelname));
-
-	summary->startTime = json_object_get_number(jsObj, "start-time-epoch");
-	summary->doneTime = json_object_get_number(jsObj, "done-time-epoch");
-	summary->durationMs = json_object_get_number(jsObj, "duration");
-
-	if (json_object_has_value_of_type(jsObj, "command", JSONString))
-	{
-		const char *command = json_object_get_string(jsObj, "command");
-		summary->command = strdup(command);
-
-		if (summary->command == NULL)
-		{
-			log_error(ALLOCATION_FAILED_ERROR);
-			json_value_free(json);
-			return false;
-		}
-	}
-
-	/* we can't provide instr_time readers */
+	summary->startTime = time(NULL);
+	summary->doneTime = 0;
+	summary->durationMs = 0;
 	summary->startTimeInstr = (instr_time) {
 		0
 	};
@@ -451,7 +2559,25 @@ read_index_summary(CopyIndexSummary *summary, const char *filename)
 		0
 	};
 
-	json_value_free(json);
+	INSTR_TIME_SET_CURRENT(summary->startTimeInstr);
+
+	return true;
+}
+
+
+/*
+ * table_summary_finish sets the duration of the summary fields.
+ */
+bool
+table_vacuum_summary_finish(CopyVacuumTableSummary *summary)
+{
+	summary->doneTime = time(NULL);
+
+	INSTR_TIME_SET_CURRENT(summary->durationInstr);
+	INSTR_TIME_SUBTRACT(summary->durationInstr, summary->startTimeInstr);
+
+	summary->durationMs = INSTR_TIME_GET_MILLISEC(summary->durationInstr);
+
 	return true;
 }
 
@@ -500,11 +2626,10 @@ prepare_index_summary_as_json(CopyIndexSummary *summary,
 
 
 /*
- * open_index_summary initializes the time elements of an index summary and
- * writes the summary in the given filename. Typically, the lockFile.
+ * index_summary_init initializes the time elements of an index summary.
  */
 bool
-open_index_summary(CopyIndexSummary *summary, char *filename, bool constraint)
+index_summary_init(CopyIndexSummary *summary)
 {
 	summary->startTime = time(NULL);
 	summary->doneTime = 0;
@@ -518,16 +2643,15 @@ open_index_summary(CopyIndexSummary *summary, char *filename, bool constraint)
 
 	INSTR_TIME_SET_CURRENT(summary->startTimeInstr);
 
-	return write_index_summary(summary, filename, constraint);
+	return true;
 }
 
 
 /*
- * finish_index_summary sets the duration of the summary fields and writes the
- * summary in the given filename. Typically, the doneFile.
+ * index_summary_finish updates the duration of the summary fields.
  */
 bool
-finish_index_summary(CopyIndexSummary *summary, char *filename, bool constraint)
+index_summary_finish(CopyIndexSummary *summary)
 {
 	summary->doneTime = time(NULL);
 
@@ -536,53 +2660,24 @@ finish_index_summary(CopyIndexSummary *summary, char *filename, bool constraint)
 
 	summary->durationMs = INSTR_TIME_GET_MILLISEC(summary->durationInstr);
 
-	return write_index_summary(summary, filename, constraint);
+	return true;
 }
 
 
 /*
- * write_blobs_summary writes the given pre-filled summary to disk.
+ * summary_prepare_toplevel_durations reads the top-level timings from the
+ * SQLite catalogs.
  */
 bool
-write_blobs_summary(CopyBlobsSummary *summary, char *filename)
+summary_prepare_toplevel_durations(CopyDataSpec *specs)
 {
-	JSON_Value *js = json_value_init_object();
-	JSON_Object *jsObj = json_value_get_object(js);
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	json_object_set_number(jsObj, "pid", (double) summary->pid);
-	json_object_set_number(jsObj, "count", (double) summary->count);
-	json_object_set_number(jsObj, "duration", summary->durationMs);
-	json_object_set_number(jsObj, "start-time-epoch", summary->startTime);
-	json_object_set_number(jsObj, "done-time-epoch", summary->doneTime);
-
-	/* pretty print start time */
-	time_t secs = summary->startTime;
-	struct tm ts = { 0 };
-	char startTimeStr[BUFSIZE] = { 0 };
-
-	if (localtime_r(&secs, &ts) == NULL)
+	if (!summary_iter_timing(sourceDB,
+							 NULL,
+							 summary_prepare_toplevel_durations_hook))
 	{
-		log_error("Failed to convert seconds %lld to local time: %m",
-				  (long long) secs);
-		return false;
-	}
-
-	strftime(startTimeStr, sizeof(startTimeStr), "%Y-%m-%d %H:%M:%S %Z", &ts);
-
-	json_object_set_string(jsObj, "start-time-string", startTimeStr);
-
-	char *serialized_string = json_serialize_to_string_pretty(js);
-	size_t len = strlen(serialized_string);
-
-	/* write the summary to the doneFile */
-	bool success = write_file(serialized_string, len, filename);
-
-	json_free_serialized_string(serialized_string);
-	json_value_free(js);
-
-	if (!success)
-	{
-		log_error("Failed to write table summary file \"%s\"", filename);
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -591,174 +2686,39 @@ write_blobs_summary(CopyBlobsSummary *summary, char *filename)
 
 
 /*
- * read_blobs_summary reads a blobs process summary file from disk.
+ * summary_prepare_toplevel_durations_hook is an iterator callback function.
  */
-bool
-read_blobs_summary(CopyBlobsSummary *summary, char *filename)
+static bool
+summary_prepare_toplevel_durations_hook(void *ctx, TopLevelTiming *timing)
 {
-	JSON_Value *json = json_parse_file(filename);
-
-	if (json == NULL)
+	if (topLevelTimingArrayCount <= timing->section)
 	{
-		log_error("Failed to parse summary file \"%s\"", filename);
+		log_error("BUG: unknown on-disk top-level timing section %d",
+				  timing->section);
 		return false;
 	}
 
-	JSON_Object *jsObj = json_value_get_object(json);
-
-	summary->pid = json_object_get_number(jsObj, "pid");
-	summary->count = json_object_get_number(jsObj, "count");
-	summary->durationMs = json_object_get_number(jsObj, "duration");
-	summary->startTime = json_object_get_number(jsObj, "start-time-epoch");
-	summary->doneTime = json_object_get_number(jsObj, "done-time-epoch");
-
-	json_value_free(json);
-	return true;
-}
-
-
-/*
- * summary_set_current_time sets the current timing to the appropriate
- * TopLevelTimings entry given the step we're at.
- */
-void
-summary_set_current_time(TopLevelTimings *timings, TimingStep step)
-{
-	switch (step)
+	/* just skip the UNKNOWN section */
+	if (timing->section == TIMING_SECTION_UNKNOWN)
 	{
-		case TIMING_STEP_START:
-		{
-			INSTR_TIME_SET_CURRENT(timings->startTime);
-			break;
-		}
-
-		case TIMING_STEP_BEFORE_SCHEMA_FETCH:
-		{
-			INSTR_TIME_SET_CURRENT(timings->beforeSchemaFetch);
-			break;
-		}
-
-		case TIMING_STEP_BEFORE_SCHEMA_DUMP:
-		{
-			INSTR_TIME_SET_CURRENT(timings->beforeSchemaDump);
-			break;
-		}
-
-		case TIMING_STEP_BEFORE_PREPARE_SCHEMA:
-		{
-			INSTR_TIME_SET_CURRENT(timings->beforePrepareSchema);
-			break;
-		}
-
-		case TIMING_STEP_AFTER_PREPARE_SCHEMA:
-		{
-			INSTR_TIME_SET_CURRENT(timings->afterPrepareSchema);
-			break;
-		}
-
-		case TIMING_STEP_BEFORE_FINALIZE_SCHEMA:
-		{
-			INSTR_TIME_SET_CURRENT(timings->beforeFinalizeSchema);
-			break;
-		}
-
-		case TIMING_STEP_AFTER_FINALIZE_SCHEMA:
-		{
-			INSTR_TIME_SET_CURRENT(timings->afterFinalizeSchema);
-			break;
-		}
-
-		case TIMING_STEP_END:
-		{
-			INSTR_TIME_SET_CURRENT(timings->endTime);
-			break;
-		}
+		return true;
 	}
-}
 
+	TopLevelTiming *entry = &(topLevelTimingArray[timing->section]);
 
-/* avoid non-initialized durations or clock oddities */
-#define INSTR_TIME_MS(x) \
-	(INSTR_TIME_GET_MILLISEC(x) > 0 ? INSTR_TIME_GET_MILLISEC(x) : 0)
+	entry->section = timing->section;
+	entry->startTime = timing->startTime;
+	entry->doneTime = timing->doneTime;
+	entry->durationMs = timing->durationMs;
 
-/*
- * summary_prepare_toplevel_durations prepares the top-level durations in a
- * form that's suitable for printing on-screen.
- */
-void
-summary_prepare_toplevel_durations(Summary *summary)
-{
-	TopLevelTimings *timings = &(summary->timings);
+	strlcpy(entry->ppDuration, timing->ppDuration, sizeof(entry->ppDuration));
 
-	instr_time duration;
-	uint64_t durationMs;
+	entry->count = timing->count;
+	entry->bytes = timing->bytes;
 
-	/* compute schema dump duration, part of schemaDurationMs */
-	duration = timings->beforeSchemaDump;
-	INSTR_TIME_SUBTRACT(duration, timings->beforeSchemaFetch);
-	durationMs = INSTR_TIME_MS(duration);
+	strlcpy(entry->ppBytes, timing->ppBytes, sizeof(entry->ppBytes));
 
-	IntervalToString(durationMs, timings->dumpSchemaMs, INTSTRING_MAX_DIGITS);
-
-	timings->schemaDurationMs = durationMs;
-	timings->dumpSchemaDurationMs = durationMs;
-
-	/* compute schema fetch duration, part of schemaDurationMs */
-	duration = timings->beforePrepareSchema;
-	INSTR_TIME_SUBTRACT(duration, timings->beforeSchemaDump);
-	durationMs = INSTR_TIME_MS(duration);
-
-	IntervalToString(durationMs, timings->fetchSchemaMs, INTSTRING_MAX_DIGITS);
-
-	timings->schemaDurationMs += durationMs;
-	timings->fetchSchemaDurationMs = durationMs;
-
-	/* compute prepare schema duration, part of schemaDurationMs */
-	duration = timings->afterPrepareSchema;
-	INSTR_TIME_SUBTRACT(duration, timings->beforePrepareSchema);
-	durationMs = INSTR_TIME_MS(duration);
-
-	IntervalToString(durationMs, timings->prepareSchemaMs, INTSTRING_MAX_DIGITS);
-
-	timings->schemaDurationMs += durationMs;
-	timings->prepareSchemaDurationMs = durationMs;
-
-	/* compute data + index duration, between prepare schema and finalize */
-	duration = timings->beforeFinalizeSchema;
-	INSTR_TIME_SUBTRACT(duration, timings->afterPrepareSchema);
-	durationMs = INSTR_TIME_MS(duration);
-
-	IntervalToString(durationMs, timings->dataAndIndexMs, INTSTRING_MAX_DIGITS);
-
-	timings->dataAndIndexesDurationMs = durationMs;
-
-	/* compute finalize schema duration, part of schemaDurationMs */
-	duration = timings->afterFinalizeSchema;
-	INSTR_TIME_SUBTRACT(duration, timings->beforeFinalizeSchema);
-	durationMs = INSTR_TIME_MS(duration);
-
-	IntervalToString(durationMs, timings->finalizeSchemaMs, INTSTRING_MAX_DIGITS);
-
-	timings->schemaDurationMs += durationMs;
-	timings->finalizeSchemaDurationMs = durationMs;
-
-	/* compute total duration, wall clock elapsed time */
-	duration = timings->endTime;
-	INSTR_TIME_SUBTRACT(duration, timings->startTime);
-	durationMs = INSTR_TIME_MS(duration);
-
-	IntervalToString(durationMs, timings->totalMs, INTSTRING_MAX_DIGITS);
-
-	timings->totalDurationMs = durationMs;
-
-	/* prepare the pretty printed string for the cumulative parallel part */
-	IntervalToString(timings->tableDurationMs,
-					 timings->totalTableMs,
-					 INTSTRING_MAX_DIGITS);
-
-	IntervalToString(timings->indexDurationMs,
-					 timings->totalIndexMs,
-					 INTSTRING_MAX_DIGITS);
+	return true;
 }
 
 
@@ -769,7 +2729,6 @@ void
 print_toplevel_summary(Summary *summary)
 {
 	char *d10s = "----------";
-	char *s10s = "          ";
 	char *d12s = "------------";
 	char *d50s = "--------------------------------------------------";
 
@@ -778,62 +2737,34 @@ print_toplevel_summary(Summary *summary)
 	fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n",
 			"Step", "Connection", "Duration", "Transfer", "Concurrency");
 
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n", d50s, d10s, d10s, d10s, d12s);
+	fformat(stdout,
+			" %50s   %10s  %10s  %10s  %12s\n",
+			d50s, d10s, d10s, d10s, d12s);
 
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n", "Dump Schema", "source",
-			summary->timings.dumpSchemaMs, s10s, 1);
+	for (int i = 0; i < topLevelTimingArrayCount; i++)
+	{
+		TopLevelTiming *timing = &(topLevelTimingArray[i]);
 
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n",
-			"Catalog Queries (table ordering, filtering, etc)",
-			"source",
-			summary->timings.fetchSchemaMs,
-			s10s,
-			1);
+		/* skip the internal unknown section */
+		if (timing->section == TIMING_SECTION_UNKNOWN)
+		{
+			continue;
+		}
 
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n", "Prepare Schema", "target",
-			summary->timings.prepareSchemaMs, s10s, 1);
+		if (i + 1 == topLevelTimingArrayCount)
+		{
+			fformat(stdout,
+					" %50s   %10s  %10s  %10s  %12s\n",
+					d50s, d10s, d10s, d10s, d12s);
+		}
 
-	char concurrency[BUFSIZE] = { 0 };
-	sformat(concurrency, sizeof(concurrency), "%d + %d",
-			summary->tableJobs,
-			summary->tableJobs + summary->indexJobs);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n",
-			"COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)", "both",
-			summary->timings.dataAndIndexMs,
-			s10s,
-			concurrency);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n",
-			"COPY (cumulative)", "both",
-			summary->timings.totalTableMs,
-			summary->table.totalBytesStr,
-			summary->tableJobs);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n",
-			"Large Objects (cumulative)", "both",
-			summary->timings.blobsMs,
-			s10s,
-			summary->lObjectJobs);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n",
-			"CREATE INDEX, CONSTRAINTS (cumulative)", "target",
-			summary->timings.totalIndexMs,
-			s10s,
-			summary->indexJobs);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n", "Finalize Schema", "target",
-			summary->timings.finalizeSchemaMs, s10s, 1);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n", d50s, d10s, d10s, d10s, d12s);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n",
-			"Total Wall Clock Duration", "both",
-			summary->timings.totalMs,
-			s10s,
-			concurrency);
-
-	fformat(stdout, " %50s   %10s  %10s  %10s  %12s\n", d50s, d10s, d10s, d10s, d12s);
+		fformat(stdout, " %50s   %10s  %10s  %10s  %12d\n",
+				timing->label,
+				timing->conn,
+				timing->ppDuration,
+				timing->bytes > 0 ? timing->ppBytes : "",
+				TopLevelTimingConcurrency(summary, timing));
+	}
 
 	fformat(stdout, "\n");
 }
@@ -855,19 +2786,21 @@ print_summary_table(SummaryTable *summary)
 
 	fformat(stdout, "\n");
 
-	fformat(stdout, "%*s | %*s | %*s | %*s | %*s | %*s | %*s\n",
+	fformat(stdout, "%*s | %*s | %*s | %*s | %*s | %*s | %*s | %*s \n",
 			headers->maxOidSize, "OID",
 			headers->maxNspnameSize, "Schema",
 			headers->maxRelnameSize, "Name",
+			headers->maxPartCountSize, "Parts",
 			headers->maxTableMsSize, "copy duration",
 			headers->maxBytesSize, "transmitted bytes",
 			headers->maxIndexCountSize, "indexes",
 			headers->maxIndexMsSize, "create index duration");
 
-	fformat(stdout, "%s-+-%s-+-%s-+-%s-+-%s-+-%s-+-%s\n",
+	fformat(stdout, "%s-+-%s-+-%s-+-%s-+-%s-+-%s-+-%s-+-%s\n",
 			headers->oidSeparator,
 			headers->nspnameSeparator,
 			headers->relnameSeparator,
+			headers->partCountSeparator,
 			headers->tableMsSeparator,
 			headers->bytesSeparator,
 			headers->indexCountSeparator,
@@ -877,10 +2810,11 @@ print_summary_table(SummaryTable *summary)
 	{
 		SummaryTableEntry *entry = &(summary->array[i]);
 
-		fformat(stdout, "%*s | %*s | %*s | %*s | %*s | %*s | %*s\n",
+		fformat(stdout, "%*s | %*s | %*s | %*s | %*s | %*s | %*s | %*s\n",
 				headers->maxOidSize, entry->oidStr,
 				headers->maxNspnameSize, entry->nspname,
 				headers->maxRelnameSize, entry->relname,
+				headers->maxPartCountSize, entry->partCount,
 				headers->maxTableMsSize, entry->tableMs,
 				headers->maxBytesSize, entry->bytesStr,
 				headers->maxIndexCountSize, entry->indexCount,
@@ -906,115 +2840,27 @@ print_summary_as_json(Summary *summary, const char *filename)
 	json_object_dotset_number(jsobj, "setup.table-jobs", summary->tableJobs);
 	json_object_dotset_number(jsobj, "setup.index-jobs", summary->indexJobs);
 
-	TopLevelTimings *timings = &(summary->timings);
-
 	JSON_Value *jsSteps = json_value_init_array();
 	JSON_Array *jsStepArray = json_value_get_array(jsSteps);
 
-	JSON_Value *jsDumpSchema = json_value_init_object();
-	JSON_Object *jsDSObj = json_value_get_object(jsDumpSchema);
+	for (int i = 0; i < topLevelTimingArrayCount; i++)
+	{
+		TopLevelTiming *timing = &(topLevelTimingArray[i]);
 
-	json_object_set_string(jsDSObj, "label", "dump schema");
-	json_object_set_string(jsDSObj, "conn", "source");
-	json_object_set_number(jsDSObj, "duration",
-						   timings->dumpSchemaDurationMs);
-	json_object_set_number(jsDSObj, "concurrency", 1);
+		JSON_Value *jsStep = json_value_init_object();
+		JSON_Object *jsStepObj = json_value_get_object(jsStep);
 
-	json_array_append_value(jsStepArray, jsDumpSchema);
+		json_object_set_string(jsStepObj, "label", timing->label);
+		json_object_set_string(jsStepObj, "conn", timing->conn);
+		json_object_set_number(jsStepObj, "duration", timing->durationMs);
+		json_object_set_string(jsStepObj, "duration_pretty", timing->ppDuration);
 
-	JSON_Value *jsCatalog = json_value_init_object();
-	JSON_Object *jsCatObj = json_value_get_object(jsCatalog);
+		int concurrency = TopLevelTimingConcurrency(summary, timing);
 
-	json_object_set_string(jsCatObj, "label", "Catalog Queries");
-	json_object_set_string(jsCatObj, "conn", "source");
-	json_object_set_number(jsCatObj, "duration",
-						   timings->fetchSchemaDurationMs);
-	json_object_set_number(jsCatObj, "concurrency", 1);
+		json_object_set_number(jsStepObj, "concurrency", concurrency);
 
-	json_array_append_value(jsStepArray, jsCatalog);
-
-	JSON_Value *jsPrep = json_value_init_object();
-	JSON_Object *jsPrepObj = json_value_get_object(jsPrep);
-
-	json_object_set_string(jsPrepObj, "label", "Prepare Schema");
-	json_object_set_string(jsPrepObj, "conn", "target");
-	json_object_set_number(jsPrepObj, "duration",
-						   timings->prepareSchemaDurationMs);
-	json_object_set_number(jsPrepObj, "concurrency", 1);
-
-	json_array_append_value(jsStepArray, jsPrep);
-
-	JSON_Value *jsDB = json_value_init_object();
-	JSON_Object *jsDBObj = json_value_get_object(jsDB);
-
-	json_object_set_string(jsDBObj, "label",
-						   "COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)");
-	json_object_set_string(jsDBObj, "conn", "both");
-	json_object_set_number(jsDBObj, "duration",
-						   timings->dataAndIndexesDurationMs);
-	json_object_set_number(jsDBObj, "concurrency",
-						   summary->tableJobs + summary->indexJobs);
-
-	json_array_append_value(jsStepArray, jsDB);
-
-	JSON_Value *jsCopy = json_value_init_object();
-	JSON_Object *jsCopyObj = json_value_get_object(jsCopy);
-
-	json_object_set_string(jsCopyObj, "label", "COPY (cumulative)");
-	json_object_set_string(jsCopyObj, "conn", "both");
-	json_object_set_number(jsCopyObj, "duration", timings->tableDurationMs);
-	json_object_set_number(jsCopyObj, "concurrency", summary->tableJobs);
-
-	json_object_dotset_number(jsCopyObj, "network.bytes",
-							  summary->table.totalBytes);
-	json_object_dotset_string(jsCopyObj, "network.bytes-pretty",
-							  summary->table.totalBytesStr);
-
-	json_array_append_value(jsStepArray, jsCopy);
-
-	JSON_Value *jsBlob = json_value_init_object();
-	JSON_Object *jsBlobObj = json_value_get_object(jsBlob);
-
-	json_object_set_string(jsBlobObj, "label", "Large Objects (cumulative)");
-	json_object_set_string(jsBlobObj, "conn", "both");
-	json_object_set_number(jsBlobObj, "duration", timings->blobDurationMs);
-	json_object_set_number(jsBlobObj, "concurrency", summary->lObjectJobs);
-
-	json_array_append_value(jsStepArray, jsBlob);
-
-	JSON_Value *jsIndex = json_value_init_object();
-	JSON_Object *jsIndexObj = json_value_get_object(jsIndex);
-
-	json_object_set_string(jsIndexObj, "label",
-						   "CREATE INDEX, CONSTRAINTS (cumulative)");
-	json_object_set_string(jsIndexObj, "conn", "target");
-	json_object_set_number(jsIndexObj, "duration", timings->indexDurationMs);
-	json_object_set_number(jsIndexObj, "concurrency", summary->indexJobs);
-
-	json_array_append_value(jsStepArray, jsIndex);
-
-	JSON_Value *jsFin = json_value_init_object();
-	JSON_Object *jsFinObj = json_value_get_object(jsFin);
-
-	json_object_set_string(jsFinObj, "label", "Finalize Schema");
-	json_object_set_string(jsFinObj, "conn", "target");
-	json_object_set_number(jsFinObj, "duration", timings->finalizeSchemaDurationMs);
-	json_object_set_number(jsFinObj, "concurrency", 1);
-
-	json_array_append_value(jsStepArray, jsFin);
-
-	JSON_Value *jsTotal = json_value_init_object();
-	JSON_Object *jsTotalObj = json_value_get_object(jsTotal);
-
-	json_object_set_string(jsTotalObj, "label", "Total Wall Clock Duration");
-	json_object_set_string(jsTotalObj, "conn", "both");
-	json_object_set_number(jsTotalObj, "duration", timings->totalDurationMs);
-
-	json_object_set_number(jsTotalObj,
-						   "concurrency",
-						   summary->tableJobs + summary->indexJobs);
-
-	json_array_append_value(jsStepArray, jsTotal);
+		json_array_append_value(jsStepArray, jsStep);
+	}
 
 	json_object_set_value(jsobj, "steps", jsSteps);
 
@@ -1109,7 +2955,6 @@ print_summary_as_json(Summary *summary, const char *filename)
 	}
 
 	json_free_serialized_string(serialized_string);
-	json_value_free(js);
 }
 
 
@@ -1127,6 +2972,7 @@ prepare_summary_table_headers(SummaryTable *summary)
 	headers->maxOidSize = 3;        /* "oid" */
 	headers->maxNspnameSize = 6;    /* "schema" */
 	headers->maxRelnameSize = 4;    /* "name" */
+	headers->maxPartCountSize = 5;    /* "parts" */
 	headers->maxTableMsSize = 13;   /* "copy duration" */
 	headers->maxBytesSize = 17;     /* "transmitted bytes" */
 	headers->maxIndexCountSize = 7; /* "indexes" */
@@ -1157,6 +3003,13 @@ prepare_summary_table_headers(SummaryTable *summary)
 		if (headers->maxRelnameSize < len)
 		{
 			headers->maxRelnameSize = len;
+		}
+
+		len = strlen(entry->partCount);
+
+		if (headers->maxPartCountSize < len)
+		{
+			headers->maxPartCountSize = len;
 		}
 
 		len = strlen(entry->tableMs);
@@ -1192,6 +3045,7 @@ prepare_summary_table_headers(SummaryTable *summary)
 	prepareLineSeparator(headers->oidSeparator, headers->maxOidSize);
 	prepareLineSeparator(headers->nspnameSeparator, headers->maxNspnameSize);
 	prepareLineSeparator(headers->relnameSeparator, headers->maxRelnameSize);
+	prepareLineSeparator(headers->partCountSeparator, headers->maxPartCountSize);
 	prepareLineSeparator(headers->tableMsSeparator, headers->maxTableMsSize);
 	prepareLineSeparator(headers->bytesSeparator, headers->maxBytesSize);
 	prepareLineSeparator(headers->indexCountSeparator, headers->maxIndexCountSize);
@@ -1229,23 +3083,26 @@ prepareLineSeparator(char dashes[], int size)
  * creating those indexes.
  */
 bool
-print_summary(Summary *summary, CopyDataSpec *specs)
+print_summary(CopyDataSpec *specs)
 {
-	SummaryTable *summaryTable = &(summary->table);
+	Summary summary = { 0 };
+	SummaryTable *summaryTable = &(summary.table);
 
-	summary->tableJobs = specs->tableJobs;
-	summary->indexJobs = specs->indexJobs;
-	summary->lObjectJobs = specs->lObjectJobs;
+	summary.tableJobs = specs->tableJobs;
+	summary.indexJobs = specs->indexJobs;
+	summary.vacuumJobs = specs->vacuumJobs;
+	summary.lObjectJobs = specs->lObjectJobs;
+	summary.restoreJobs = specs->restoreOptions.jobs;
 
 	/* first, we have to scan the available data from memory and files */
-	if (!prepare_summary_table(summary, specs))
+	if (!prepare_summary_table(&summary, specs))
 	{
 		log_error("Failed to prepare the summary table");
 		return false;
 	}
 
 	/* print the summary.json file */
-	(void) print_summary_as_json(summary, specs->cfPaths.summaryfile);
+	(void) print_summary_as_json(&summary, specs->cfPaths.summaryfile);
 
 	/* then we can prepare the headers and print the table */
 	if (specs->section == DATA_SECTION_TABLE_DATA ||
@@ -1256,11 +3113,20 @@ print_summary(Summary *summary, CopyDataSpec *specs)
 	}
 
 	/* and then finally prepare the top-level counters and print them */
-	(void) summary_prepare_toplevel_durations(summary);
-	(void) print_toplevel_summary(summary);
+	(void) summary_prepare_toplevel_durations(specs);
+	(void) print_toplevel_summary(&summary);
 
 	return true;
 }
+
+
+typedef struct SummaryTableContext
+{
+	Summary *summary;
+	CopyDataSpec *specs;
+	uint32_t tableIndex;
+	uint64_t indexingDurationMs;
+} SummaryTableContext;
 
 
 /*
@@ -1270,17 +3136,33 @@ print_summary(Summary *summary, CopyDataSpec *specs)
 bool
 prepare_summary_table(Summary *summary, CopyDataSpec *specs)
 {
-	TopLevelTimings *timings = &(summary->timings);
 	SummaryTable *summaryTable = &(summary->table);
-	CopyTableDataSpecsArray *tableSpecsArray = &(specs->tableSpecsArray);
-	uint64_t *totalBytes = &(summaryTable->totalBytes);
-	*totalBytes = 0;
 
-	int count = tableSpecsArray->count;
+	summaryTable->totalBytes = 0;
 
-	summaryTable->count = count;
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+	CatalogCounts count = { 0 };
+
+	if (!catalog_count_objects(sourceDB, &count))
+	{
+		log_error("Failed to count indexes and constraints in our catalogs");
+		return false;
+	}
+
+	log_info("Printing summary for %lld tables and %lld indexes",
+			 (long long) count.tables,
+			 (long long) count.indexes);
+
+	summaryTable->count = count.tables;
+
+	if (count.tables == 0)
+	{
+		summaryTable->array = NULL;
+		return true;
+	}
+
 	summaryTable->array =
-		(SummaryTableEntry *) calloc(count, sizeof(SummaryTableEntry));
+		(SummaryTableEntry *) calloc(count.tables, sizeof(SummaryTableEntry));
 
 	if (summaryTable->array == NULL)
 	{
@@ -1288,187 +3170,188 @@ prepare_summary_table(Summary *summary, CopyDataSpec *specs)
 		return false;
 	}
 
-	for (int tableIndex = 0; tableIndex < tableSpecsArray->count; tableIndex++)
+	SummaryTableContext context = {
+		.specs = specs,
+		.summary = summary,
+		.tableIndex = 0
+	};
+
+	if (!catalog_iter_s_table(sourceDB,
+							  &context,
+							  &prepare_summary_table_hook))
 	{
-		CopyTableDataSpec *tableSpecs = &(tableSpecsArray->array[tableIndex]);
-		SourceTable *table = tableSpecs->sourceTable;
-
-		SummaryTableEntry *entry = &(summaryTable->array[tableIndex]);
-
-		/* prepare some of the information we already have */
-		IntString oidString = intToString(table->oid);
-
-		entry->oid = table->oid;
-		strlcpy(entry->oidStr, oidString.strValue, sizeof(entry->oidStr));
-		strlcpy(entry->nspname, table->nspname, sizeof(entry->nspname));
-		strlcpy(entry->relname, table->relname, sizeof(entry->relname));
-
-		/* the specs doesn't contain timing information or bytes transmitted */
-		CopyTableSummary tableSummary = { .table = table };
-
-		if (!read_table_summary(&tableSummary, tableSpecs->tablePaths.doneFile))
-		{
-			log_error("Failed to read table summary \"%s\"",
-					  tableSpecs->tablePaths.doneFile);
-			return false;
-		}
-
-		*totalBytes += tableSummary.bytesTransmitted;
-
-		entry->bytes = tableSummary.bytesTransmitted;
-		pretty_print_bytes(entry->bytesStr,
-						   sizeof(entry->bytesStr),
-						   entry->bytes);
-		pretty_print_bytes_per_second(entry->transmitRate,
-									  sizeof(entry->transmitRate),
-									  tableSummary.bytesTransmitted,
-									  tableSummary.durationMs);
-
-		entry->durationTableMs = tableSummary.durationMs;
-		timings->tableDurationMs += tableSummary.durationMs;
-
-		(void) IntervalToString(tableSummary.durationMs,
-								entry->tableMs,
-								sizeof(entry->tableMs));
-
-		/* read the index oid list from the table oid */
-		uint64_t indexingDurationMs = 0;
-
-		SourceIndexArray indexArray = { 0 };
-
-		/* make sure to always initialize this memory area */
-		entry->indexArray.count = 0;
-		entry->indexArray.array = NULL;
-
-		entry->constraintArray.count = 0;
-		entry->constraintArray.array = NULL;
-
-		/*
-		 * When the table COPY processing was split into several processes,
-		 * ensure we only read the index list once: only one of those COPY
-		 * processes started the indexing.
-		 */
-		if (tableSpecs->part.partNumber == 0)
-		{
-			if (!read_table_index_file(&indexArray,
-									   tableSpecs->tablePaths.idxListFile))
-			{
-				log_error("Failed to read table index file \"%s\"",
-						  tableSpecs->tablePaths.idxListFile);
-				return false;
-			}
-
-			/* prepare for as many constraints as indexes */
-			entry->indexArray.array =
-				(SummaryIndexEntry *) calloc(indexArray.count,
-											 sizeof(SummaryIndexEntry));
-
-			entry->constraintArray.array =
-				(SummaryIndexEntry *) calloc(indexArray.count,
-											 sizeof(SummaryIndexEntry));
-
-			if (entry->indexArray.array == NULL ||
-				entry->constraintArray.array == NULL)
-			{
-				log_error(ALLOCATION_FAILED_ERROR);
-				return false;
-			}
-
-			/* for reach index, read the index summary */
-			for (int i = 0; i < indexArray.count; i++)
-			{
-				SourceIndex *index = &(indexArray.array[i]);
-
-				CopyFilePaths *cfPaths = &(specs->cfPaths);
-				IndexFilePaths indexPaths = { 0 };
-
-				if (!copydb_init_index_paths(cfPaths, index, &indexPaths))
-				{
-					/* errors have already been logged */
-					return false;
-				}
-
-				/* when a table has no indexes, the file doesn't exists */
-				if (file_exists(indexPaths.doneFile))
-				{
-					SummaryIndexEntry *indexEntry =
-						&(entry->indexArray.array[(entry->indexArray.count)++]);
-
-					if (!summary_read_index_donefile(index,
-													 indexPaths.doneFile,
-													 false, /* constraint */
-													 indexEntry))
-					{
-						log_error("Failed to read index done file \"%s\"",
-								  indexPaths.doneFile);
-						return false;
-					}
-
-					/* accumulate total duration of creating all the indexes */
-					timings->indexDurationMs += indexEntry->durationMs;
-					indexingDurationMs += indexEntry->durationMs;
-				}
-
-				if (file_exists(indexPaths.constraintDoneFile))
-				{
-					SummaryIndexArray *constraintArray =
-						&(entry->constraintArray);
-
-					SummaryIndexEntry *indexEntry =
-						&(constraintArray->array[(constraintArray->count)++]);
-
-					if (!summary_read_index_donefile(index,
-													 indexPaths.constraintDoneFile,
-													 true, /* constraint */
-													 indexEntry))
-					{
-						log_error("Failed to read index done file \"%s\"",
-								  indexPaths.constraintDoneFile);
-						return false;
-					}
-
-					/* accumulate total duration of creating all the indexes */
-					timings->indexDurationMs += indexEntry->durationMs;
-					indexingDurationMs += indexEntry->durationMs;
-				}
-			}
-		}
-
-		IntString indexCountString = intToString(indexArray.count);
-
-		strlcpy(entry->indexCount,
-				indexCountString.strValue,
-				sizeof(entry->indexCount));
-
-		(void) IntervalToString(indexingDurationMs,
-								entry->indexMs,
-								sizeof(entry->indexMs));
-
-		entry->durationIndexMs = indexingDurationMs;
+		log_error("Failed to prepare the table summary");
+		return false;
 	}
 
 	/* write pretty printed total bytes value */
-	pretty_print_bytes(summary->table.totalBytesStr, BUFSIZE, *totalBytes);
+	(void) pretty_print_bytes(summary->table.totalBytesStr,
+							  BUFSIZE,
+							  summary->table.totalBytes);
 
-	/*
-	 * Also read the blobs summary file.
-	 */
-	if (file_exists(specs->cfPaths.done.blobs))
+	return true;
+}
+
+
+/*
+ * prepare_summary_table_hook is an iterator callback function.
+ */
+static bool
+prepare_summary_table_hook(void *ctx, SourceTable *table)
+{
+	SummaryTableContext *context = (SummaryTableContext *) ctx;
+
+	CopyDataSpec *specs = (CopyDataSpec *) context->specs;
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	SummaryTable *summaryTable = &(context->summary->table);
+
+	SummaryTableEntry *entry = &(summaryTable->array[context->tableIndex]);
+
+	int partCount =
+		table->partition.partCount == 0 ? 1 : table->partition.partCount;
+
+	/* prepare some of the information we already have */
+	IntString oidString = intToString(table->oid);
+	IntString pcStr = intToString(partCount);
+
+	entry->oid = table->oid;
+	strlcpy(entry->partCount, pcStr.strValue, sizeof(entry->partCount));
+	strlcpy(entry->oidStr, oidString.strValue, sizeof(entry->oidStr));
+	strlcpy(entry->nspname, table->nspname, sizeof(entry->nspname));
+	strlcpy(entry->relname, table->relname, sizeof(entry->relname));
+
+	entry->durationTableMs = table->durationMs;
+
+	(void) IntervalToString(table->durationMs,
+							entry->tableMs,
+							sizeof(entry->tableMs));
+
+	entry->bytes = table->bytesTransmitted;
+	summaryTable->totalBytes += table->bytesTransmitted;
+
+	pretty_print_bytes(entry->bytesStr,
+					   sizeof(entry->bytesStr),
+					   entry->bytes);
+
+	pretty_print_bytes_per_second(entry->transmitRate,
+								  sizeof(entry->transmitRate),
+								  entry->bytes,
+								  entry->durationTableMs);
+
+	/* read the index oid list from the table oid */
+	context->indexingDurationMs = 0;
+
+	if (!catalog_s_table_count_indexes(sourceDB, table))
 	{
-		CopyBlobsSummary blobsSummary = { 0 };
+		/* errors have already been logged */
+		return false;
+	}
 
-		if (!read_blobs_summary(&blobsSummary, specs->cfPaths.done.blobs))
+	/* make sure to always initialize this memory area */
+	entry->indexArray.count = 0;
+	entry->indexArray.array = NULL;
+
+	entry->constraintArray.count = 0;
+	entry->constraintArray.array = NULL;
+
+	if (table->indexCount > 0)
+	{
+		/* prepare for as many constraints as indexes */
+		entry->indexArray.array =
+			(SummaryIndexEntry *) calloc(table->indexCount,
+										 sizeof(SummaryIndexEntry));
+
+		entry->constraintArray.array =
+			(SummaryIndexEntry *) calloc(table->constraintCount,
+										 sizeof(SummaryIndexEntry));
+
+		if (entry->indexArray.array == NULL ||
+			entry->constraintArray.array == NULL)
 		{
-			log_error("Failed to read blog summary file \"%s\"",
-					  specs->cfPaths.done.blobs);
+			log_error(ALLOCATION_FAILED_ERROR);
 			return false;
 		}
 
-		timings->blobDurationMs = blobsSummary.durationMs;
+		if (!catalog_iter_s_index_table(sourceDB,
+										table->nspname,
+										table->relname,
+										ctx,
+										prepare_summary_table_index_hook))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
 
-		(void) IntervalToString(blobsSummary.durationMs,
-								timings->blobsMs,
-								sizeof(timings->blobsMs));
+	IntString indexCountString = intToString(table->indexCount);
+
+	strlcpy(entry->indexCount,
+			indexCountString.strValue,
+			sizeof(entry->indexCount));
+
+	(void) IntervalToString(context->indexingDurationMs,
+							entry->indexMs,
+							sizeof(entry->indexMs));
+
+	entry->durationIndexMs = context->indexingDurationMs;
+
+	/* prepare context for next iteration */
+	++context->tableIndex;
+
+	return true;
+}
+
+
+/*
+ * prepare_summary_table_hook is an iterator callback function.
+ */
+static bool
+prepare_summary_table_index_hook(void *ctx, SourceIndex *index)
+{
+	SummaryTableContext *context = (SummaryTableContext *) ctx;
+
+	CopyDataSpec *specs = (CopyDataSpec *) context->specs;
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	SummaryTable *summaryTable = &(context->summary->table);
+
+	SummaryTableEntry *entry = &(summaryTable->array[context->tableIndex]);
+
+	SummaryIndexEntry *indexEntry =
+		&(entry->indexArray.array[(entry->indexArray.count)++]);
+
+	if (!summary_prepare_index_entry(sourceDB,
+									 index,
+									 false, /* constraint */
+									 indexEntry))
+	{
+		log_error("Failed to read index summary");
+		return false;
+	}
+
+	/* accumulate total duration of creating all the indexes */
+	context->indexingDurationMs += indexEntry->durationMs;
+
+	if (index->constraintOid > 0)
+	{
+		SummaryIndexArray *constraintArray =
+			&(entry->constraintArray);
+
+		SummaryIndexEntry *constraintEntry =
+			&(constraintArray->array[(constraintArray->count)++]);
+
+		if (!summary_prepare_index_entry(sourceDB,
+										 index,
+										 true, /* constraint */
+										 constraintEntry))
+		{
+			log_error("Failed to read constraint summary");
+			return false;
+		}
+
+		/* accumulate total duration of creating all the indexes */
+		context->indexingDurationMs += constraintEntry->durationMs;
 	}
 
 	return true;
@@ -1480,53 +3363,115 @@ prepare_summary_table(Summary *summary, CopyDataSpec *specs)
  * information found in the SummaryIndexEntry structure.
  */
 bool
-summary_read_index_donefile(SourceIndex *index,
-							const char *filename,
+summary_prepare_index_entry(DatabaseCatalog *catalog,
+							SourceIndex *index,
 							bool constraint,
 							SummaryIndexEntry *indexEntry)
 {
-	CopyIndexSummary indexSummary = { .index = index };
-
-	if (!read_index_summary(&indexSummary, filename))
-	{
-		/* errors have already been logged */
-		return false;
-	}
+	CopyIndexSpec indexSpecs = { .sourceIndex = index };
+	CopyIndexSummary *indexSummary = &(indexSpecs.summary);
 
 	if (constraint)
 	{
-		indexEntry->oid = indexSummary.index->constraintOid;
+		if (!summary_lookup_constraint(catalog, &indexSpecs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 
-		IntString oidString = intToString(indexSummary.index->constraintOid);
+		indexEntry->oid = index->constraintOid;
+
+		IntString oidString = intToString(index->constraintOid);
 		strlcpy(indexEntry->oidStr,
 				oidString.strValue,
 				sizeof(indexEntry->oidStr));
 	}
 	else
 	{
-		indexEntry->oid = indexSummary.index->indexOid;
+		if (!summary_lookup_index(catalog, &indexSpecs))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 
-		IntString oidString = intToString(indexSummary.index->indexOid);
+		indexEntry->oid = index->indexOid;
+
+		IntString oidString = intToString(index->indexOid);
 		strlcpy(indexEntry->oidStr,
 				oidString.strValue,
 				sizeof(indexEntry->oidStr));
 	}
 
 	strlcpy(indexEntry->nspname,
-			indexSummary.index->indexNamespace,
+			indexSummary->index->indexNamespace,
 			sizeof(indexEntry->nspname));
 
 	strlcpy(indexEntry->relname,
-			indexSummary.index->indexRelname,
+			index->indexRelname,
 			sizeof(indexEntry->relname));
 
-	indexEntry->sql = strdup(indexSummary.command);
+	if (indexSummary->command != NULL)
+	{
+		indexEntry->sql = strdup(indexSummary->command);
+	}
 
-	indexEntry->durationMs = indexSummary.durationMs;
+	indexEntry->durationMs = indexSummary->durationMs;
 
-	(void) IntervalToString(indexSummary.durationMs,
+	(void) IntervalToString(indexSummary->durationMs,
 							indexEntry->indexMs,
 							sizeof(indexEntry->indexMs));
 
 	return true;
+}
+
+
+/*
+ * TopLevelTimingConcurrency computes the actual job concurrency.
+ */
+int
+TopLevelTimingConcurrency(Summary *summary, TopLevelTiming *timing)
+{
+	int concurrency = 0;
+
+	if (timing->jobsMask & TIMING_SINGLE_JOB)
+	{
+		concurrency += 1;
+	}
+
+	if (timing->jobsMask & TIMING_TABLE_JOBS)
+	{
+		concurrency += summary->tableJobs;
+	}
+
+	if (timing->jobsMask & TIMING_INDEX_JOBS)
+	{
+		concurrency += summary->indexJobs;
+	}
+
+	if (timing->jobsMask & TIMING_VACUUM_JOBS)
+	{
+		concurrency += summary->vacuumJobs;
+	}
+
+	if (timing->jobsMask & TIMING_RESTORE_JOBS)
+	{
+		concurrency += summary->restoreJobs;
+	}
+
+	if (timing->jobsMask & TIMING_LOBJECTS_JOBS)
+	{
+		concurrency += summary->lObjectJobs;
+	}
+
+	if (timing->jobsMask & TIMING_ALL_JOBS)
+	{
+		concurrency =
+			summary->tableJobs +
+			summary->indexJobs +
+			summary->vacuumJobs +
+			summary->restoreJobs +
+			summary->lObjectJobs;
+	}
+
+	return concurrency;
 }

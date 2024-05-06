@@ -24,10 +24,17 @@ copy="\COPY rides FROM nyc_data_rides.10k.csv CSV"
 psql -d ${PGCOPYDB_SOURCE_PGURI} -1 -c "${copy}"
 
 # take a snapshot using role tsdb on source database
-coproc ( pgcopydb snapshot --follow --plugin wal2json )
+coproc ( pgcopydb snapshot --follow --plugin wal2json)
 
 # wait for snapshot to be created
 while [ ! -f /tmp/pgcopydb/snapshot ]; do sleep 1; done
+
+dbf=/tmp/pgcopydb/schema/source.db
+
+while [ ! -s ${dbf} ]
+do
+    sleep 1
+done
 
 # copying roles needs superuser
 # and we use the postgres database here still
@@ -45,16 +52,12 @@ psql ${PGCOPYDB_TARGET_PGURI_SU} -f /usr/src/pgcopydb/tsdb_grants.sql
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
     -c 'select public.timescaledb_pre_restore();'
 
-pgcopydb copy extensions --source ${PGCOPYDB_SOURCE_PGURI_SU} \
-  --target ${PGCOPYDB_TARGET_PGURI_SU} --resume
-
 pgcopydb stream setup
 
+pgcopydb copy extensions --resume --no-acl --no-owner
+
 # now clone with superuser privileges, seems to be required for timescaledb
-pgcopydb clone \
-         --skip-extensions \
-         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
-         --target ${PGCOPYDB_TARGET_PGURI_SU}
+pgcopydb clone --skip-extensions --no-acl --no-owner
 
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
     -f - <<'EOF'

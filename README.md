@@ -49,7 +49,6 @@ $ pgcopydb help
     clone     Clone an entire database from source to target
     fork      Clone an entire database from source to target
     follow    Replay changes from the source database to the target database
-    copy-db   Clone an entire database from source to target
     snapshot  Create and export a snapshot on the source database
   + compare   Compare source and target databases
   + copy      Implement the data section of the database copy
@@ -181,59 +180,7 @@ an overall summary that looks like the following:
 
 ## Installing pgcopydb
 
-Several distributions are available for pgcopydb:
-
-  1. Install from either debian sid or testing (see [debian package for
-     pgcopydb](https://packages.debian.org/search?keywords=pgcopydb), or
-     from [apt.postgresql.org](https://wiki.postgresql.org/wiki/Apt)
-     packages by following the linked documentation and then:
-
-	 ```
-	 $ sudo apt-get install pgcopydb
-	 ```
-
-  2. Install from [yum.postgresql.org](https://yum.postgresql.org) is not
-     available at this time.
-
-  3. Use a docker image.
-
-     Either use
-     [dimitri/pgcopydb](https://hub.docker.com/r/dimitri/pgcopydb#!) from
-     DockerHub, where the latest release is made available with the Postgres
-     version currently in debian stable.
-
-	 ```
-	 $ docker run --rm -it dimitri/pgcopydb:v0.14 pgcopydb --version
-	 ```
-
-	 Or you can use the CI/CD integration that publishes packages from the
-     main branch to the GitHub docker repository:
-
-	 ```
-	 $ docker pull ghcr.io/dimitri/pgcopydb:latest
-	 $ docker run --rm -it ghcr.io/dimitri/pgcopydb:latest pgcopydb --version
-	 $ docker run --rm -it ghcr.io/dimitri/pgcopydb:latest pgcopydb --help
-	 ```
-
-  4. Build from sources
-
-     Building from source requires a list of build-dependencies that's
-     comparable to that of Postgres itself. The pgcopydb source code is
-     written in C and the build process uses a GNU Makefile.
-
-	 See our main
-     [Dockerfile](https://github.com/dimitri/pgcopydb/blob/main/Dockerfile)
-     for a complete recipe to build pgcopydb when using a debian environment.
-
-	 Then the build process is pretty simple, in its simplest form you can
-     just use `make clean install`, if you want to be more fancy consider
-     also:
-
-	 ```
-	 $ make -s clean
-	 $ make -s -j12 install
-	 ```
-
+See our [documentation](https://pgcopydb.readthedocs.io/en/latest/install.html).
 
 ## Design Considerations (why oh why)
 

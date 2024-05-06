@@ -15,6 +15,10 @@ typedef struct ChunkHypertableMap
 } ChunkHypertableMap;
 
 
+static bool tableExists(PGSQL *pgsql, const char *nspname,
+						const char *relname,
+						bool *exists);
+
 static ChunkHypertableMap *chunkHypertableMap = NULL;
 
 /*
@@ -66,6 +70,54 @@ parseHypertableDetails(void *ctx, PGresult *res)
 }
 
 
+/*
+ * tableExists checks that a role with the given table exists on the
+ * Postgres server.
+ */
+static bool
+tableExists(PGSQL *pgsql,
+			const char *nspname,
+			const char *relname,
+			bool *exists)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	char *existsQuery =
+		"select exists( "
+		"         select 1 "
+		"           from pg_class c "
+		"                join pg_namespace n on n.oid = c.relnamespace "
+		"          where format('%I', n.nspname) = $1 "
+		"            and format('%I', c.relname) = $2"
+		"       )";
+
+	int paramCount = 2;
+	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { 0 };
+
+	paramValues[0] = nspname;
+	paramValues[1] = relname;
+
+	if (!pgsql_execute_with_params(pgsql, existsQuery,
+								   paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check if \"%s\".\"%s\" exists", nspname, relname);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to check if \"%s\".\"%s\" exists", nspname, relname);
+		return false;
+	}
+
+	*exists = context.boolVal;
+
+	return true;
+}
+
+
 static bool isTimescale = false;
 
 bool
@@ -77,7 +129,7 @@ timescale_init(PGSQL *pgsql, char *pguri)
 		return false;
 	}
 
-	if (!pgsql_table_exists(pgsql, "_timescaledb_catalog", "hypertable", &isTimescale))
+	if (!tableExists(pgsql, "_timescaledb_catalog", "hypertable", &isTimescale))
 	{
 		/* errors have already been logged */
 		return false;
@@ -148,6 +200,7 @@ timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
 	}
 
 	uint32_t targetHypertableID;
+
 	if (!extract_hypertable_id(relname_in, &targetHypertableID))
 	{
 		log_error("BUG: Failed to find hypertable id from %s.%s", nspname_in, relname_in);
@@ -155,8 +208,10 @@ timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
 	}
 
 	ChunkHypertableMap *foundMapEntry;
+
 	HASH_FIND_INT(chunkHypertableMap, &targetHypertableID, foundMapEntry);
-	if (!foundMapEntry)
+
+	if (foundMapEntry == NULL)
 	{
 		log_error("Failed to find hypertable from map for %s.%s", nspname_in, relname_in);
 		return false;
@@ -180,7 +235,7 @@ timescale_is_chunk(const char *nspname_in, const char *relname_in)
 	}
 
 	/* Chunk will be always present in _timescaledb_internal schema */
-	if (streq(nspname_in, "_timescaledb_internal") &&
+	if ((streq(nspname_in, "_timescaledb_internal") &&
 		strstr(relname_in, "_hyper_"))
 	{
 		return true;

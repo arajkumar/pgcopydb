@@ -15,6 +15,7 @@
 #include "postgres_fe.h"
 #include "pqexpbuffer.h"
 
+#include "catalog.h"
 #include "cli_root.h"
 #include "defaults.h"
 #include "env_utils.h"
@@ -27,8 +28,17 @@
 #include "signals.h"
 #include "string_utils.h"
 
+/*
+ * Because we did include defaults.h previously in the same compilation unit (a
+ * .c file), then the runprogram.h code is linked to the Garbage-Collector:
+ * calls to malloc() in there are replaced by calls to GC_malloc() as per
+ * defaults.h #define instructions.
+ *
+ * As a result we never call free_program().
+ */
 #define RUN_PROGRAM_IMPLEMENTATION
 #include "runprogram.h"
+
 
 /*
  * Get psql --version output in pgPaths->pg_version.
@@ -36,29 +46,32 @@
 bool
 psql_version(PostgresPaths *pgPaths)
 {
-	Program prog = run_program(pgPaths->psql, "--version", NULL);
+	Program *prog = run_program(pgPaths->psql, "--version", NULL);
 	char pg_version_string[PG_VERSION_STRING_MAX] = { 0 };
 	int pg_version = 0;
 
-	if (prog.returnCode != 0)
+	if (prog == NULL)
 	{
-		errno = prog.error;
-		log_error("Failed to run \"psql --version\" using program \"%s\": %m",
-				  pgPaths->psql);
-		free_program(&prog);
+		log_error(ALLOCATION_FAILED_ERROR);
 		return false;
 	}
 
-	if (!parse_version_number(prog.stdOut,
+	if (prog->returnCode != 0)
+	{
+		errno = prog->error;
+		log_error("Failed to run \"psql --version\" using program \"%s\": %m",
+				  pgPaths->psql);
+		return false;
+	}
+
+	if (!parse_version_number(prog->stdOut,
 							  pg_version_string,
 							  PG_VERSION_STRING_MAX,
 							  &pg_version))
 	{
 		/* errors have already been logged */
-		free_program(&prog);
 		return false;
 	}
-	free_program(&prog);
 
 	strlcpy(pgPaths->pg_version, pg_version_string, PG_VERSION_STRING_MAX);
 
@@ -189,31 +202,32 @@ set_psql_from_config_bindir(PostgresPaths *pgPaths, const char *pg_config)
 		return false;
 	}
 
-	Program prog = run_program(pg_config, "--bindir", NULL);
+	Program *prog = run_program(pg_config, "--bindir", NULL);
 
-	char *lines[1];
-
-	if (prog.returnCode != 0)
+	if (prog == NULL)
 	{
-		errno = prog.error;
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (prog->returnCode != 0)
+	{
+		errno = prog->error;
 		log_error("Failed to run \"pg_config --bindir\" using program \"%s\": %m",
 				  pg_config);
-		free_program(&prog);
 		return false;
 	}
 
-	if (splitLines(prog.stdOut, lines, 1) != 1)
+	LinesBuffer lbuf = { 0 };
+
+	if (!splitLines(&lbuf, prog->stdOut) || lbuf.count != 1)
 	{
 		log_error("Unable to parse output from pg_config --bindir");
-		free_program(&prog);
 		return false;
 	}
 
-	char *bindir = lines[0];
+	char *bindir = lbuf.lines[0];
 	join_path_components(psql, bindir, "psql");
-
-	/* we're now done with the Program and its output */
-	free_program(&prog);
 
 	if (!file_exists(psql))
 	{
@@ -335,6 +349,13 @@ set_psql_from_pg_config(PostgresPaths *pgPaths)
 }
 
 
+typedef struct DumpExtensionNamespaceContext
+{
+	char **extNamespaces;
+	int *extNamespaceCount;
+} DumpExtensionNamespaceContext;
+
+
 /*
  * Call pg_dump and get the given section of the dump into the target file.
  */
@@ -344,7 +365,7 @@ pg_dump_db(PostgresPaths *pgPaths,
 		   const char *snapshot,
 		   const char *section,
 		   SourceFilters *filters,
-		   SourceExtensionArray *extensionArray,
+		   DatabaseCatalog *filtersDB,
 		   const char *filename)
 {
 	char *args[PG_CMD_MAX_ARG];
@@ -420,32 +441,6 @@ pg_dump_db(PostgresPaths *pgPaths,
 		args[argsIndex++] = nspname;
 	}
 
-	/* now --exclude-schema for extension's own schemas */
-	if (extensionArray != NULL)
-	{
-		for (int i = 0; i < extensionArray->count; i++)
-		{
-			char *nspname = extensionArray->array[i].extnamespace;
-
-			if (!streq(nspname, "public") && !streq(nspname, "pg_catalog"))
-			{
-				/* check that we still have room for --exclude-schema args */
-				if (PG_CMD_MAX_ARG < (argsIndex + 2))
-				{
-					log_error("Failed to call pg_dump, "
-							  "too many schema are excluded: "
-							  "argsIndex %d > %d",
-							  argsIndex + 2,
-							  PG_CMD_MAX_ARG);
-					return false;
-				}
-
-				args[argsIndex++] = "--exclude-schema";
-				args[argsIndex++] = nspname;
-			}
-		}
-	}
-
 	args[argsIndex++] = "--file";
 	args[argsIndex++] = (char *) filename;
 	args[argsIndex++] = (char *) connStrings->safeSourcePGURI.pguri;
@@ -485,12 +480,10 @@ pg_dump_db(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_dump: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -577,12 +570,10 @@ pg_dumpall_roles(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_dump: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -627,8 +618,13 @@ pg_restore_roles(PostgresPaths *pgPaths,
 		return false;
 	}
 
-	char *lines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(content, lines, BUFSIZE);
+	LinesBuffer lbuf = { 0 };
+
+	if (!splitLines(&lbuf, content))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	PGSQL pgsql = { 0 };
 
@@ -654,9 +650,9 @@ pg_restore_roles(PostgresPaths *pgPaths,
 	 */
 	bool skipNextLine = false;
 
-	for (int l = 0; l < lineCount; l++)
+	for (uint64_t l = 0; l < lbuf.count; l++)
 	{
-		char *currentLine = lines[l];
+		char *currentLine = lbuf.lines[l];
 
 		if (skipNextLine)
 		{
@@ -819,7 +815,16 @@ pg_restore_db(PostgresPaths *pgPaths,
 	args[argsIndex++] = (char *) pgPaths->pg_restore;
 	args[argsIndex++] = "--dbname";
 	args[argsIndex++] = (char *) connStrings->safeTargetPGURI.pguri;
-	args[argsIndex++] = "--single-transaction";
+
+	if (options.jobs == 1)
+	{
+		args[argsIndex++] = "--single-transaction";
+	}
+	else
+	{
+		args[argsIndex++] = "--jobs";
+		args[argsIndex++] = intToString(options.jobs).strValue;
+	}
 
 	if (options.dropIfExists)
 	{
@@ -840,6 +845,11 @@ pg_restore_db(PostgresPaths *pgPaths,
 	if (options.noACL)
 	{
 		args[argsIndex++] = "--no-acl";
+	}
+
+	if (options.noTableSpaces)
+	{
+		args[argsIndex++] = "--no-tablespaces";
 	}
 
 	/*
@@ -913,12 +923,10 @@ pg_restore_db(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_restore: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -965,7 +973,6 @@ pg_restore_list(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_restore: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
@@ -973,11 +980,9 @@ pg_restore_list(PostgresPaths *pgPaths,
 	if (!parse_archive_list(listFilename, archive))
 	{
 		/* errors have already been logged */
-		free_program(&program);
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -1091,28 +1096,32 @@ parse_archive_list(const char *filename, ArchiveContentArray *contents)
 		return false;
 	}
 
-	int lineCount = countLines(buffer);
-	char **lines = (char **) calloc(lineCount, sizeof(char *));
-	int splitCount = splitLines(buffer, lines, lineCount);
+	LinesBuffer lbuf = { 0 };
 
-	if (splitCount != lineCount)
+	if (!splitLines(&lbuf, buffer))
 	{
-		log_error("BUG: parse_archive_list counted %d lines "
-				  "and got %d after split",
-				  lineCount,
-				  splitCount);
+		/* errors have already been logged */
 		return false;
+	}
+
+	/*
+	 * If the file contains zero lines, we're done already, Also malloc(zero)
+	 * leads to "corrupted size vs. prev_size" run-time errors.
+	 */
+	if (lbuf.count == 0)
+	{
+		return true;
 	}
 
 	contents->count = 0;
 	contents->array =
-		(ArchiveContentItem *) calloc(lineCount, sizeof(ArchiveContentItem));
+		(ArchiveContentItem *) calloc(lbuf.count, sizeof(ArchiveContentItem));
 
-	for (int lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 	{
 		ArchiveContentItem *item = &(contents->array[contents->count]);
 
-		char *line = lines[lineNumber];
+		char *line = lbuf.lines[lineNumber];
 
 		/* skip empty lines and lines that start with a semi-colon (comment) */
 		if (line == NULL || *line == '\0' || *line == ';')
@@ -1122,9 +1131,9 @@ parse_archive_list(const char *filename, ArchiveContentArray *contents)
 
 		if (!parse_archive_list_entry(item, line))
 		{
-			log_error("Failed to parse line %d of \"%s\", "
+			log_error("Failed to parse line %lld of \"%s\", "
 					  "see above for details",
-					  lineNumber,
+					  (long long) lineNumber,
 					  filename);
 			return false;
 		}
@@ -1238,6 +1247,14 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 	}
 
 	item->desc = token.desc;
+	int itemDescLen = token.ptr - start + 1;
+
+	if (itemDescLen == 0)
+	{
+		log_error("Failed to parse Archive TOC: %s", line);
+		return false;
+	}
+
 	item->description = (char *) calloc(token.ptr - start + 1, sizeof(char));
 
 	if (item->description == NULL)
@@ -1291,6 +1308,13 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 		/* 10. restore list name */
 		size_t len = strlen(token.ptr) + 1;
 		item->restoreListName = (char *) calloc(len, sizeof(char));
+
+		if (item->restoreListName == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
 		strlcpy(item->restoreListName, token.ptr, len);
 	}
 
@@ -1366,6 +1390,13 @@ tokenize_archive_list_entry(ArchiveToken *token)
 		int len = ptr - line + 1;
 		size_t size = len + 1;
 		char *buf = (char *) calloc(size, sizeof(char));
+
+		if (buf == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
 		strlcpy(buf, line, len);
 
 		if (!stringToUInt32(buf, &(token->oid)))
@@ -1411,7 +1442,8 @@ tokenize_archive_list_entry(ArchiveToken *token)
  *
  * The ptr argument is positioned after the space following EXTENSION tag.
  */
-bool parse_archive_extension(char *ptr, ArchiveContentItem *item)
+bool
+parse_archive_extension(char *ptr, ArchiveContentItem *item)
 {
 	log_trace("parse_archive_extension: \"%s\"", ptr);
 
@@ -1448,6 +1480,7 @@ bool parse_archive_extension(char *ptr, ArchiveContentItem *item)
 
 	return true;
 }
+
 
 /*
  * parse_archive_acl_or_comment parses the ACL or COMMENT entry of the
@@ -1571,30 +1604,6 @@ parse_archive_acl_or_comment(char *ptr, ArchiveContentItem *item)
 	log_trace("parse_archive_acl_or_comment: %s [%s]",
 			  item->description,
 			  item->restoreListName);
-
-	return true;
-}
-
-
-/*
- * FreeArchiveContentArray frees the memory allocated in the given
- * ArchiveContentArray.
- */
-bool
-FreeArchiveContentArray(ArchiveContentArray *contents)
-{
-	for (int i = 0; i < contents->count; i++)
-	{
-		ArchiveContentItem *item = &(contents->array[i]);
-
-		free(item->description);
-		free(item->restoreListName);
-	}
-
-	free(contents->array);
-
-	contents->count = 0;
-	contents->array = NULL;
 
 	return true;
 }

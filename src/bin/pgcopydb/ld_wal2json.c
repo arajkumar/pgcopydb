@@ -24,6 +24,7 @@
 #include "lock_utils.h"
 #include "log.h"
 #include "parsing_utils.h"
+#include "pgsql.h"
 #include "pidfile.h"
 #include "pg_utils.h"
 #include "schema.h"
@@ -33,9 +34,14 @@
 #include "timescale.h"
 
 
+static bool SetMessageRelation(JSON_Object *jsobj,
+							   LogicalMessageMetadata *metadata,
+							   LogicalMessageRelation *table,
+							   PGSQL *pgsql);
 static bool SetColumnNamesAndValues(LogicalMessageTuple *tuple,
 									const char *message,
-									JSON_Array *jscols);
+									JSON_Array *jscols,
+									PGSQL *pgsql);
 
 
 /*
@@ -139,38 +145,15 @@ parseWal2jsonMessage(StreamContext *privateContext,
 	/* most actions share a need for "schema" and "table" properties */
 	JSON_Object *jsobj = json_value_get_object(json);
 
-	char *schema = NULL;
-	char *table = NULL;
+	LogicalMessageRelation table = { 0 };
 
-	schema = (char *) json_object_dotget_string(jsobj, "message.schema");
-	table = (char *) json_object_dotget_string(jsobj, "message.table");
+	PGSQL *pgsql = privateContext->transformPGSQL;
 
-	if (schema == NULL || table == NULL)
+	if (!SetMessageRelation(jsobj, metadata, &table, pgsql))
 	{
 		log_error("Failed to parse truncated message missing "
 				  "schema or table property: %s",
 				  message);
-		return false;
-	}
-
-	char chunk_schema[PG_NAMEDATALEN] = { 0 };
-	char chunk_table[PG_NAMEDATALEN] = { 0 };
-	if (timescale_is_chunk(schema, table) &&
-		(metadata->action == STREAM_ACTION_INSERT ||
-		 metadata->action == STREAM_ACTION_UPDATE ||
-		 metadata->action == STREAM_ACTION_DELETE))
-	{
-		if (!timescale_chunk_to_hypertable(schema,
-										   table,
-										   chunk_schema,
-										   chunk_table))
-		{
-			log_error("Failed to map chunk %s.%s to hypertable",
-					  schema, table);
-			return false;
-		}
-		schema = chunk_schema;
-		table = chunk_table;
 	}
 
 	switch (metadata->action)
@@ -187,9 +170,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_TRUNCATE:
 		{
-			strlcpy(stmt->stmt.truncate.nspname, schema, PG_NAMEDATALEN);
-			strlcpy(stmt->stmt.truncate.relname, table, PG_NAMEDATALEN);
-
+			stmt->stmt.truncate.table = table;
 			break;
 		}
 
@@ -198,8 +179,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 			JSON_Array *jscols =
 				json_object_dotget_array(jsobj, "message.columns");
 
-			strlcpy(stmt->stmt.insert.nspname, schema, PG_NAMEDATALEN);
-			strlcpy(stmt->stmt.insert.relname, table, PG_NAMEDATALEN);
+			stmt->stmt.insert.table = table;
 
 			stmt->stmt.insert.new.count = 1;
 			stmt->stmt.insert.new.array =
@@ -213,7 +193,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 			LogicalMessageTuple *tuple = &(stmt->stmt.insert.new.array[0]);
 
-			if (!SetColumnNamesAndValues(tuple, message, jscols))
+			if (!SetColumnNamesAndValues(tuple, message, jscols, pgsql))
 			{
 				log_error("Failed to parse INSERT columns for logical "
 						  "message %s",
@@ -226,8 +206,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_UPDATE:
 		{
-			strlcpy(stmt->stmt.update.nspname, schema, PG_NAMEDATALEN);
-			strlcpy(stmt->stmt.update.relname, table, PG_NAMEDATALEN);
+			stmt->stmt.update.table = table;
 
 			stmt->stmt.update.old.count = 1;
 			stmt->stmt.update.new.count = 1;
@@ -249,7 +228,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 			JSON_Array *jsids =
 				json_object_dotget_array(jsobj, "message.identity");
 
-			if (!SetColumnNamesAndValues(old, message, jsids))
+			if (!SetColumnNamesAndValues(old, message, jsids, pgsql))
 			{
 				log_error("Failed to parse UPDATE identity (old) for logical "
 						  "message %s",
@@ -261,7 +240,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 			JSON_Array *jscols =
 				json_object_dotget_array(jsobj, "message.columns");
 
-			if (!SetColumnNamesAndValues(new, message, jscols))
+			if (!SetColumnNamesAndValues(new, message, jscols, pgsql))
 			{
 				log_error("Failed to parse UPDATE columns (new) for logical "
 						  "message %s",
@@ -274,8 +253,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_DELETE:
 		{
-			strlcpy(stmt->stmt.delete.nspname, schema, PG_NAMEDATALEN);
-			strlcpy(stmt->stmt.delete.relname, table, PG_NAMEDATALEN);
+			stmt->stmt.delete.table = table;
 
 			stmt->stmt.delete.old.count = 1;
 			stmt->stmt.delete.old.array =
@@ -291,7 +269,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 			JSON_Array *jsids =
 				json_object_dotget_array(jsobj, "message.identity");
 
-			if (!SetColumnNamesAndValues(old, message, jsids))
+			if (!SetColumnNamesAndValues(old, message, jsids, pgsql))
 			{
 				log_error("Failed to parse DELETE identity (old) for logical "
 						  "message %s",
@@ -315,6 +293,68 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 
 /*
+ * SetMessageRelation parses the table's nspname and relname from the JSON
+ * object and escapes it appropriately to be put as it is in SQL statements
+ */
+static bool
+SetMessageRelation(JSON_Object *jsobj,
+				   LogicalMessageMetadata *metadata,
+				   LogicalMessageRelation *table,
+				   PGSQL *pgsql)
+{
+	char *schema = NULL;
+	char *relname = NULL;
+
+	schema = (char *) json_object_dotget_string(jsobj, "message.schema");
+	relname = (char *) json_object_dotget_string(jsobj, "message.table");
+
+
+	if (schema == NULL || relname == NULL)
+	{
+		return false;
+	}
+
+	char chunk_schema[PG_NAMEDATALEN] = { 0 };
+	char chunk_table[PG_NAMEDATALEN] = { 0 };
+
+	if (timescale_is_chunk(table->nspname, table->relname) &&
+		(metadata->action == STREAM_ACTION_INSERT ||
+		 metadata->action == STREAM_ACTION_UPDATE ||
+		 metadata->action == STREAM_ACTION_DELETE))
+	{
+		if (!timescale_chunk_to_hypertable(table->nspname,
+										   table->relname,
+										   chunk_schema,
+										   chunk_table))
+		{
+			log_error("Failed to map chunk %s.%s to hypertable",
+					  table->nspname, table->relname);
+			return false;
+		}
+
+		schema = chunk_schema;
+		relname = chunk_table;
+	}
+
+	table->nspname = pgsql_escape_identifier(pgsql, schema);
+
+	if (table->nspname == NULL)
+	{
+		return false;
+	}
+
+	table->relname = pgsql_escape_identifier(pgsql, relname);
+
+	if (table->relname == NULL)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * SetColumnNames parses the "columns" (or "identity") JSON object from a
  * wal2json logical replication message and fills-in our internal
  * representation for a tuple.
@@ -322,7 +362,8 @@ parseWal2jsonMessage(StreamContext *privateContext,
 static bool
 SetColumnNamesAndValues(LogicalMessageTuple *tuple,
 						const char *message,
-						JSON_Array *jscols)
+						JSON_Array *jscols,
+						PGSQL *pgsql)
 {
 	int count = json_array_get_count(jscols);
 
@@ -358,7 +399,7 @@ SetColumnNamesAndValues(LogicalMessageTuple *tuple,
 			return false;
 		}
 
-		tuple->columns[i] = strndup(colname, PG_NAMEDATALEN);
+		tuple->columns[i] = pgsql_escape_identifier(pgsql, (char *) colname);
 
 		if (tuple->columns[i] == NULL)
 		{
