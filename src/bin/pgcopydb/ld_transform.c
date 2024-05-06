@@ -36,7 +36,6 @@
 #include "summary.h"
 #include "timescale.h"
 
-
 typedef struct TransformStreamCtx
 {
 	StreamContext *context;
@@ -47,6 +46,23 @@ static bool canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												   LogicalTransactionStatement *new);
 static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												LogicalTransactionStatement *new);
+
+static bool removeGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
+												  LogicalTransaction *txn);
+static bool removeGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
+												LogicalTransactionStatement *stmt);
+
+static void createFQColumnName(FQColumnName *qColumnName,
+							   const char *schema,
+							   const char *table,
+							   const char *column);
+
+static bool prepareGeneratedColumnsCache(StreamContext *privateContext);
+
+static bool isGeneratedColumn(GeneratedColumnsCache *cache,
+							  const char *schema,
+							  const char *table,
+							  const char *column);
 
 /*
  * stream_transform_stream transforms a JSON formatted input stream (read line
@@ -194,6 +210,16 @@ stream_transform_resume(StreamSpecs *specs)
 	 * Initialize our private context from the updated specs.
 	 */
 	if (!stream_init_context(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * Prepare the generated columns cache, which helps to skip the generated
+	 * columns in the SQL output.
+	 */
+	if (!prepareGeneratedColumnsCache(&(specs->private)))
 	{
 		/* errors have already been logged */
 		return false;
@@ -389,6 +415,22 @@ stream_transform_write_message(StreamContext *privateContext,
 	{
 		/* now write the COMMIT message even when txn is continued */
 		txn->commit = true;
+	}
+
+	/*
+	 * Before serializing the transaction to disk or stdout, we need to remove
+	 * the generated columns from the transaction, as they are not supposed to
+	 * be part of the SQL output.
+	 */
+	GeneratedColumnsCache *cache = privateContext->generatedColumnsCache;
+
+	if (currentMsg->isTransaction && cache != NULL)
+	{
+		if (!removeGeneratedColumnsFromTransaction(cache, txn))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
 
 	/* now write the transaction out */
@@ -617,6 +659,16 @@ stream_transform_from_queue(StreamSpecs *specs)
 	bool stop = false;
 
 	if (!stream_init_context(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
+	 * Prepare the generated columns cache, which helps to skip the generated
+	 * columns in the SQL output.
+	 */
+	if (!prepareGeneratedColumnsCache(&(specs->private)))
 	{
 		/* errors have already been logged */
 		return false;
@@ -861,6 +913,16 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 		log_error("Failed to open file \"%s\"", tempfilename);
 		free(content.buffer);
 		free(content.lines);
+		return false;
+	}
+
+	/*
+	 * Prepare the generated columns cache, which helps to skip the generated
+	 * columns in the SQL output.
+	 */
+	if (!prepareGeneratedColumnsCache(&(specs->private)))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -1290,6 +1352,7 @@ parseMessage(StreamContext *privateContext, char *message, JSON_Value *json)
 				}
 			}
 
+
 			(void) streamLogicalTransactionAppendStatement(txn, stmt);
 
 			break;
@@ -1470,24 +1533,6 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 		return false;
 	}
 
-	/* TODO: Refactor using inheritance info from pg_catalog.pg_inherits */
-	char *nspname, *relname;
-	if (GetRelationFromLogicalTransactionStatement(stmt, &nspname, &relname))
-	{
-		/* Map if the relation is chunk */
-		if (timescale_is_chunk(nspname, relname))
-		{
-			if (stmt->action == STREAM_ACTION_TRUNCATE)
-			{
-				log_warn("Ignore TRUNCATE on timescale chunk %s.%s",
-						 nspname, relname);
-				FreeLogicalTransactionStatement(stmt);
-				return true;
-			}
-		}
-	}
-
-
 	if (txn->first == NULL)
 	{
 		txn->first = stmt;
@@ -1533,50 +1578,6 @@ FreeLogicalMessage(LogicalMessage *msg)
 	{
 		FreeLogicalTransaction(&(msg->command.tx));
 	}
-}
-
-
-bool
-GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
-										   char **nspname, char **relname)
-{
-	switch (stmt->action)
-	{
-		case STREAM_ACTION_INSERT:
-		{
-			*nspname = stmt->stmt.insert.nspname;
-			*relname = stmt->stmt.insert.relname;
-			break;
-		}
-
-		case STREAM_ACTION_UPDATE:
-		{
-			*nspname = stmt->stmt.update.nspname;
-			*relname = stmt->stmt.update.relname;
-			break;
-		}
-
-		case STREAM_ACTION_DELETE:
-		{
-			*nspname = stmt->stmt.delete.nspname;
-			*relname = stmt->stmt.delete.relname;
-			break;
-		}
-
-		case STREAM_ACTION_TRUNCATE:
-		{
-			*nspname = stmt->stmt.truncate.nspname;
-			*relname = stmt->stmt.truncate.relname;
-			break;
-		}
-
-		/* no malloc'ated area in a BEGIN, COMMIT, or TRUNCATE statement */
-		default:
-		{
-			return false;
-		}
-	}
-	return true;
 }
 
 
@@ -2731,4 +2732,266 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
 
 	/* makes compiler happy */
 	return false;
+}
+
+
+/*
+ * Identifiers such as schema, table, column comes from various
+ * sources(e.g. wal2json, test_decoding and source catalog) and some of them
+ * already escapes identifiers and few don't.
+ * We need to check if the identifier is already quoted or not before
+ * escaping it.
+ * Whatever we are here is not a fool proof escaping mechanism, but a best
+ * effort to make sure that the identifiers are normalized by quoting them
+ * if it is not already quoted.
+ *
+ * Here is an example:
+ * foo -> "foo"
+ * "foo" -> "foo"
+ * foo"bar -> "foo"bar"
+ * "foo -> ""foo"
+ *
+ * The goal of this normalization is to make sure that the identifiers are
+ * comparable in the context of Hash Table.
+ */
+#define NORMALIZE_IDENTIFIER(buf, bufsize, offset, ident) \
+	{ \
+		int len = strlen(ident); \
+		if (ident[0] == '"' && ident[len - 1] == '"') \
+		{ \
+			offset += sformat(buf, bufsize, "%s", ident); \
+		} \
+		else \
+		{ \
+			offset += sformat(buf, bufsize, "\"%s\"", ident); \
+		} \
+	}
+
+/*
+ * createFQColumnName creates a fully qualified column name in the form
+ * schema.table.column and normalizes the identifiers by quoting them if
+ * necessary.
+ *
+ */
+static void
+createFQColumnName(FQColumnName *qColumnName,
+				   const char *schema,
+				   const char *table,
+				   const char *column)
+{
+	int offset = 0;
+	char *buf = (char *) qColumnName;
+	const int bufsize = sizeof(FQColumnName);
+
+	NORMALIZE_IDENTIFIER(buf + offset, bufsize - offset, offset, schema);
+	offset += sformat(buf + offset, bufsize - offset, ".");
+
+	NORMALIZE_IDENTIFIER(buf + offset, bufsize - offset, offset, table);
+	offset += sformat(buf + offset, bufsize - offset, ".");
+
+	NORMALIZE_IDENTIFIER(buf + offset, bufsize - offset, offset, column);
+}
+
+
+/*
+ * isGeneratedColumn checks whether the given "column" in "schema.table" is
+ * generated or not using the cache.
+ *
+ * Returns true if the column is generated, false otherwise.
+ *
+ * NOTE: There is no error condition, if the cache is NULL, it means that we
+ * don't have any generated columns in the catalog.
+ */
+static bool
+isGeneratedColumn(GeneratedColumnsCache *cache,
+				  const char *schema,
+				  const char *table,
+				  const char *column)
+{
+	/*
+	 * NULL cache means that we don't have any generated columns in the
+	 * catalog.
+	 */
+	if (cache == NULL)
+	{
+		return false;
+	}
+
+	GeneratedColumnsCache *item = NULL;
+	FQColumnName qColumnName = { 0 };
+
+	(void) createFQColumnName(&qColumnName,
+							  schema, table, column);
+
+	HASH_FIND_STR(cache, qColumnName, item);
+
+	bool isGenerated = (item != NULL);
+
+	if (isGenerated)
+	{
+		log_debug("IsColumnGenerated: %s is a generated column",
+				  qColumnName);
+	}
+
+	return isGenerated;
+}
+
+
+/*
+ * prepareGeneratedColumnsCache fills-in the cache with the tables having
+ * generated columns.
+ */
+static bool
+prepareGeneratedColumnsCache(StreamContext *privateContext)
+{
+	SourceTableArray *tables = &(privateContext->catalog->sourceTableArray);
+
+	for (int i = 0; i < tables->count; i++)
+	{
+		SourceTable *table = &(tables->array[i]);
+
+		SourceTableAttributeArray *attributes = &(table->attributes);
+
+		for (int n = 0; n < attributes->count; n++)
+		{
+			SourceTableAttribute *attribute = &(attributes->array[n]);
+
+			if (attribute->attisgenerated)
+			{
+				GeneratedColumnsCache *item = (GeneratedColumnsCache *)
+											  calloc(1, sizeof(GeneratedColumnsCache));
+
+				if (item == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
+
+				(void) createFQColumnName(&(item->qColumnName),
+										  table->nspname,
+										  table->relname,
+										  attribute->attname);
+
+
+				HASH_ADD_STR(privateContext->generatedColumnsCache,
+							 qColumnName,
+							 item);
+			}
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * removeGeneratedColumnsFromTransaction removes the generated columns from the
+ * given transaction.
+ */
+static bool
+removeGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
+									  LogicalTransaction *txn)
+{
+	LogicalTransactionStatement *stmt = txn->first;
+
+	for (; stmt != NULL; stmt = stmt->next)
+	{
+		if (!removeGeneratedColumnsFromStatement(cache, stmt))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * removeGeneratedColumnsFromStatement removes the generated columns from the
+ * given statement after looking up the cache.
+ */
+static bool
+removeGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
+									LogicalTransactionStatement *stmt)
+{
+	LogicalMessageTupleArray *columns = NULL;
+	const char *nspname = NULL;
+	const char *relname = NULL;
+
+	if (stmt->action == STREAM_ACTION_INSERT)
+	{
+		columns = &(stmt->stmt.insert.new);
+		nspname = stmt->stmt.insert.nspname;
+		relname = stmt->stmt.insert.relname;
+	}
+	else if (stmt->action == STREAM_ACTION_UPDATE)
+	{
+		columns = &(stmt->stmt.update.new);
+		nspname = stmt->stmt.update.nspname;
+		relname = stmt->stmt.update.relname;
+	}
+	else
+	{
+		/* Only INSERT and UPDATE statements might have generated columns */
+		return true;
+	}
+
+	if (columns->count > 1)
+	{
+		log_error("BUG: removeGeneratedColumnsFromStatement called on a statement "
+				  "with multiple VALUES clauses");
+		return false;
+	}
+
+	LogicalMessageTuple *tuple = &(columns->array[0]);
+
+	for (int c = 0; c < tuple->cols; c++)
+	{
+		if (isGeneratedColumn(cache,
+							  nspname,
+							  relname,
+							  tuple->columns[c]))
+		{
+			/* deallocate the column */
+			free(tuple->columns[c]);
+
+			/* remove the column from the tuple */
+			for (int j = c; j < tuple->cols - 1; j++)
+			{
+				tuple->columns[j] = tuple->columns[j + 1];
+			}
+
+			/* number of colums have reduced now */
+			tuple->cols--;
+
+			/* remove the value from the tuple */
+			for (int r = 0; r < tuple->values.count; r++)
+			{
+				LogicalMessageValues *values = &(tuple->values.array[r]);
+
+				LogicalMessageValue *value = &(values->array[c]);
+
+				if ((value->oid == TEXTOID || value->oid == BYTEAOID) &&
+					!value->isNull)
+				{
+					free(value->val.str);
+				}
+
+				for (int v = c; v < values->cols - 1; v++)
+				{
+					values->array[v] = values->array[v + 1];
+				}
+
+				values->cols--;
+			}
+
+			/*
+			 * Since we move the next column to the current position, the
+			 * moved once can be generated too, so we need to recheck it.
+			 */
+			c--;
+		}
+	}
+
+	return true;
 }

@@ -273,6 +273,26 @@ typedef enum
 
 
 /*
+ * Fully Qualified Postgres column name: "nspname"."relname"."attname".
+ * We need to account for the dots hence add 2 more bytes.
+ */
+typedef char FQColumnName[(PG_NAMEDATALEN * 3) + 2];
+
+/*
+ * Keep track of tables with generated columns to avoid unnecessary lookups
+ * in the catalog.
+ */
+typedef struct GeneratedColumnsCache
+{
+
+	/* This is a char [] type */
+	FQColumnName qColumnName;
+
+	UT_hash_handle hh;          /* makes this structure hashable */
+} GeneratedColumnsCache;
+
+
+/*
  * StreamContext allows tracking the progress of the ld_stream module and is
  * shared also with the ld_transform module, which has its own instance of a
  * StreamContext to track its own progress.
@@ -305,6 +325,9 @@ typedef struct StreamContext
 
 	/* transform needs some catalog lookups (pkey, type oid) */
 	SourceCatalog *catalog;
+
+	/* hash table acts as a cache for tables with generated columns */
+	GeneratedColumnsCache *generatedColumnsCache;
 
 	Queue *transformQueue;
 	uint32_t WalSegSz;
@@ -615,9 +638,6 @@ bool parseMessage(StreamContext *privateContext, char *message, JSON_Value *json
 bool streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 											 LogicalTransactionStatement *stmt);
 
-
-bool GetRelationFromLogicalTransactionStatement(LogicalTransactionStatement *stmt,
-												char **nspname, char **relname);
 
 void FreeLogicalMessage(LogicalMessage *msg);
 void FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt);

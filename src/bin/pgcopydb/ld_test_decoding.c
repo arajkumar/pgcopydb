@@ -189,6 +189,15 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 			metadata->filterOut = true;
 		}
 
+		if (header.action == STREAM_ACTION_TRUNCATE &&
+			timescale_is_chunk(header.nspname, header.relname))
+		{
+			log_warn("Filtering out message action TRUNCATE for %s.%s",
+					 header.nspname, header.relname);
+
+			metadata->filterOut = true;
+		}
+
 		metadata->action = header.action;
 	}
 	else
@@ -384,15 +393,21 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	if (timescale_is_chunk(header->nspname, header->relname) &&
 		header->action != STREAM_ACTION_TRUNCATE)
 	{
+		char chunk_schema[PG_NAMEDATALEN] = { 0 };
+		char chunk_table[PG_NAMEDATALEN] = { 0 };
+
 		if (!timescale_chunk_to_hypertable(header->nspname,
 										   header->relname,
-										   header->nspname,
-										   header->relname))
+										   chunk_schema,
+										   chunk_table))
 		{
 			log_error("Failed to map chunk %s.%s to hypertable",
 					  header->nspname, header->relname);
 			return false;
 		}
+
+		strlcpy(header->nspname, chunk_schema, sizeof(header->nspname));
+		strlcpy(header->relname, chunk_table, sizeof(header->relname));
 	}
 
 	sformat(header->qname, sizeof(header->qname), "%s.%s",

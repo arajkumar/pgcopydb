@@ -113,6 +113,15 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 
 			metadata->filterOut = true;
 		}
+
+		if (metadata->action == STREAM_ACTION_TRUNCATE &&
+			timescale_is_chunk(nspname, relname))
+		{
+			log_warn("Filtering out message action TRUNCATE for %s.%s",
+					 nspname, relname);
+
+			metadata->filterOut = true;
+		}
 	}
 
 	json_value_free(json);
@@ -155,6 +164,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 	char chunk_schema[PG_NAMEDATALEN] = { 0 };
 	char chunk_table[PG_NAMEDATALEN] = { 0 };
+
 	if (timescale_is_chunk(schema, table) &&
 		(metadata->action == STREAM_ACTION_INSERT ||
 		 metadata->action == STREAM_ACTION_UPDATE ||
@@ -169,6 +179,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 					  schema, table);
 			return false;
 		}
+
 		schema = chunk_schema;
 		table = chunk_table;
 	}
