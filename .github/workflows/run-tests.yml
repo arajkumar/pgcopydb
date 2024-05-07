@@ -27,7 +27,6 @@ jobs:
           - blobs
           - filtering
           - extensions
-          - timescaledb
           - cdc-low-level
           - cdc-test-decoding
           - cdc-endpos-between-transaction
@@ -36,6 +35,9 @@ jobs:
           - follow-9.6
           - follow-data-only
           - endpos-in-multi-wal-txn
+          - timescaledb
+          - timescaledb-test-decoding
+          - cdc-generated-column
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
