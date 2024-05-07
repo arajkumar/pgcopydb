@@ -24,6 +24,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     valgrind \
     build-essential \
     libedit-dev \
+    libgc-dev \
     libicu-dev \
     libkrb5-dev \
     liblz4-dev \
