@@ -287,7 +287,6 @@ typedef char FQColumnName[(PG_NAMEDATALEN * 3) + 2];
  */
 typedef struct GeneratedColumnsCache
 {
-
 	/* This is a char [] type */
 	FQColumnName qColumnName;
 
