@@ -65,7 +65,9 @@ static void createFQColumnName(FQColumnName *qColumnName,
 							   const char *table,
 							   const char *column);
 
-static bool prepareGeneratedColumnsCache(StreamContext *privateContext);
+static bool populateGeneratedColumnCache(void *ctx, GeneratedColumn *column);
+
+static bool prepareGeneratedColumnsCache(StreamSpecs *specs);
 
 static bool isGeneratedColumn(GeneratedColumnsCache *cache,
 							  const char *schema,
@@ -278,7 +280,7 @@ stream_transform_resume(StreamSpecs *specs)
 	 * Prepare the generated columns cache, which helps to skip the generated
 	 * columns in the SQL output.
 	 */
-	if (!prepareGeneratedColumnsCache(&(specs->private)))
+	if (!prepareGeneratedColumnsCache(specs))
 	{
 		/* errors have already been logged */
 		return false;
@@ -717,7 +719,7 @@ stream_transform_from_queue(StreamSpecs *specs)
 	 * Prepare the generated columns cache, which helps to skip the generated
 	 * columns in the SQL output.
 	 */
-	if (!prepareGeneratedColumnsCache(&(specs->private)))
+	if (!prepareGeneratedColumnsCache(specs))
 	{
 		/* errors have already been logged */
 		return false;
@@ -998,7 +1000,7 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 	 * Prepare the generated columns cache, which helps to skip the generated
 	 * columns in the SQL output.
 	 */
-	if (!prepareGeneratedColumnsCache(&(specs->private)))
+	if (!prepareGeneratedColumnsCache(specs))
 	{
 		/* errors have already been logged */
 		return false;
@@ -2815,51 +2817,51 @@ isGeneratedColumn(GeneratedColumnsCache *cache,
 
 
 /*
+ * populateGeneratedColumnCache is a callback function that populates the
+ * generated columns cache from the catalog.
+ */
+static bool
+populateGeneratedColumnCache(void *ctx, GeneratedColumn *column)
+{
+	StreamSpecs *specs = (StreamSpecs *) ctx;
+	StreamContext *privateContext = &(specs->private);
+
+	GeneratedColumnsCache *item = (GeneratedColumnsCache *)
+								  calloc(1, sizeof(GeneratedColumnsCache));
+
+	if (item == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	(void) createFQColumnName(&(item->qColumnName),
+							  column->nspname,
+							  column->relname,
+							  column->attname);
+
+	HASH_ADD_STR(privateContext->generatedColumnsCache, qColumnName, item);
+
+	return true;
+}
+
+
+/*
  * prepareGeneratedColumnsCache fills-in the cache with the tables having
  * generated columns.
  */
 static bool
-prepareGeneratedColumnsCache(StreamContext *privateContext)
+prepareGeneratedColumnsCache(StreamSpecs *specs)
 {
-#if 0
-	SourceTableArray *tables = &(privateContext->catalog->sourceTableArray);
-
-	for (int i = 0; i < tables->count; i++)
+	if (!catalog_iter_s_generated_column(specs->sourceDB,
+										 specs,
+										 &populateGeneratedColumnCache))
 	{
-		SourceTable *table = &(tables->array[i]);
-
-		SourceTableAttributeArray *attributes = &(table->attributes);
-
-		for (int n = 0; n < attributes->count; n++)
-		{
-			SourceTableAttribute *attribute = &(attributes->array[n]);
-
-			if (attribute->attisgenerated)
-			{
-				GeneratedColumnsCache *item = (GeneratedColumnsCache *)
-											  calloc(1, sizeof(GeneratedColumnsCache));
-
-				if (item == NULL)
-				{
-					log_error(ALLOCATION_FAILED_ERROR);
-					return false;
-				}
-
-				(void) createFQColumnName(&(item->qColumnName),
-										  table->nspname,
-										  table->relname,
-										  attribute->attname);
-
-
-				HASH_ADD_STR(privateContext->generatedColumnsCache,
-							 qColumnName,
-							 item);
-			}
-		}
+		log_error("Failed to prepare a generated column cache for our catalog,"
+				  "see above for details");
+		return false;
 	}
 
-	return true;
-#endif
 	return true;
 }
 
