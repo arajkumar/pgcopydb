@@ -119,6 +119,15 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 
 			metadata->filterOut = true;
 		}
+
+		if (metadata->action == STREAM_ACTION_TRUNCATE &&
+			timescale_is_chunk(nspname, relname))
+		{
+			log_warn("Filtering out message action TRUNCATE for %s.%s",
+					 nspname, relname);
+
+			metadata->filterOut = true;
+		}
 	}
 
 	json_value_free(json);

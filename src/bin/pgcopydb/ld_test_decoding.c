@@ -188,6 +188,15 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 			metadata->filterOut = true;
 		}
 
+		if (header.action == STREAM_ACTION_TRUNCATE &&
+			timescale_is_chunk(header.table.nspname, header.table.relname))
+		{
+			log_warn("Filtering out message action TRUNCATE for %s.%s",
+					 header.table.nspname, header.table.relname);
+
+			metadata->filterOut = true;
+		}
+
 		metadata->action = header.action;
 	}
 	else
@@ -392,12 +401,12 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	}
 
 	/* Map if the relation is chunk */
-	char nspname[PG_NAMEDATALEN] = { 0 };
-	char relname[PG_NAMEDATALEN] = { 0 };
-
 	if (timescale_is_chunk(header->table.nspname, header->table.relname) &&
 		header->action != STREAM_ACTION_TRUNCATE)
 	{
+		char nspname[PG_NAMEDATALEN] = { 0 };
+		char relname[PG_NAMEDATALEN] = { 0 };
+
 		if (!timescale_chunk_to_hypertable(header->table.nspname,
 										   header->table.relname,
 										   nspname,
@@ -407,6 +416,7 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 					  header->table.nspname, header->table.relname);
 			return false;
 		}
+
 		strlcpy(header->table.nspname, nspname, sizeof(nspname));
 		strlcpy(header->table.relname, relname, sizeof(relname));
 	}

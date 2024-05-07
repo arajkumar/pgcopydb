@@ -7,6 +7,8 @@ BUILD_ARGS = --build-arg PGVERSION=$(PGVERSION)
 all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-between-transaction cdc-low-level \
 	 follow-wal2json follow-9.6 follow-data-only \
+	 timescaledb timescaledb-test-decoding \
+	 cdc-generated-column \
 	 endpos-in-multi-wal-txn;
 
 pagila: build
@@ -57,6 +59,9 @@ timescaledb: build
 timescaledb-test-decoding: build
 	$(MAKE) -C $@
 
+cdc-generated-column: build
+	$(MAKE) -C $@
+
 build:
 	docker build $(BUILD_ARGS) -t pagila -f Dockerfile.pagila .
 
@@ -65,3 +70,5 @@ build:
 .PHONY: cdc-wal2json cdc-test-decoding cdc-low-level
 .PHONY: follow-wal2json follow-9.6
 .PHONY: endpos-in-multi-wal-txn
+.PHONY: timescaledb timescaledb-test-decoding
+.PHONY: cdc-generated-column
