@@ -589,7 +589,7 @@ def migrate(args):
 
     # reset endpos
     if args.resume:
-        run_cmd("pgcopydb stream sentinel set endpos 0/0")
+        run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR 0/0")
 
     housekeeping_thread, housekeeping_stop_event = None, None
     follow_proc = create_follow(resume=args.resume)
@@ -610,11 +610,11 @@ def migrate(args):
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
         logger.info("Applying buffered transactions ...")
-        run_cmd("pgcopydb stream sentinel set apply")
+        run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
 
         wait_for_DBs_to_sync(follow_proc)
 
-        run_cmd("pgcopydb stream sentinel set endpos --current")
+        run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR --current")
 
         logger.info("Waiting for live-replay to complete ...")
         # TODO: Implement retry for follow.
