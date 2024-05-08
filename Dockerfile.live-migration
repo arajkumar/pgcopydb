@@ -83,6 +83,7 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     sudo \
     passwd \
     ca-certificates \
+    libgc1 \
     libpq5 \
     lsof \
     tmux \
