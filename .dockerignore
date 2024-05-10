@@ -11,3 +11,5 @@ docs/_build
 
 # ignore the git version number in release builds
 src/bin/pgcopydb/git-version.h
+
+/tests/

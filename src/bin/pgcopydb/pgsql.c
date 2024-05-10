@@ -2667,11 +2667,18 @@ pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode)
  * name qname, in the given Postgres connection.
  */
 bool
-pgsql_truncate(PGSQL *pgsql, const char *qname)
+pgsql_truncate(PGSQL *pgsql, const char *qname, bool decendants)
 {
 	char sql[BUFSIZE] = { 0 };
 
-	sformat(sql, sizeof(sql), "TRUNCATE ONLY %s", qname);
+	if (decendants)
+	{
+		sformat(sql, sizeof(sql), "TRUNCATE %s", qname);
+	}
+	else
+	{
+		sformat(sql, sizeof(sql), "TRUNCATE ONLY %s", qname);
+	}
 
 	/* this being more like a DDL operation, proper log level is NOTICE */
 	log_notice("%s", sql);
@@ -2740,7 +2747,7 @@ pg_copy_data(PGSQL *src, PGSQL *dst, CopyArgs *args)
 
 	if (args->truncate)
 	{
-		if (!pgsql_truncate(dst, args->dstQname))
+		if (!pgsql_truncate(dst, args->dstQname, args->truncateDescendants))
 		{
 			/* errors have already been logged */
 			return false;
@@ -5698,4 +5705,52 @@ pgsql_escape_identifier(PGSQL *pgsql, char *src)
 	PQfreemem(escapedIdentifier);
 
 	return escapedIdentifierCopy;
+}
+
+
+/*
+ * pgsql_is_table_partition_root checks if a given table is a root of a
+ * PostgreSQL logical partition.
+ */
+bool
+pgsql_is_table_partition_root(PGSQL *pgsql,
+							  const char *nspname,
+							  const char *relname,
+							  bool *isRoot)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	char *sql =
+		"select exists( "
+		"         select 1 "
+		"           from pg_class c "
+		"                join pg_namespace n on n.oid = c.relnamespace "
+		"          where format('%I', n.nspname) = $1 "
+		"            and format('%I', c.relname) = $2"
+		"            and c.relkind = 'p'"
+		"       )";
+
+	int paramCount = 2;
+	Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { nspname, relname };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check if table \"%s\".\"%s\" "
+				  "is a partition root", nspname, relname);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to check if table \"%s\".\"%s\" "
+				  "is a partition root", nspname, relname);
+		return false;
+	}
+
+	*isRoot = context.boolVal;
+
+	return true;
 }

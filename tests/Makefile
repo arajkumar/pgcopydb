@@ -9,6 +9,8 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 timescaledb timescaledb-test-decoding \
 	 cdc-generated-column \
+	 target-only-partition \
+	 target-only-timescaledb-hypertable \
 	 endpos-in-multi-wal-txn;
 
 pagila: build
@@ -62,6 +64,12 @@ timescaledb-test-decoding: build
 cdc-generated-column: build
 	$(MAKE) -C $@
 
+target-only-partition: build
+	$(MAKE) -C $@
+
+target-only-timescaledb-hypertable: build
+	$(MAKE) -C $@
+
 build:
 	docker build $(BUILD_ARGS) -t pagila -f Dockerfile.pagila .
 
@@ -72,3 +80,5 @@ build:
 .PHONY: endpos-in-multi-wal-txn
 .PHONY: timescaledb timescaledb-test-decoding
 .PHONY: cdc-generated-column
+.PHONY: target-only-partition
+.PHONY: target-only-timescaledb-hypertable

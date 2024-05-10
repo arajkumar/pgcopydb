@@ -24,9 +24,62 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 static bool copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table);
+
+static bool copydb_find_truncate_decendants(PGSQL *pgsql,
+											SourceTable *table,
+											bool *decendants);
+
+static bool
+copydb_find_truncate_decendants(PGSQL *pgsql,
+								SourceTable *table,
+								bool *decendants)
+{
+	bool isPartitionRoot = false;
+
+	/*
+	 * Check if the table is a partition root, in which case we need to
+	 * truncate all its partitions.
+	 *
+	 * This scenario is only possible when the target table is a partitioned
+	 * but the source table is not.
+	 */
+	if (!pgsql_is_table_partition_root(pgsql,
+									   table->nspname,
+									   table->relname,
+									   &isPartitionRoot))
+	{
+		log_error("Failed to check if \"%s\" is a partition root",
+				  table->qname);
+
+		return false;
+	}
+
+	/*
+	 * Check if the table is a hypertable, in which case we need to truncate
+	 * all its partitions.
+	 *
+	 * This scenario is only possible when the target table is a hypertable
+	 * but the source table is not.
+	 */
+	if (!isPartitionRoot && !timescale_is_hypertable_root(pgsql,
+														  table->nspname,
+														  table->relname,
+														  &isPartitionRoot))
+	{
+		log_error("Failed to check if \"%s\" is a hypertable", table->qname);
+
+		return false;
+	}
+
+	*decendants = isPartitionRoot;
+
+	return true;
+}
+
 
 /*
  * copydb_table_data fetches the list of tables from the source database and
@@ -584,7 +637,15 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 
 		if (granted)
 		{
-			if (!pgsql_truncate(dst, table->qname))
+			bool decendants = false;
+
+			if (!copydb_find_truncate_decendants(dst, table, &decendants))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			if (!pgsql_truncate(dst, table->qname, decendants))
 			{
 				/* errors have already been logged */
 				return false;
@@ -1135,6 +1196,7 @@ copydb_table_create_lockfile(CopyDataSpec *specs,
 	args->truncate = false;     /* default value, see below */
 	args->freeze = tableSpecs->sourceTable->partition.partCount <= 1;
 	args->bytesTransmitted = 0;
+	args->truncateDescendants = false;
 
 	/*
 	 * Check to see if we want to TRUNCATE the table and benefit from the COPY
@@ -1160,7 +1222,19 @@ copydb_table_create_lockfile(CopyDataSpec *specs,
 			return false;
 		}
 
+		bool decendants = false;
+
+		if (!copydb_find_truncate_decendants(dst,
+											 tableSpecs->sourceTable,
+											 &decendants))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		args->truncate = granted;
+		args->truncateDescendants = decendants;
+		args->freeze = granted && !decendants;
 	}
 
 	if (!copydb_prepare_copy_query(tableSpecs, args))

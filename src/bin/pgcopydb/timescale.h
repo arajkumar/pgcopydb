@@ -28,4 +28,10 @@ bool timescale_is_chunk(const char *nspname_in, const char *relname_in);
  */
 bool timescale_allow_relation(const char *nspname_in, const char *relname_in);
 
+
+bool timescale_is_hypertable_root(PGSQL *pgsql,
+								  const char *nspname,
+								  const char *relname,
+								  bool *isRoot);
+
 #endif /* TIMESCALE_H */

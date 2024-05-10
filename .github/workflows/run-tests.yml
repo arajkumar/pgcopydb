@@ -38,6 +38,8 @@ jobs:
           - timescaledb
           - timescaledb-test-decoding
           - cdc-generated-column
+          - target-only-partition
+          - target-only-timescaledb-hypertable
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

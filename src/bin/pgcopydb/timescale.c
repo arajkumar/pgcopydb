@@ -277,3 +277,71 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 
 	return true; /* Not found in denylist, allowed */
 }
+
+
+bool
+timescale_is_hypertable_root(PGSQL *pgsql,
+							 const char *nspname,
+							 const char *relname,
+							 bool *isRoot)
+{
+	bool exists = false;
+
+	if (!tableExists(pgsql, "_timescaledb_catalog", "hypertable", &exists))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!exists)
+	{
+		/* The table does not exist, so it cannot be a hypertable root */
+		*isRoot = false;
+		return true;
+	}
+
+	const char *sql =
+		" select exists( "
+		"   select 1 from timescaledb_information.hypertables"
+
+		/*
+		 * We need to check if the restoring mode is off, otherwise the
+		 * hypertable is not considered a root hypertable.
+		 *
+		 * When restoring mode is on, the migration is for Postgres to
+		 * TimescaleDB, and the hypertable is not yet fully migrated.
+		 */
+		"   where "
+		"     current_setting('timescaledb.restoring') = 'off' "
+		"     and hypertable_schema=$1 "
+		"     and hypertable_name=$2 "
+		"   ) ";
+
+	int paramCount = 2;
+	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { 0 };
+
+	paramValues[0] = nspname;
+	paramValues[1] = relname;
+
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	if (!pgsql_execute_with_params(pgsql, sql, paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check if \"%s\".\"%s\" is a hypertable root", nspname,
+				  relname);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to check if \"%s\".\"%s\" is a hypertable root", nspname,
+				  relname);
+		return false;
+	}
+
+	*isRoot = context.boolVal;
+
+	return true;
+}
