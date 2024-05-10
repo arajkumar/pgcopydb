@@ -9,8 +9,8 @@ use test_common::PgVersion::PG15;
 use test_common::PsqlInput::Sql;
 use test_common::TsVersion::{TS213, TS214};
 use test_common::{
-    psql, timescaledb, DbAssert, HasConnectionString, InternalConnectionString, PgVersion,
-    TsVersion,
+    configure_cloud_setup, psql, timescaledb, DbAssert, HasConnectionString,
+    InternalConnectionString, PgVersion, TsVersion,
 };
 use testcontainers::{
     clients::Cli, core::WaitFor, images::generic::GenericImage, Container, RunnableImage,
@@ -42,7 +42,10 @@ fn start_target<'a>(
     ts_version: TsVersion,
     network_name: &'_ str,
 ) -> Container<'a, GenericImage> {
-    docker.run(RunnableImage::from(timescaledb(pg_version, ts_version)).with_network(network_name))
+    let container = docker
+        .run(RunnableImage::from(timescaledb(pg_version, ts_version)).with_network(network_name));
+    configure_cloud_setup(&container).unwrap();
+    container
 }
 
 fn live_migration_image(
