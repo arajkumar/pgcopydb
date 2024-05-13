@@ -1162,8 +1162,7 @@ parse_archive_list(const char *filename, ArchiveContentArray *contents)
 /*
  * parse_archive_list_entry parses a pg_restore archive TOC line such as the
  * following:
- * 5; 3079 80839 EXTENSION - aiven_extras
- * 6762; 0 0 COMMENT aiven_extras
+ *
  * 20; 2615 680978 SCHEMA - pgcopydb dim
  * 662; 1247 466596 DOMAIN public bıgınt postgres
  * 665; 1247 466598 TYPE public mpaa_rating postgres
@@ -1274,7 +1273,8 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 	}
 
 	/*
-	 * 6762; 0 0 COMMENT aiven_extras
+	 * 9. ACL and COMMENT tags are "composite"
+	 *
 	 * 4837; 0 0 ACL - SCHEMA public postgres
 	 * 4838; 0 0 COMMENT - SCHEMA topology dim
 	 * 4839; 0 0 COMMENT - EXTENSION intarray

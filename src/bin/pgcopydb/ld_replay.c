@@ -188,18 +188,6 @@ stream_replay_line(void *ctx, const char *line, bool *stop)
 					return false;
 				}
 			}
-
-
-			/* rate limit to 1 pipeline sync per seconds */
-			if (1 < (now - context->applyPgConn.pipelineSyncTime))
-			{
-				if (!pgsql_sync_pipeline(&(context->applyPgConn)))
-				{
-					log_error("Failed to sync the pipeline, see previous "
-							  "error for details");
-					return false;
-				}
-			}
 			break;
 		}
 

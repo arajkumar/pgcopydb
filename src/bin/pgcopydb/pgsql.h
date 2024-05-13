@@ -314,9 +314,6 @@ bool pgsql_sync_pipeline(PGSQL *pgsql);
 bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
 				   int paramCount, const Oid *paramTypes);
 
-bool pgsql_enable_pipeline_mode(PGSQL *pgsql);
-bool pgsql_sync_pipeline(PGSQL *pgsql);
-
 bool pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 							int paramCount, const char **paramValues,
 							void *context, ParsePostgresResultCB *parseFun);
