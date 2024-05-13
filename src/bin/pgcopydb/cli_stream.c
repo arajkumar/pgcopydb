@@ -148,7 +148,7 @@ static CommandLine stream_transform_command =
 		"transform",
 		"Transform changes from the source database into SQL commands",
 		" <json filename> <sql filename> ",
-		"  --source         Postgres URI to the source database\n"
+		"  --target         Postgres URI to the target database\n"
 		"  --dir            Work directory to use\n"
 		"  --restart        Allow restarting when temp files exist already\n"
 		"  --resume         Allow resuming operations after a failure\n"
@@ -966,10 +966,21 @@ cli_stream_transform(int argc, char **argv)
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
 	}
-	else if (!stream_transform_file(&specs, jsonfilename, sqlfilename))
+	else
 	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
+		if (!stream_transform_context_init_pgsql(&specs))
+		{
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
+		bool success = stream_transform_file(&specs, jsonfilename, sqlfilename);
+
+		pgsql_finish(&(specs.transformPGSQL));
+
+		if (!success)
+		{
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
 	}
 }
 
