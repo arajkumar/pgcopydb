@@ -596,6 +596,7 @@ name = "integration"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "postgres",
  "pretty_env_logger",
  "rand",
  "tempfile",

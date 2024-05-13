@@ -1,7 +1,9 @@
 use anyhow::Result;
+use postgres::{Config, NoTls};
 use rand::{thread_rng, Rng};
-use std::thread;
-use std::time::Duration;
+use std::str::FromStr;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use tempfile::{tempdir, TempDir};
 use test_common::PgVersion::PG15;
 use test_common::PsqlInput::Sql;
@@ -58,6 +60,33 @@ fn live_migration_image(
             target_container.internal_connection_string().as_str(),
         )
         .with_volume(temp_dir.path().to_str().unwrap(), "/opt/timescale/ts_cdc")
+}
+
+fn wait_for_source_target_sync(
+    source_container: &Container<'_, GenericImage>,
+    target_container: &Container<'_, GenericImage>,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut source_client =
+        Config::from_str(source_container.connection_string().as_str())?.connect(NoTls)?;
+    let mut target_client =
+        Config::from_str(target_container.connection_string().as_str())?.connect(NoTls)?;
+    let source_lsn: String = source_client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])?
+        .get(0);
+    loop {
+        if start.elapsed() > timeout {
+            panic!("wal did not sync after {}s", timeout.as_secs())
+        }
+        let target_has_caught_up = target_client.query_one("SELECT pg_wal_lsn_diff(pg_replication_origin_progress('pgcopydb', true), $1::text::pg_lsn) >= 0;", &[&source_lsn])?.get(0);
+        if target_has_caught_up {
+            break;
+        }
+        sleep(Duration::from_secs(1));
+    }
+
+    Ok(())
 }
 
 #[test]
@@ -152,8 +181,11 @@ fn test_end_to_end_migration() -> Result<()> {
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
 	")).expect("query should succeed");
 
-    // TODO: this is an arbitrary duration
-    thread::sleep(Duration::from_secs(5));
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
 
     target_assert.has_table_count("public", "metrics", 1440);
 
