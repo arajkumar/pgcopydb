@@ -71,9 +71,11 @@ def main():
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
-    parser_migrate.add_argument('--exclude-existing-table-data', nargs='*',
-                                help='Exclude the data from given table during initial data migration. ' \
-                                    'However, the table schema will be migrated, and live replay will happen for the specified table.')
+    parser_migrate.add_argument('--skip-table-data', nargs='+',
+                                help='Skips data from the given table during migration. However, the table schema will be migrated. ' \
+                                    'To skip data from a Hypertable, you will need to specify a list of schema qualified chunks belonging to the Hypertable. ' \
+                                    'Currently, this flag does not skip data during live replay from the specified table. ' \
+                                    'Values for this flag must be schema qualified. Eg: --skip-table-data public.exclude_table_1 public.exclude_table_2')
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',

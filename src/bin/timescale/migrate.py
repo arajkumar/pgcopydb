@@ -124,10 +124,10 @@ def skip_extensions_list(args):
         return skip_extensions_default
 
 
-def prepare_exclude_extensions(clone_cmd: list[str], args, filter: Filter):
-    if args.exclude_existing_table_data:
-        logger.info("Excluding table data: %s", args.exclude_existing_table_data)
-        filter.exclude_table_data(args.exclude_existing_table_data)
+def prepare_filters(clone_cmd: list[str], args, filter: Filter):
+    if args.skip_table_data:
+        logger.info("Excluding table data: %s", args.skip_table_data)
+        filter.exclude_table_data(args.skip_table_data)
 
     # empty list of skip_extensions ignores all extensions
     if args.skip_extensions is not None and len(args.skip_extensions) == 0:
@@ -216,7 +216,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
             "--resume",
         ]
 
-        prepare_exclude_extensions(copy_extensions, args, filter)
+        prepare_filters(copy_extensions, args, filter)
         # Apply filters
         with open(args.dir / "filter.ini", "w") as f:
             filter.write(f)
@@ -383,7 +383,7 @@ def migrate_existing_data_from_ts(args):
     ]
 
     filter = Filter()
-    prepare_exclude_extensions(clone_table_data, args, filter)
+    prepare_filters(clone_table_data, args, filter)
     # Apply filters
     with open(args.dir / "filter.ini", "w") as f:
         filter.write(f)

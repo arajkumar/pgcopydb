@@ -191,3 +191,77 @@ fn test_end_to_end_migration() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_exclude_existing_table_data() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    psql(
+        &source_container,
+        Sql(r"
+		CREATE TABLE metrics_data_excluded(time timestamptz primary key, value float8);
+		INSERT INTO metrics_data_excluded(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+
+		CREATE TABLE metrics(time timestamptz primary key, value float8);
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+	"),
+    )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+
+    let migrate = RunnableImage::from((
+        migrate_image,
+        vec![
+            String::from("migrate"),
+            String::from("--skip-table-data"),
+            String::from("public.metrics_data_excluded"),
+        ],
+    ))
+    .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+
+    target_assert.has_table_count("public", "metrics_data_excluded", 0);
+    target_assert.has_table_count("public", "metrics", 744);
+
+    psql(
+        &source_container,
+        Sql(r"
+        INSERT INTO metrics_data_excluded(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+        INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+    "),
+    )?;
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    // Currently, we do not skip data during live replay. This is why
+    // "metrics_data_excluded" has count as 696 which was added during CDC.
+    target_assert.has_table_count("public", "metrics_data_excluded", 696);
+    target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}

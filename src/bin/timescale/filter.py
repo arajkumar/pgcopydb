@@ -25,11 +25,9 @@ class Filter:
         """
         Exclude table data from initial data migration.
         """
-        if len(tables) == 0:
-            raise Exception("--exclude-table-data cannot be empty")
         for table in tables:
             if "." not in table:
-                raise Exception(f"exclude-table-data: dot separator ('.') not found: {table}")
+                raise Exception(f"dot separator ('.') not found: {table}")
         self._filter[self.EXCLUDE_TABLE_DATA].update(tables)
 
     def write(self, f):
