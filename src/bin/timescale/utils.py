@@ -110,7 +110,7 @@ def dbname_from_uri(uri: str) -> str:
         for param in parameters:
             key, value = param.split("=")
             if key == "dbname":
-                return value
+                return value.replace("'", "")
     else:
         # Input => uri: 'postgres://tsdb:abcd@a.timescaledb.io:26479/rbac_test?sslmode=require'
         # result.path[1]: '/rbac_test'

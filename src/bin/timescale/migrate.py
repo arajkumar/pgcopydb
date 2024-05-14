@@ -150,7 +150,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
         with timeit():
             pgdump_command = " ".join(["pg_dump",
                                        "-d",
-                                       "$PGCOPYDB_SOURCE_PGURI",
+                                       '"$PGCOPYDB_SOURCE_PGURI"',
                                        "--format=plain",
                                        "--quote-all-identifiers",
                                        "--no-tablespaces",
@@ -167,7 +167,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
         with timeit():
             pgdump_command = " ".join(["pg_dump",
                                        "-d",
-                                       "$PGCOPYDB_SOURCE_PGURI",
+                                       '"$PGCOPYDB_SOURCE_PGURI"',
                                        "--format=plain",
                                        "--quote-all-identifiers",
                                        "--no-tablespaces",
@@ -186,7 +186,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
             psql_command = " ".join(["psql",
                                      "-X",
                                      "-d",
-                                     "$PGCOPYDB_TARGET_PGURI",
+                                     '"$PGCOPYDB_TARGET_PGURI"',
                                      "--echo-errors",
                                      "-v",
                                      "ON_ERROR_STOP=0",
@@ -256,7 +256,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
             psql_command = " ".join(["psql",
                                      "-X",
                                      "-d",
-                                     "$PGCOPYDB_TARGET_PGURI",
+                                     '"$PGCOPYDB_TARGET_PGURI"',
                                      "--echo-errors",
                                      "-v",
                                      "ON_ERROR_STOP=0",
@@ -277,7 +277,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                         "--analyze-in-stages",
                                         "--echo",
                                         "--dbname",
-                                        "$PGCOPYDB_TARGET_PGURI",
+                                        '"$PGCOPYDB_TARGET_PGURI"',
                                         "--jobs",
                                         args.table_jobs,
                                         ])
@@ -299,7 +299,7 @@ def migrate_roles():
         dump_roles = " ".join([
             "pg_dumpall",
             "-d",
-            "$PGCOPYDB_SOURCE_PGURI",
+            '"$PGCOPYDB_SOURCE_PGURI"',
             "--quote-all-identifiers",
             "--roles-only",
             "--no-role-passwords",
@@ -341,7 +341,7 @@ sed -i -E \
             "psql",
              "-X",
              "-d",
-             "$PGCOPYDB_TARGET_PGURI",
+             '"$PGCOPYDB_TARGET_PGURI"',
              "-v",
              # Attempt whatever tsdbadmin can do, but don't fail if it fails.
              "ON_ERROR_STOP=0",
