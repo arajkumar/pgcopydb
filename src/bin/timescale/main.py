@@ -71,6 +71,9 @@ def main():
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
+    parser_migrate.add_argument('--exclude-existing-table-data', nargs='*',
+                                help='Exclude the data from given table during initial data migration. ' \
+                                    'However, the table schema will be migrated, and live replay will happen for the specified table.')
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',

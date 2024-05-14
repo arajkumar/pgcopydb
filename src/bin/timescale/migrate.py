@@ -125,6 +125,10 @@ def skip_extensions_list(args):
 
 
 def prepare_exclude_extensions(clone_cmd: list[str], args, filter: Filter):
+    if args.exclude_existing_table_data:
+        logger.info("Excluding table data: %s", args.exclude_existing_table_data)
+        filter.exclude_table_data(args.exclude_existing_table_data)
+
     # empty list of skip_extensions ignores all extensions
     if args.skip_extensions is not None and len(args.skip_extensions) == 0:
         logger.warn("Ignoring all extensions")
