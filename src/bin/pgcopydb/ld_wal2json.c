@@ -11,7 +11,6 @@
 
 #include "postgres.h"
 #include "postgres_fe.h"
-#include "libpq-fe.h"
 #include "access/xlog_internal.h"
 #include "access/xlogdefs.h"
 
@@ -25,7 +24,6 @@
 #include "lock_utils.h"
 #include "log.h"
 #include "parsing_utils.h"
-#include "pgsql.h"
 #include "pidfile.h"
 #include "pg_utils.h"
 #include "schema.h"
@@ -35,10 +33,6 @@
 #include "timescale.h"
 
 
-static bool SetMessageRelation(JSON_Object *jsobj,
-							   LogicalMessageRelation *table,
-							   LogicalMessageMetadata *metadata,
-							   PGSQL *pgsql);
 static bool SetColumnNamesAndValues(LogicalMessageTuple *tuple,
 									const char *message,
 									JSON_Array *jscols);
@@ -154,13 +148,40 @@ parseWal2jsonMessage(StreamContext *privateContext,
 	/* most actions share a need for "schema" and "table" properties */
 	JSON_Object *jsobj = json_value_get_object(json);
 
-	LogicalMessageRelation table = { 0 };
+	char *schema = NULL;
+	char *table = NULL;
 
-	if (!SetMessageRelation(jsobj, &table, metadata, privateContext->transformPGSQL))
+	schema = (char *) json_object_dotget_string(jsobj, "message.schema");
+	table = (char *) json_object_dotget_string(jsobj, "message.table");
+
+	if (schema == NULL || table == NULL)
 	{
 		log_error("Failed to parse truncated message missing "
 				  "schema or table property: %s",
 				  message);
+		return false;
+	}
+
+	char chunk_schema[PG_NAMEDATALEN] = { 0 };
+	char chunk_table[PG_NAMEDATALEN] = { 0 };
+
+	if (timescale_is_chunk(schema, table) &&
+		(metadata->action == STREAM_ACTION_INSERT ||
+		 metadata->action == STREAM_ACTION_UPDATE ||
+		 metadata->action == STREAM_ACTION_DELETE))
+	{
+		if (!timescale_chunk_to_hypertable(schema,
+										   table,
+										   chunk_schema,
+										   chunk_table))
+		{
+			log_error("Failed to map chunk %s.%s to hypertable",
+					  schema, table);
+			return false;
+		}
+
+		schema = chunk_schema;
+		table = chunk_table;
 	}
 
 	switch (metadata->action)
@@ -177,7 +198,9 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_TRUNCATE:
 		{
-			stmt->stmt.truncate.table = table;
+			strlcpy(stmt->stmt.truncate.nspname, schema, PG_NAMEDATALEN);
+			strlcpy(stmt->stmt.truncate.relname, table, PG_NAMEDATALEN);
+
 			break;
 		}
 
@@ -186,7 +209,8 @@ parseWal2jsonMessage(StreamContext *privateContext,
 			JSON_Array *jscols =
 				json_object_dotget_array(jsobj, "message.columns");
 
-			stmt->stmt.insert.table = table;
+			strlcpy(stmt->stmt.insert.nspname, schema, PG_NAMEDATALEN);
+			strlcpy(stmt->stmt.insert.relname, table, PG_NAMEDATALEN);
 
 			stmt->stmt.insert.new.count = 1;
 			stmt->stmt.insert.new.array =
@@ -213,7 +237,8 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_UPDATE:
 		{
-			stmt->stmt.update.table = table;
+			strlcpy(stmt->stmt.update.nspname, schema, PG_NAMEDATALEN);
+			strlcpy(stmt->stmt.update.relname, table, PG_NAMEDATALEN);
 
 			stmt->stmt.update.old.count = 1;
 			stmt->stmt.update.new.count = 1;
@@ -260,7 +285,8 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_DELETE:
 		{
-			stmt->stmt.delete.table = table;
+			strlcpy(stmt->stmt.delete.nspname, schema, PG_NAMEDATALEN);
+			strlcpy(stmt->stmt.delete.relname, table, PG_NAMEDATALEN);
 
 			stmt->stmt.delete.old.count = 1;
 			stmt->stmt.delete.old.array =
@@ -295,69 +321,6 @@ parseWal2jsonMessage(StreamContext *privateContext,
 	}
 
 	/* keep compiler happy */
-	return true;
-}
-
-
-/*
- * SetMessageRelation parses the table's nspname and relname from the JSON
- * object and escapes it appropriately to be put as it is in SQL statements
- */
-static bool
-SetMessageRelation(JSON_Object *jsobj,
-				   LogicalMessageRelation *table,
-				   LogicalMessageMetadata *metadata,
-				   PGSQL *pgsql)
-{
-	char *schema = NULL;
-	char *relname = NULL;
-
-	schema = (char *) json_object_dotget_string(jsobj, "message.schema");
-	relname = (char *) json_object_dotget_string(jsobj, "message.table");
-
-
-	if (schema == NULL || relname == NULL)
-	{
-		return false;
-	}
-
-	char chunk_schema[PG_NAMEDATALEN] = { 0 };
-	char chunk_table[PG_NAMEDATALEN] = { 0 };
-
-	if (timescale_is_chunk(schema, relname) &&
-		(metadata->action == STREAM_ACTION_INSERT ||
-		 metadata->action == STREAM_ACTION_UPDATE ||
-		 metadata->action == STREAM_ACTION_DELETE))
-	{
-		if (!timescale_chunk_to_hypertable(schema,
-										   relname,
-										   chunk_schema,
-										   chunk_table))
-		{
-			log_error("Failed to map chunk %s.%s to hypertable",
-					  schema, relname);
-			return false;
-		}
-
-		schema = chunk_schema;
-		relname = chunk_table;
-	}
-
-	table->nspname = pgsql_escape_identifier(pgsql, schema);
-	if (table->nspname == NULL)
-	{
-		return false;
-	}
-
-	table->relname = pgsql_escape_identifier(pgsql, relname);
-	if (table->relname == NULL)
-	{
-		PQfreemem(table->nspname);
-		return false;
-	}
-
-	table->pqMemory = true;
-
 	return true;
 }
 

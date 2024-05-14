@@ -21,9 +21,6 @@ unit: build
 filtering: build
 	$(MAKE) -C $@
 
-extensions: build
-	$(MAKE) -C $@
-
 cdc-wal2json: build
 	$(MAKE) -C $@
 
@@ -40,6 +37,9 @@ follow-wal2json: build
 	$(MAKE) -C $@
 
 follow-9.6: build
+	$(MAKE) -C $@
+
+extensions: build
 	$(MAKE) -C $@
 
 follow-data-only: build

@@ -15,11 +15,9 @@ pgcopydb ping
 
 psql -o /tmp/s.out -d ${PGCOPYDB_SOURCE_PGURI} -1 -f /usr/src/pagila/pagila-schema.sql
 psql -o /tmp/d.out -d ${PGCOPYDB_SOURCE_PGURI} -1 -f /usr/src/pagila/pagila-data.sql
+
 # alter the pagila schema to allow capturing DDLs without pkey
 psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/ddl.sql
-
-psql -o /tmp/s.out -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/special-ddl.sql
-psql -o /tmp/s.out -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/special-dml.sql
 
 # create the replication slot that captures all the changes
 coproc ( pgcopydb snapshot --follow )
@@ -37,7 +35,6 @@ wait ${COPROC_PID}
 
 # now that the copying is done, inject some SQL DML changes to the source
 psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/dml.sql
-psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/special-dml.sql
 
 # grab the current LSN, it's going to be our streaming end position
 lsn=`psql -At -d ${PGCOPYDB_SOURCE_PGURI} -c 'select pg_current_wal_lsn()'`

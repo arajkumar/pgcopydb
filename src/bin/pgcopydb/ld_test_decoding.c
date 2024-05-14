@@ -37,7 +37,8 @@ typedef struct TestDecodingHeader
 {
 	const char *message;
 	char qname[PG_NAMEDATALEN_FQ];
-	LogicalMessageRelation table;
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 	StreamAction action;
 	int offset;                 /* end of metadata section */
 	int pos;
@@ -171,35 +172,33 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 			return false;
 		}
 
-		if (strcmp(header.table.nspname, "pgcopydb") == 0)
+		if (strcmp(header.nspname, "pgcopydb") == 0)
 		{
 			log_debug("Filtering out message for schema \"%s\": %s",
-					  header.table.nspname,
+					  header.nspname,
 					  context->buffer);
 			metadata->filterOut = true;
 		}
 
-		if (!timescale_allow_relation(header.table.nspname, header.table.relname))
+		if (!timescale_allow_relation(header.nspname, header.relname))
 		{
 			log_warn("Filtering out message action %s for %s.%s",
 					 StreamActionToString(header.action),
-					 header.table.nspname, header.table.relname);
+					 header.nspname, header.relname);
 
 			metadata->filterOut = true;
 		}
 
 		if (header.action == STREAM_ACTION_TRUNCATE &&
-			timescale_is_chunk(header.table.nspname, header.table.relname))
+			timescale_is_chunk(header.nspname, header.relname))
 		{
 			log_warn("Filtering out message action TRUNCATE for %s.%s",
-					 header.table.nspname, header.table.relname);
+					 header.nspname, header.relname);
 
 			metadata->filterOut = true;
 		}
 
 		metadata->action = header.action;
-
-		FreeLogicalMessageRelation(&(header.table));
 	}
 	else
 	{
@@ -267,14 +266,14 @@ parseTestDecodingMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_TRUNCATE:
 		{
-			stmt->stmt.truncate.table = header.table;
+			strlcpy(stmt->stmt.truncate.nspname, header.nspname, PG_NAMEDATALEN);
+			strlcpy(stmt->stmt.truncate.relname, header.relname, PG_NAMEDATALEN);
 
 			break;
 		}
 
 		case STREAM_ACTION_INSERT:
 		{
-			stmt->stmt.insert.table = header.table;
 			if (!parseTestDecodingInsertMessage(privateContext, &header))
 			{
 				log_error("Failed to parse test_decoding INSERT message: %s",
@@ -287,7 +286,6 @@ parseTestDecodingMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_UPDATE:
 		{
-			stmt->stmt.update.table = header.table;
 			if (!parseTestDecodingUpdateMessage(privateContext, &header))
 			{
 				log_error("Failed to parse test_decoding UPDATE message: %s",
@@ -299,7 +297,6 @@ parseTestDecodingMessage(StreamContext *privateContext,
 
 		case STREAM_ACTION_DELETE:
 		{
-			stmt->stmt.delete.table = header.table;
 			if (!parseTestDecodingDeleteMessage(privateContext, &header))
 			{
 				log_error("Failed to parse test_decoding DELETE message: %s",
@@ -359,20 +356,9 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 		return false;
 	}
 
-	/*
-	 * The table schema.name is already escaped by the plugin using PostgreSQL's
-	 * internal quote_identifier function (see
-	 * https://github.com/postgres/postgres/blob/8793c600/contrib/test_decoding/test_decoding.c#L627-L632).
-	 * The result slightly differs from that of PQescapeIdentifier, as it does
-	 * not add quotes around the schema.name when they are not necessary. Here
-	 * are some possible outputs:
-	 * - public.hello
-	 * - "Public".hello
-	 * - "sp $cial"."t ablE"
-	 */
-	header->table.nspname = strndup(idp, dot - idp);
-	header->table.relname = strndup(dot + 1, sep - dot - 1);
-	header->table.pqMemory = false;
+	/* grab the table schema.name */
+	strlcpy(header->nspname, idp, dot - idp + 1);
+	strlcpy(header->relname, dot + 1, sep - dot);
 
 	/* now grab the action */
 	char action[BUFSIZE] = { 0 };
@@ -404,45 +390,29 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	}
 
 	/* Map if the relation is chunk */
-	if (timescale_is_chunk(header->table.nspname, header->table.relname) &&
+	if (timescale_is_chunk(header->nspname, header->relname) &&
 		header->action != STREAM_ACTION_TRUNCATE)
 	{
 		char chunk_schema[PG_NAMEDATALEN] = { 0 };
 		char chunk_table[PG_NAMEDATALEN] = { 0 };
 
-		if (!timescale_chunk_to_hypertable(header->table.nspname,
-										   header->table.relname,
+		if (!timescale_chunk_to_hypertable(header->nspname,
+										   header->relname,
 										   chunk_schema,
 										   chunk_table))
 		{
 			log_error("Failed to map chunk %s.%s to hypertable",
-					  header->table.nspname, header->table.relname);
+					  header->nspname, header->relname);
 			return false;
 		}
 
-		free(header->table.nspname);
-		free(header->table.relname);
-
-		header->table.nspname = strndup(chunk_schema, strlen(chunk_schema));
-
-		if (header->table.nspname == NULL)
-		{
-			log_error(ALLOCATION_FAILED_ERROR);
-			return false;
-		}
-
-		header->table.relname = strndup(chunk_table, strlen(chunk_table));
-
-		if (header->table.relname == NULL)
-		{
-			log_error(ALLOCATION_FAILED_ERROR);
-			return false;
-		}
+		strlcpy(header->nspname, chunk_schema, sizeof(header->nspname));
+		strlcpy(header->relname, chunk_table, sizeof(header->relname));
 	}
 
 	sformat(header->qname, sizeof(header->qname), "%s.%s",
-			header->table.nspname,
-			header->table.relname);
+			header->nspname,
+			header->relname);
 
 	return true;
 }
@@ -457,6 +427,9 @@ parseTestDecodingInsertMessage(StreamContext *privateContext,
 							   TestDecodingHeader *header)
 {
 	LogicalTransactionStatement *stmt = privateContext->stmt;
+
+	strlcpy(stmt->stmt.insert.nspname, header->nspname, PG_NAMEDATALEN);
+	strlcpy(stmt->stmt.insert.relname, header->relname, PG_NAMEDATALEN);
 
 	stmt->stmt.insert.new.count = 1;
 	stmt->stmt.insert.new.array =
@@ -493,6 +466,9 @@ parseTestDecodingUpdateMessage(StreamContext *privateContext,
 							   TestDecodingHeader *header)
 {
 	LogicalTransactionStatement *stmt = privateContext->stmt;
+
+	strlcpy(stmt->stmt.update.nspname, header->nspname, PG_NAMEDATALEN);
+	strlcpy(stmt->stmt.update.relname, header->relname, PG_NAMEDATALEN);
 
 	stmt->stmt.update.old.count = 1;
 	stmt->stmt.update.new.count = 1;
@@ -584,6 +560,9 @@ parseTestDecodingDeleteMessage(StreamContext *privateContext,
 							   TestDecodingHeader *header)
 {
 	LogicalTransactionStatement *stmt = privateContext->stmt;
+
+	strlcpy(stmt->stmt.delete.nspname, header->nspname, PG_NAMEDATALEN);
+	strlcpy(stmt->stmt.delete.relname, header->relname, PG_NAMEDATALEN);
 
 	stmt->stmt.delete.old.count = 1;
 	stmt->stmt.delete.old.array =
