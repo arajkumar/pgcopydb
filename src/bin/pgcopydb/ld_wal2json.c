@@ -130,11 +130,6 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 		}
 	}
 
-	/*
-	 * TODO(merge): check whether we need the below statement.
-	 */
-	json_value_free(json);
-
 	return true;
 }
 

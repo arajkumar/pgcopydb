@@ -1139,10 +1139,6 @@ stream_apply_sql(StreamApplyContext *context,
 				}
 			}
 
-			/*
-			 * TODO(merge): check whether we need the below statement.
-			 */
-			json_value_free(js);
 
 			break;
 		}
