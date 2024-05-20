@@ -423,3 +423,63 @@ fn test_case_sensitive_objects() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_jobs_from_different_owner_migration() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    // Postgres role will create test_role. We can imagine Postgres role here as a tsdbadmin role on MST.
+    psql(
+        &source_container,
+        Sql(r"
+		CREATE TABLE metrics(time timestamptz primary key, value float8);
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+        CREATE ROLE test_role WITH LOGIN PASSWORD 'pass';
+        GRANT ALL ON SCHEMA public TO test_role;
+	"),
+    )?;
+
+    // Create a job with test_role as job owner.
+    psql(
+        &source_container,
+        Sql(r"
+        SET SESSION ROLE 'test_role';
+        CREATE OR REPLACE PROCEDURE test_action(job_id int, config jsonb) LANGUAGE PLPGSQL AS $$ BEGIN PERFORM 1; END $$;
+        SELECT add_job('test_action', '1h')
+    "),
+    )?;
+
+    {
+        let mut source_assert = DbAssert::new(&source_container.connection_string())?;
+        source_assert.has_user_defined_job("test_action", "test_role");
+    }
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+    let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
+        .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+    target_assert.has_user_defined_job("test_action", "test_role");
+
+    Ok(())
+}
