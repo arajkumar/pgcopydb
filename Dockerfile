@@ -36,7 +36,6 @@ RUN dpkg --add-architecture ${TARGETARCH:-arm64} && apt update \
     libreadline-dev \
     libselinux1-dev \
     libssl-dev \
-	libzstd-dev \
     libxslt1-dev \
     libzstd-dev \
     lsof \
