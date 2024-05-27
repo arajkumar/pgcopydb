@@ -31,7 +31,7 @@
 #include "git-version.h"
 
 /* additional version information for printing version on CLI */
-#define PGCOPYDB_VERSION "0.15"
+#define PGCOPYDB_VERSION "0.16"
 
 #ifdef GIT_VERSION
 #define VERSION_STRING GIT_VERSION
@@ -65,6 +65,7 @@
 #define PGCOPYDB_SKIP_VACUUM "PGCOPYDB_SKIP_VACUUM"
 #define PGCOPYDB_SKIP_TABLESPACES "PGCOPYDB_SKIP_TABLESPACES"
 #define PGCOPYDB_SKIP_DB_PROPERTIES "PGCOPYDB_SKIP_DB_PROPERTIES"
+#define PGCOPYDB_SKIP_CTID_SPLIT "PGCOPYDB_SKIP_CTID_SPLIT"
 
 /* default values for the command line options */
 #define DEFAULT_TABLE_JOBS 4
