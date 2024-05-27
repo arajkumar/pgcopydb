@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # This script orchestrates CDC based migration process using pgcopydb.
 
+import csv
 import os
 import signal
 import sys
@@ -212,6 +213,45 @@ def skip_extensions_list(args):
         return skip_extensions_default + args.skip_extensions
     else:
         return skip_extensions_default
+
+
+def get_hypertables(pguri) -> csv.DictReader:
+    hypertables = psql_run(conn=pguri,
+                           sql="select hypertable_schema, hypertable_name from timescaledb_information.hypertables")
+    return hypertables
+
+def get_hypertable_conflicting_constraints(pguri, hypertables: csv.DictReader) -> csv.DictReader:
+    sql = """
+        SELECT
+            con.conname AS constraint_name,
+            cls.relname AS relname,
+            ns.nspname AS nspname,
+            con.contype AS constraint_type,
+            idxcls.relname AS idx_relname,
+            FORMAT('%I.%I', ns.nspname, idxcls.relname) AS index_name,
+            pg_get_indexdef(idx.indexrelid) AS index_definition
+        FROM
+            pg_constraint con
+        JOIN
+            pg_class cls ON con.conrelid = cls.oid
+        JOIN
+            pg_namespace ns ON cls.relnamespace = ns.oid
+        JOIN
+            pg_index idx ON idx.indexrelid = con.conindid
+        JOIN
+            pg_class idxcls ON idx.indexrelid = idxcls.oid
+        WHERE
+            con.contype IN ('p', 'u') -- 'p' for primary key, 'u' for unique constraints
+        $$CONDITION$$
+    """
+    condition = map(lambda row: f"(cls.relname = '{row['hypertable_name']}' AND ns.nspname = '{row['hypertable_schema']}')", hypertables)
+    sql = sql.replace("$$CONDITION$$", " OR ".join(condition))
+    return psql_run(conn=pguri, sql=sql)
+
+
+def prepare_conflicting_constraints_filter(indexes: csv.DictReader, filter: Filter):
+    exclude_indexes = map(lambda row: row["index_name"], indexes)
+    filter.exclude_indexes(exclude_indexes)
 
 
 def prepare_filters(clone_cmd: list[str], args, filter: Filter):
