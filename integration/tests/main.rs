@@ -306,7 +306,6 @@ fn test_skip_dml_on_matview() -> Result<()> {
 
     let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
         .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
-
     let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
         .with_network(&network_name);
     let _migrate = docker.run(migrate);
@@ -342,6 +341,85 @@ fn test_skip_dml_on_matview() -> Result<()> {
     )?;
 
     target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
+
+#[test]
+fn test_case_sensitive_objects() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    psql(
+        &source_container,
+        Sql(r#"
+        CREATE SCHEMA "Sensitive_Schema0";
+		CREATE TABLE "Sensitive_Schema0"."Sensitive_Metric1"(time timestamptz primary key, value float8);
+        SELECT create_hypertable('"Sensitive_Schema0"."Sensitive_Metric1"', by_range('time'));
+		INSERT INTO "Sensitive_Schema0"."Sensitive_Metric1"(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+        CREATE ROLE "Sensitive_Role2" WITH LOGIN PASSWORD 'pass';
+        GRANT ALL ON SCHEMA public TO "Sensitive_Role2";
+	"#),
+    )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+    let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
+        .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    let check_count = |dba: &mut DbAssert, count: i64| {
+        let client = dba.connection();
+        let v: i64 = client
+            .query_one(
+                r#"select count(*) from "Sensitive_Schema0"."Sensitive_Metric1""#,
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(v, count);
+    };
+
+    {
+        let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+        target_assert.has_table("Sensitive_Schema0", "Sensitive_Metric1");
+        check_count(&mut target_assert, 744);
+    }
+
+    // Perform CDC on sensitive SQL objects.
+    // Live migration below v0.0.15 could not replicate the following INSERT statement.
+    psql(
+        &source_container,
+        Sql(r#"
+        INSERT INTO "Sensitive_Schema0"."Sensitive_Metric1"(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+    "#),
+    )?;
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+    check_count(&mut target_assert, 1440);
 
     Ok(())
 }
