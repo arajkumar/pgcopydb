@@ -933,18 +933,19 @@ copydb_prepare_index_specs(CopyDataSpec *specs, PGSQL *pgsql)
 bool
 copydb_matview_refresh_is_filtered_out(CopyDataSpec *specs, uint32_t oid)
 {
-	DatabaseCatalog *filtersDB = &(specs->catalogs.filter);
-	SourceMatView result = { 0 };
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	SourceTable table = { 0 };
 
 	if (oid != 0)
 	{
-		if (!catalog_lookup_s_matview_by_oid(filtersDB, &result, oid))
+		if (!catalog_lookup_s_table(sourceDB, oid, 0, &table))
 		{
 			/* errors have already been logged */
 			return false;
 		}
 
-		if (result.oid != 0)
+		if (table.oid != 0 && table.excludeData)
 		{
 			return true;
 		}

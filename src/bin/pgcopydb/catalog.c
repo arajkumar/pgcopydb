@@ -62,6 +62,7 @@ static char *sourceDBcreateDDLs[] = {
 	"create table s_table("
 	"  oid integer primary key, "
 	"  datname text, qname text, nspname text, relname text, amname text, "
+	"  relkind integer, "
 	"  restore_list_name text, "
 	"  relpages integer, reltuples integer, "
 	"  exclude_data boolean, "
@@ -233,6 +234,7 @@ static char *filterDBcreateDDLs[] = {
 	"create table s_table("
 	"  oid integer primary key, "
 	"  datname text, qname text, nspname text, relname text, amname text, "
+	"  relkind integer, "
 	"  restore_list_name text, "
 	"  relpages integer, reltuples integer, "
 	"  exclude_data boolean, "
@@ -1793,9 +1795,9 @@ catalog_add_s_table(DatabaseCatalog *catalog, SourceTable *table)
 
 	char *sql =
 		"insert into s_table("
-		"  oid, qname, nspname, relname, amname, restore_list_name, "
+		"  oid, qname, nspname, relname, amname, relkind, restore_list_name, "
 		"  relpages, reltuples, exclude_data, part_key) "
-		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+		"values($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
 
 	SQLiteQuery query = { 0 };
 
@@ -1812,6 +1814,7 @@ catalog_add_s_table(DatabaseCatalog *catalog, SourceTable *table)
 		{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, table->nspname },
 		{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, table->relname },
 		{ BIND_PARAMETER_TYPE_TEXT, "amname", 0, table->amname },
+		{ BIND_PARAMETER_TYPE_INT, "relkind", (int) table->relkind, NULL },
 
 		{ BIND_PARAMETER_TYPE_TEXT, "restore_list_name", 0,
 		  table->restoreListName },
@@ -2803,6 +2806,8 @@ catalog_iter_s_table_init(SourceTableIterator *iter)
 		"         left join s_table_chksum c on c.oid = t.oid "
 		"         left join summary s on s.tableoid = t.oid "
 		"         left join s_table_size ts on ts.oid = t.oid "
+		/* we only want tables */
+		"where char(t.relkind) = 'r' "
 		"group by t.oid "
 		"order by ts.bytes desc";
 
@@ -4892,15 +4897,6 @@ catalog_prepare_filter(DatabaseCatalog *catalog,
 
 		"     select oid, restore_list_name, 'table' "
 		"       from s_table "
-
-		"  union all "
-
-		/*
-		 * This is only for materialized views. Materialized view refresh
-		 * filtering is done with the help of s_matview data.
-		 */
-		"	 select oid, restore_list_name, 'matview' "
-		"	   from s_matview where exclude_data = 0 "
 
 		"  union all "
 

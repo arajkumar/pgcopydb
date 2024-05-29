@@ -1194,6 +1194,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"  select c.oid, "
 		"         format('%I', n.nspname) as nspname, "
 		"         format('%I', c.relname) as relname, "
+		"         c.relkind as relkind, "
 		"         pg_am.amname, "
 		"         c.relpages, c.reltuples::bigint, "
 		"         false as excludedata, "
@@ -1253,7 +1254,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"              limit 1"
 		"         ) as pkeys on true"
 
-		"   where relkind = 'r' and c.relpersistence in ('p', 'u') "
+		"   where relkind in ('r', 'm') and c.relpersistence in ('p', 'u') "
 		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
 		"     and n.nspname !~ 'pgcopydb' "
 
@@ -1276,6 +1277,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"  select c.oid, "
 		"         format('%I', n.nspname) as nspname, "
 		"         format('%I', c.relname) as relname, "
+		"         c.relkind as relkind, "
 		"         pg_am.amname, "
 		"         c.relpages, c.reltuples::bigint, "
 		"         exists(select 1 "
@@ -1343,7 +1345,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"              limit 1"
 		"         ) as pkeys on true"
 
-		"   where relkind = 'r' and c.relpersistence in ('p', 'u') "
+		"   where relkind in ('r', 'm') and c.relpersistence in ('p', 'u') "
 		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
 		"     and n.nspname !~ 'pgcopydb' "
 
@@ -1366,6 +1368,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"  select c.oid, "
 		"         format('%I', n.nspname) as nspname, "
 		"         format('%I', c.relname) as relname, "
+		"         c.relkind as relkind, "
 		"         pg_am.amname, "
 		"         c.relpages, c.reltuples::bigint, "
 		"         ftd.relname is not null as excludedata, "
@@ -1439,14 +1442,13 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"              limit 1"
 		"         ) as pkeys on true"
 
-		"   where relkind in ('r', 'p') and c.relpersistence in ('p', 'u') "
+		"   where relkind in ('r', 'p', 'm') and c.relpersistence in ('p', 'u') "
 		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
 		"     and n.nspname !~ 'pgcopydb' "
 
 		/* WHERE clause for exclusion filters */
 		"     and fn.nspname is null "
 		"     and ft.relname is null "
-		"     and ftd.relname is null "
 
 		/* avoid pg_class entries which belong to extensions */
 		"     and not exists "
@@ -1467,6 +1469,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"  select c.oid, "
 		"         format('%I', n.nspname) as nspname, "
 		"         format('%I', c.relname) as relname, "
+		"         c.relkind as relkind, "
 		"         pg_am.amname, "
 		"         c.relpages, c.reltuples::bigint, "
 		"         false as excludedata, "
@@ -1531,7 +1534,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"              limit 1"
 		"         ) as pkeys on true"
 
-		"   where relkind in ('r', 'p') and c.relpersistence in ('p', 'u') "
+		"   where relkind in ('r', 'p', 'm') and c.relpersistence in ('p', 'u') "
 		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
 		"     and n.nspname !~ 'pgcopydb' "
 
@@ -1557,6 +1560,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"  select c.oid, "
 		"         format('%I', n.nspname) as nspname, "
 		"         format('%I', c.relname) as relname, "
+		"         c.relkind as relkind, "
 		"         pg_am.amname, "
 		"         c.relpages, c.reltuples::bigint, "
 		"         false as excludedata, "
@@ -1625,7 +1629,7 @@ struct FilteringQueries listSourceTablesSQL[] = {
 		"              limit 1"
 		"         ) as pkeys on true"
 
-		"   where relkind in ('r', 'p') and c.relpersistence in ('p', 'u') "
+		"   where relkind in ('r', 'p', 'm') and c.relpersistence in ('p', 'u') "
 		"     and n.nspname !~ '^pg_' and n.nspname <> 'information_schema' "
 		"     and n.nspname !~ 'pgcopydb' "
 
@@ -5102,7 +5106,7 @@ getTableArray(void *ctx, PGresult *result)
 
 	int nTuples = PQntuples(result);
 
-	if (PQnfields(result) != 10)
+	if (PQnfields(result) != 11)
 	{
 		log_error("Query returned %d columns, expected 10", PQnfields(result));
 		context->parsedOk = false;
@@ -5267,6 +5271,7 @@ parseCurrentSourceTable(PGresult *result, int rowNumber, SourceTable *table)
 	int fnnspname = PQfnumber(result, "nspname");
 	int fnrelname = PQfnumber(result, "relname");
 	int fnamname = PQfnumber(result, "amname");
+	int fnrelkind = PQfnumber(result, "relkind");
 	int fnrelpages = PQfnumber(result, "relpages");
 	int fnreltuples = PQfnumber(result, "reltuples");
 	int fnexcldata = PQfnumber(result, "excludedata");
@@ -5342,6 +5347,10 @@ parseCurrentSourceTable(PGresult *result, int rowNumber, SourceTable *table)
 			++errors;
 		}
 	}
+
+	/* c.relkind */
+	value = PQgetvalue(result, rowNumber, fnrelkind);
+	table->relkind = value[0];
 
 	/* c.relpages */
 	if (PQgetisnull(result, rowNumber, fnrelpages))
