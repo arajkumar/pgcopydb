@@ -19,6 +19,7 @@ from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql, print_logs_with_error, LogFile
 from filter import Filter
+from psql import psql as psql_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,96 @@ def is_section_migration_complete(section):
 
 def mark_section_complete(section):
     Path(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done").touch()
+
+def convert_matview_to_view(conn):
+    query = """
+BEGIN;
+
+CREATE SCHEMA IF NOT EXISTS __live_migration;
+CREATE OR REPLACE FUNCTION __live_migration.skip_dml_function() RETURNS TRIGGER AS $$
+BEGIN
+    -- Do nothing and return NULL to skip the DML operation
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE
+    mv RECORD;
+    populated BOOLEAN;
+BEGIN
+    -- Create the audit table if it does not exist
+    CREATE TABLE IF NOT EXISTS __live_migration.matview_audit (
+        schemaname TEXT,
+        matviewname TEXT,
+        renamed BOOLEAN DEFAULT FALSE
+    );
+
+    SELECT COUNT(*) > 0 INTO populated FROM __live_migration.matview_audit;
+
+    -- Populate the audit table with materialized views if not already populated
+    IF populated = FALSE THEN
+        INSERT INTO __live_migration.matview_audit (schemaname, matviewname)
+        SELECT schemaname, matviewname
+        FROM pg_matviews;
+    END IF;
+
+    -- Loop through all materialized views in the current schema that have not been renamed
+    FOR mv IN
+        SELECT schemaname, matviewname
+        FROM __live_migration.matview_audit
+        WHERE NOT renamed
+    LOOP
+        -- Rename the materialized view with a temp_ prefix
+        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I RENAME TO %I', mv.schemaname, mv.matviewname, 'temp_' || mv.matviewname);
+
+        -- Update the audit table to mark the view as renamed
+        EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = true WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
+
+        -- Create a view to replace the materialized view
+        EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %I.%I', mv.schemaname, mv.matviewname, mv.schemaname, 'temp_' || mv.matviewname);
+        EXECUTE format('CREATE TRIGGER skip_dml_trigger
+                        INSTEAD OF INSERT OR UPDATE OR DELETE ON %I.%I
+                        FOR EACH ROW EXECUTE FUNCTION __live_migration.skip_dml_function()', mv.schemaname, mv.matviewname);
+    END LOOP;
+END $$;
+
+COMMIT;
+"""
+    return True
+
+def restore_matview(conn):
+    query = """
+BEGIN;
+
+DO $$
+DECLARE
+    mv RECORD;
+BEGIN
+    -- Loop through all materialized views in the current schema that have not been renamed
+    FOR mv IN
+        SELECT schemaname, matviewname
+        FROM __live_migration.matview_audit
+        WHERE renamed
+    LOOP
+        -- Drop the view if it exists
+        EXECUTE format('DROP VIEW IF EXISTS %I.%I', mv.schemaname, mv.matviewname);
+
+        -- Rename the materialized view with a temp_ prefix
+        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I RENAME TO %I', mv.schemaname, 'temp_' || mv.matviewname, mv.matviewname);
+
+        -- Update the audit table to mark the view as renamed
+        EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = false WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
+
+    END LOOP;
+    DROP SCHEMA IF EXISTS __live_migration CASCADE;
+END $$;
+
+COMMIT;
+"""
+    psql_cmd(conn, query)
+
+
 
 
 @telemetry_command("create_follow")
@@ -597,6 +688,7 @@ def migrate(args):
 
     housekeeping_thread, housekeeping_stop_event = None, None
     follow_proc = create_follow(resume=args.resume)
+    matview_fix = False
     try:
         if not is_section_migration_complete("roles") and not args.skip_roles:
             logger.info("Migrating roles from Source DB to Target DB ...")
@@ -612,6 +704,9 @@ def migrate(args):
             mark_section_complete("initial-data-migration")
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
+
+        logger.info("Converting materialized views to views ...")
+        matview_fix = convert_matview_to_view(target_pg_uri)
 
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply")
@@ -647,6 +742,10 @@ def migrate(args):
         print(docker_command('live-migration-clean', 'clean'))
         telemetry.complete_success()
     finally:
+        if matview_fix:
+            logger.info("Restoring materialized views ...")
+            restore_matview(target_pg_uri)
+
         # TODO: Use daemon threads for housekeeping and health_checker.
         health_checker.stop_all()
         if housekeeping_stop_event:
