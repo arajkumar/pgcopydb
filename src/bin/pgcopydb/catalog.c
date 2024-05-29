@@ -5252,7 +5252,7 @@ catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
 	}
 
 	char *sql =
-		"  select oid, nspname, relname, exclude_data"
+		"  select oid, nspname, relname, restore_list_name, exclude_data"
 		"    from s_matview "
 		"   where oid = $1 ";
 
@@ -5324,11 +5324,18 @@ catalog_s_matview_fetch(SQLiteQuery *query)
 	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
 	{
 		strlcpy(entry->relname,
-				(char *) sqlite3_column_text(query->ppStmt, 1),
+				(char *) sqlite3_column_text(query->ppStmt, 2),
 				sizeof(entry->relname));
 	}
 
-	entry->excludeData = sqlite3_column_int64(query->ppStmt, 3) == 1;
+	if (sqlite3_column_type(query->ppStmt, 3) != SQLITE_NULL)
+	{
+		strlcpy(entry->restoreListName,
+				(char *) sqlite3_column_text(query->ppStmt, 3),
+				sizeof(entry->restoreListName));
+	}
+
+	entry->excludeData = sqlite3_column_int64(query->ppStmt, 4) == 1;
 
 	return true;
 }
