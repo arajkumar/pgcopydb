@@ -763,7 +763,7 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		 */
 		if (!skip &&
 			item->desc == ARCHIVE_TAG_REFRESH_MATERIALIZED_VIEW &&
-			copydb_matview_objectid_is_filtered_out(specs, oid))
+			copydb_matview_refresh_is_filtered_out(specs, oid))
 		{
 			skip = true;
 

@@ -926,15 +926,15 @@ copydb_prepare_index_specs(CopyDataSpec *specs, PGSQL *pgsql)
 
 
 /*
- * copydb_matview_objectid_is_filtered_out returns true when the
+ * copydb_matview_refresh_is_filtered_out returns true when the
  * given oid belongs to a database materialized view object that's
  * been filtered out by the filtering setup.
  */
 bool
-copydb_matview_objectid_is_filtered_out(CopyDataSpec *specs, uint32_t oid)
+copydb_matview_refresh_is_filtered_out(CopyDataSpec *specs, uint32_t oid)
 {
 	DatabaseCatalog *filtersDB = &(specs->catalogs.filter);
-	CatalogMatview result = { 0 };
+	SourceMatView result = { 0 };
 
 	if (oid != 0)
 	{

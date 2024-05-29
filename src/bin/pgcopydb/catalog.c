@@ -5240,7 +5240,7 @@ catalog_filter_fetch(SQLiteQuery *query)
  */
 bool
 catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
-								CatalogMatview *result,
+								SourceMatView *result,
 								uint32_t oid)
 {
 	sqlite3 *db = catalog->db;
@@ -5307,10 +5307,10 @@ catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
 bool
 catalog_s_matview_fetch(SQLiteQuery *query)
 {
-	CatalogMatview *entry = (CatalogMatview *) query->context;
+	SourceMatView *entry = (SourceMatView *) query->context;
 
 	/* cleanup the memory area before re-use */
-	bzero(entry, sizeof(CatalogMatview));
+	bzero(entry, sizeof(SourceMatView));
 
 	entry->oid = sqlite3_column_int64(query->ppStmt, 0);
 

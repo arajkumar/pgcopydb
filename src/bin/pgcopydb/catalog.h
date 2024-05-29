@@ -404,16 +404,8 @@ bool catalog_filter_fetch(SQLiteQuery *query);
 /*
  * Materialized views
  */
-typedef struct CatalogrMatview
-{
-	uint32_t oid;
-	char nspname[PG_NAMEDATALEN];
-	char relname[PG_NAMEDATALEN];
-	bool excludeData;
-} CatalogMatview;
-
 bool catalog_lookup_s_matview_by_oid(DatabaseCatalog *catalog,
-									 CatalogMatview *result,
+									 SourceMatView *result,
 									 uint32_t oid);
 
 bool catalog_s_matview_fetch(SQLiteQuery *query);
