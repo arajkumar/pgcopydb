@@ -268,3 +268,80 @@ fn test_exclude_existing_table_data() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_skip_dml_on_matview() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    psql(
+        &source_container,
+        Sql(r"
+		CREATE TABLE metrics(time timestamptz primary key, value float8);
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+
+		CREATE MATERIALIZED VIEW metrics_count AS SELECT count(1) FROM metrics;
+
+		CREATE SCHEMA IF NOT EXISTS metrics_matview;
+		CREATE MATERIALIZED VIEW metrics_matview.metrics_count_1 AS SELECT count(1) FROM metrics;
+	"),
+    )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+
+    let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
+        .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+
+    target_assert.has_table_count("public", "metrics", 744);
+
+    psql(
+        &source_container,
+        Sql(r"
+        INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+
+		-- By default Postgres skips changes happening on materialized views due
+		-- REFRESH MATERIALIZED VIEW CONCURRENTLY.
+		-- However in some situations we see that Postgres does not skip the changes
+		-- and logical messages are generated for the materialized view.
+		-- Drop/Recreate is one such scenario which causes logical messages to
+		-- be generated.
+		-- Refer https://github.com/timescale/pgcopydb/pull/105.
+		DROP MATERIALIZED VIEW IF EXISTS metrics_count;
+		CREATE MATERIALIZED VIEW metrics_count AS SELECT count(1) FROM metrics;
+
+		DROP MATERIALIZED VIEW IF EXISTS metrics_matview.metrics_count_1;
+		CREATE MATERIALIZED VIEW metrics_matview.metrics_count_1 AS SELECT count(1) FROM metrics;
+    "),
+    )?;
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
