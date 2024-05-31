@@ -126,15 +126,12 @@ BEGIN
         EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = false WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
 
     END LOOP;
-    DROP SCHEMA IF EXISTS __live_migration CASCADE;
 END $$;
 
 COMMIT;
 """
     psql_cmd(conn, query)
-
-
-
+    return True
 
 @telemetry_command("create_follow")
 def create_follow(resume: bool = False):
@@ -690,7 +687,7 @@ def migrate(args):
 
     housekeeping_thread, housekeeping_stop_event = None, None
     follow_proc = create_follow(resume=args.resume)
-    matview_fix = False
+    matview_restore_complete = False
     try:
         if not is_section_migration_complete("roles") and not args.skip_roles:
             logger.info("Migrating roles from Source DB to Target DB ...")
@@ -708,7 +705,7 @@ def migrate(args):
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
         logger.info("Converting materialized views to views ...")
-        matview_fix = convert_matview_to_view(target_pg_uri)
+        convert_matview_to_view(target_pg_uri)
 
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply")
@@ -724,6 +721,9 @@ def migrate(args):
 
         logger.info("Copying sequences ...")
         copy_sequences()
+
+        logger.info("Restoring materialized views ...")
+        matview_restore_complete = restore_matview(target_pg_uri)
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")
@@ -744,7 +744,7 @@ def migrate(args):
         print(docker_command('live-migration-clean', 'clean'))
         telemetry.complete_success()
     finally:
-        if matview_fix:
+        if not matview_restore_complete:
             logger.info("Restoring materialized views ...")
             restore_matview(target_pg_uri)
 

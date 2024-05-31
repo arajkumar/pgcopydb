@@ -19,6 +19,7 @@ def cleanup(args):
         # Dropping pgcopydb schema is under '--prune' since '--prune' flag is used when
         # the user no longer intends to resume the migration process.
         run_sql(execute_on_target=True, sql="drop schema if exists pgcopydb cascade")
+        run_sql(execute_on_target=True, sql="drop schema if exists __live_migration cascade")
 
 def clean(args):
     cleanup(args)
