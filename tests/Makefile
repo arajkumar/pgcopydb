@@ -19,6 +19,9 @@ pagila: build
 pagila-multi-steps: build
 	$(MAKE) -C $@
 
+pagila-standby: build
+	$(MAKE) -C $@
+
 blobs: build
 	$(MAKE) -C $@
 

@@ -452,20 +452,12 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 {
 	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	/* check if we're connected to a standby server, which we don't support */
-	bool pg_is_in_recovery = false;
-
-	if (!pgsql_is_in_recovery(src, &pg_is_in_recovery))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (pg_is_in_recovery)
+	if (specs->sourceSnapshot.isReadOnly && specs->filters.type !=
+		SOURCE_FILTER_TYPE_NONE)
 	{
 		log_fatal("Connected to a standby server where pg_is_in_recovery(): "
 				  "pgcopydb does not support operating on standby server "
-				  "at this point, as it needs to create temp tables");
+				  "when --filters are used, as it needs to create temp tables");
 		return false;
 	}
 
@@ -553,16 +545,6 @@ copydb_fetch_source_schema(CopyDataSpec *specs, PGSQL *src)
 		 specs->section == DATA_SECTION_TABLE_DATA_PARTS) &&
 		!sourceDB->sections[DATA_SECTION_TABLE_DATA].fetched)
 	{
-		/* copydb_fetch_filtered_oids() needs the table size table around */
-		if (!schema_prepare_pgcopydb_table_size(src,
-												&(specs->filters),
-												sourceDB))
-		{
-			/* errors have already been logged */
-			(void) semaphore_unlock(&(sourceDB->sema));
-			return false;
-		}
-
 		if (!copydb_prepare_table_specs(specs, src))
 		{
 			/* errors have already been logged */
@@ -667,14 +649,45 @@ copydb_prepare_table_specs(CopyDataSpec *specs, PGSQL *pgsql)
 
 	(void) catalog_start_timing(&timing);
 
+	/* if we're estimating table sizes, we need to run analyze to update relpages values. */
+	if (specs->estimateTableSizes)
+	{
+		log_info("Running vacuumdb --analyze-only on source database before "
+				 "calculating table size estimates");
+
+		if (!pg_vacuumdb_analyze_only(&(specs->pgPaths), &(specs->connStrings),
+									  specs->tableJobs))
+		{
+			log_error("Failed to vacuum analyze source database, "
+					  "see above for details");
+			return false;
+		}
+	}
+
 	/*
 	 * Now get the list of the tables we want to COPY over.
+	 *
+	 * If we enabled estimates, we also update the table sizes in our internal
+	 * catalog using the relpages values.
 	 */
-	if (!schema_list_ordinary_tables(pgsql, filters, sourceDB))
+	if (!schema_list_ordinary_tables(pgsql, filters, specs->estimateTableSizes, sourceDB))
 	{
 		log_error("Failed to prepare table specs in our catalogs, "
 				  "see above for details");
 		return false;
+	}
+
+	/*
+	 * if we did not enable estimates, update table sizes in our internal
+	 * catalogue with exact values
+	 */
+	if (!specs->estimateTableSizes)
+	{
+		if (!schema_prepare_pgcopydb_table_size(pgsql, filters, sourceDB))
+		{
+			/* errors have already been logged */
+			return false;
+		}
 	}
 
 	(void) catalog_stop_timing(&timing);
@@ -769,7 +782,20 @@ copydb_prepare_table_specs_hook(void *ctx, SourceTable *source)
 	 * When the Table Access Method used is not "heap" we don't know if the
 	 * CTID range scan is supported (see columnar storage extensions), so
 	 * we skip partitioning altogether in that case.
+	 *
+	 * Also, we cannot execute ANALYZE on a database that is in recovery mode,
+	 * so we skip partitioning in that case too.
 	 */
+
+	if (specs->sourceSnapshot.isReadOnly)
+	{
+		log_warn("Connected to a standby server where pg_is_in_recovery(): "
+				 "skipping partitioning for table %s",
+				 source->qname);
+
+		return true;
+	}
+
 	if (IS_EMPTY_STRING_BUFFER(source->partKey) &&
 		streq(source->amname, "heap"))
 	{
@@ -922,6 +948,44 @@ copydb_prepare_index_specs(CopyDataSpec *specs, PGSQL *pgsql)
 			 (long long) count.constraints);
 
 	return true;
+}
+
+
+/*
+ * copydb_matview_refresh_is_filtered_out returns true when the
+ * given oid belongs to a materialized view object that's
+ * data(refresh) has been filtered out by the filtering setup using
+ * [exclude-table-data].
+ */
+bool
+copydb_matview_refresh_is_filtered_out(CopyDataSpec *specs, uint32_t oid)
+{
+	/*
+	 * We need to check the s_matview table exists on the source catalog
+	 * to find out if the materialized view refresh has been filtered out.
+	 *
+	 * The filtering of materialized view as a whole handled by the
+	 * existing filtering setup(i.e. copydb_objectid_is_filtered_out).
+	 */
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	CatalogMatView result = { 0 };
+
+	if (oid != 0)
+	{
+		if (!catalog_lookup_s_matview_by_oid(sourceDB, &result, oid))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (result.oid != 0 && result.excludeData)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -1139,7 +1203,8 @@ copydb_fetch_filtered_oids(CopyDataSpec *specs, PGSQL *pgsql)
 
 		(void) catalog_start_timing(&timing);
 
-		if (!schema_list_ordinary_tables(pgsql, filters, filtersDB))
+		if (!schema_list_ordinary_tables(pgsql, filters, specs->estimateTableSizes,
+										 filtersDB))
 		{
 			/* errors have already been logged */
 			filters->type = type;
