@@ -450,6 +450,7 @@ bool copydb_prepare_create_index_command(SourceIndex *index,
 										 char **command);
 
 bool copydb_prepare_create_constraint_command(SourceIndex *index,
+											  bool partitionedTable,
 											  char **command);
 
 bool copydb_create_constraints(CopyDataSpec *spec, SourceTable *table);
@@ -569,4 +570,10 @@ bool compare_fetch_schemas(CopyDataSpec *copySpecs,
 bool compare_write_checksum(SourceTable *table, const char *filename);
 bool compare_read_checksum(SourceTable *table, const char *filename);
 
+/* timescale.c */
+bool copydb_is_hypertable(PGSQL *pgsql,
+						  const char *schema,
+						  const char *table,
+						  bool restoring,
+						  bool *isHypertable);
 #endif  /* COPYDB_H */

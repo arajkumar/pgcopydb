@@ -216,7 +216,7 @@ def skip_extensions_list(args):
 
 
 def get_hypertables(pguri) -> csv.DictReader:
-    hypertables = psql_run(conn=pguri,
+    hypertables = psql_cmd(conn=pguri,
                            sql="select hypertable_schema, hypertable_name from timescaledb_information.hypertables")
     return hypertables
 
@@ -246,7 +246,7 @@ def get_hypertable_conflicting_constraints(pguri, hypertables: csv.DictReader) -
     """
     condition = map(lambda row: f"(cls.relname = '{row['hypertable_name']}' AND ns.nspname = '{row['hypertable_schema']}')", hypertables)
     sql = sql.replace("$$CONDITION$$", " OR ".join(condition))
-    return psql_run(conn=pguri, sql=sql)
+    return psql_cmd(conn=pguri, sql=sql)
 
 
 def prepare_conflicting_constraints_filter(indexes: csv.DictReader, filter: Filter):

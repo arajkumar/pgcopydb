@@ -18,6 +18,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 /*
@@ -721,6 +722,40 @@ copydb_create_index(const char *pguri,
 				   index->constraintDef,
 				   index->tableQname);
 	}
+	else if (isConstraintIndex && (index->isPrimary || index->isUnique))
+	{
+		PGSQL dst = { 0 };
+
+		if (!pgsql_init(&dst, (char *) pguri, PGSQL_CONN_TARGET))
+		{
+			return false;
+		}
+
+		bool partitionedTable = false;
+
+		if (!copydb_is_hypertable(&dst,
+								  index->tableNamespace,
+								  index->tableRelname,
+								  false /* restoring */,
+								  &partitionedTable))
+		{
+			log_error("Failed to check if table %s is a hypertable",
+					  index->tableQname);
+			return false;
+		}
+
+		if (partitionedTable)
+		{
+			log_warn("Skipping index %s for constraint %s on %s, "
+					 "it is a UNIQUE or a PRIMARY constraint on a "
+					 "TimescaleDB hypertable",
+					 index->indexQname,
+					 index->constraintDef,
+					 index->tableQname);
+
+			skipCreateIndex = true;
+		}
+	}
 
 	if (!copydb_index_is_being_processed(index,
 										 indexPaths,
@@ -745,6 +780,7 @@ copydb_create_index(const char *pguri,
 	if (constraint)
 	{
 		if (!copydb_prepare_create_constraint_command(index,
+													  false,
 													  &(summary->command)))
 		{
 			/* errors have already been logged */
@@ -1046,11 +1082,13 @@ copydb_prepare_create_index_command(SourceIndex *index,
  * create the given constraint on-top of an already existing Index.
  */
 bool
-copydb_prepare_create_constraint_command(SourceIndex *index, char **command)
+copydb_prepare_create_constraint_command(SourceIndex *index,
+										 bool partitionedTable,
+										 char **command)
 {
 	PQExpBuffer cmd = createPQExpBuffer();
 
-	if (index->isPrimary || index->isUnique)
+	if (!partitionedTable && (index->isPrimary || index->isUnique))
 	{
 		char *constraintType = index->isPrimary ? "PRIMARY KEY" : "UNIQUE";
 
@@ -1216,7 +1254,22 @@ copydb_create_constraints(CopyDataSpec *specs, SourceTable *table)
 			}
 		}
 
-		if (!copydb_prepare_create_constraint_command(index, &(summary.command)))
+		bool partitionedTable = false;
+
+		if (!copydb_is_hypertable(&dst,
+								  table->nspname,
+								  table->relname,
+								  false /* restoring */,
+								  &partitionedTable))
+		{
+			log_error("Failed to check if table %s is a hypertable",
+					  table->qname);
+			return false;
+		}
+
+		if (!copydb_prepare_create_constraint_command(index,
+													  partitionedTable,
+													  &(summary.command)))
 		{
 			log_warn("Failed to prepare SQL command to create constraint \"%s\"",
 					 index->constraintName);
