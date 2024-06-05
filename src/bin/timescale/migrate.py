@@ -215,43 +215,78 @@ def skip_extensions_list(args):
         return skip_extensions_default
 
 
-def get_hypertables(pguri) -> csv.DictReader:
-    hypertables = psql_cmd(conn=pguri,
-                           sql="select hypertable_schema, hypertable_name from timescaledb_information.hypertables")
-    return hypertables
-
-def get_hypertable_conflicting_constraints(pguri, hypertables: csv.DictReader) -> csv.DictReader:
+def get_hypertable_dimensions(pguri) -> csv.DictReader:
     sql = """
-        SELECT
-            con.conname AS constraint_name,
-            cls.relname AS relname,
-            ns.nspname AS nspname,
-            con.contype AS constraint_type,
-            idxcls.relname AS idx_relname,
-            FORMAT('%I.%I', ns.nspname, idxcls.relname) AS index_name,
-            pg_get_indexdef(idx.indexrelid) AS index_definition
-        FROM
-            pg_constraint con
-        JOIN
-            pg_class cls ON con.conrelid = cls.oid
-        JOIN
-            pg_namespace ns ON cls.relnamespace = ns.oid
-        JOIN
-            pg_index idx ON idx.indexrelid = con.conindid
-        JOIN
-            pg_class idxcls ON idx.indexrelid = idxcls.oid
-        WHERE
-            con.contype IN ('p', 'u') -- 'p' for primary key, 'u' for unique constraints
-        $$CONDITION$$
+select
+    FORMAT('%I', hypertable_schema) as nspname,
+    FORMAT('%I', hypertable_name) as relname,
+    array_agg(FORMAT('%I', column_name::text)) as dimensions
+from timescaledb_information.dimensions group by 1, 2;
+ """
+    dimensions = psql_cmd(conn=pguri,
+                           sql=sql)
+    return dimensions
+
+def get_hypertable_incompatible_source_tables(pguri, hypertables: csv.DictReader) -> csv.DictReader:
+    sql = """
+WITH indexes AS (
+    SELECT
+        ns.nspname AS schema_name,
+        cls.relname AS table_name,
+        idxns.nspname AS index_schema_name,
+        idxcls.relname AS index_name,
+        am.amname AS index_type,
+        array_agg(FORMAT('%I', att.attname::text) ORDER BY array_position(idx.indkey, att.attnum)) AS columns,
+        pg_get_indexdef(idx.indexrelid) AS index_definition,
+        con.conname AS constraint_name,
+        pg_get_constraintdef(con.oid) AS constraint_definition
+    FROM
+        pg_index idx
+    JOIN
+        pg_class cls ON cls.oid = idx.indrelid
+    JOIN
+        pg_namespace ns ON ns.oid = cls.relnamespace
+    JOIN
+        pg_class idxcls ON idxcls.oid = idx.indexrelid
+    JOIN
+        pg_namespace idxns ON idxns.oid = idxcls.relnamespace
+    JOIN
+        pg_attribute att ON att.attrelid = idx.indrelid AND att.attnum = ANY(idx.indkey)
+    JOIN
+        pg_am am ON idxcls.relam = am.oid
+    LEFT JOIN
+        pg_constraint con ON con.conindid = idx.indexrelid
+    WHERE
+        (idx.indisunique OR idx.indisprimary)
+    GROUP BY
+        ns.nspname, cls.relname, idxns.nspname, idxcls.relname, am.amname, idx.indisunique, idx.indexrelid, con.conname, con.oid
+    ORDER BY
+        ns.nspname, cls.relname, idxns.nspname, idxcls.relname
+)
+SELECT
+    FORMAT('%I.%I', schema_name, table_name) AS table_name,
+    FORMAT('%I.%I', index_schema_name, index_name) AS index_name,
+    columns,
+    index_definition,
+    constraint_name,
+    constraint_definition
+FROM indexes
+WHERE
+    -- schema_name='public' AND table_name = 'metrics'
+    -- AND NOT columns <@ '{"\"time\"",id}'::text[];
+    $$CONDITION$$
     """
-    condition = map(lambda row: f"(cls.relname = '{row['hypertable_name']}' AND ns.nspname = '{row['hypertable_schema']}')", hypertables)
+    condition = map(lambda row: f"""
+                (
+                    table_name = '{row['nspname']}'
+                    AND
+                    schema_name = '{row['relname']}')
+                    -- parition column must be a superset of
+                    -- the hypertable dimensions
+                    AND NOT columns <@ '{row['dimensions']}'::text[]
+                )""", hypertables)
     sql = sql.replace("$$CONDITION$$", " OR ".join(condition))
     return psql_cmd(conn=pguri, sql=sql)
-
-
-def prepare_conflicting_constraints_filter(indexes: csv.DictReader, filter: Filter):
-    exclude_indexes = map(lambda row: row["index_name"], indexes)
-    filter.exclude_indexes(exclude_indexes)
 
 
 def prepare_filters(clone_cmd: list[str], args, filter: Filter):
