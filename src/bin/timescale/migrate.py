@@ -365,11 +365,13 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
         logger.info("Perform ANALYZE on target DB tables ...")
         with timeit():
             vaccumdb_command = " ".join(["vacuumdb",
-                                        # There won't be anything to
-                                        # vacuum after a fresh restore.
-                                        "--analyze-only",
-                                        "--analyze-in-stages",
+                                        "--analyze",
                                         "--echo",
+                                        "--exclude-schema=pg_catalog",
+                                        "--exclude-schema=information_schema",
+                                        "--exclude-schema=timescaledb_information",
+                                        "--exclude-schema=_timescaledb_internal",
+                                        "--exclude-schema=_timescaledb_debug",
                                         "--dbname",
                                         '"$PGCOPYDB_TARGET_PGURI"',
                                         "--jobs",
