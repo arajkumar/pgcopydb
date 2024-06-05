@@ -687,7 +687,6 @@ def migrate(args):
 
     housekeeping_thread, housekeeping_stop_event = None, None
     follow_proc = create_follow(resume=args.resume)
-    matview_restore_complete = False
     try:
         if not is_section_migration_complete("roles") and not args.skip_roles:
             logger.info("Migrating roles from Source DB to Target DB ...")
@@ -719,11 +718,23 @@ def migrate(args):
         follow_proc.wait()
         follow_proc = None
 
+    except KeyboardInterrupt:
+        logger.info("Exiting ... (Ctrl+C)")
+
+    except Exception as e:
+        logger.error(f"Unexpected exception: {e}")
+        logger.error(traceback.format_exc())
+        telemetry.complete_fail()
+        logger.error("An error occurred during the live migration. "
+                     "Please report this issue to support@timescale.com "
+                     "with all log files from the <volume-mount>/logs "
+                     "directory.")
+    else:
         logger.info("Copying sequences ...")
         copy_sequences()
 
         logger.info("Restoring materialized views ...")
-        matview_restore_complete = restore_matview(target_pg_uri)
+        restore_matview(target_pg_uri)
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")
@@ -732,22 +743,12 @@ def migrate(args):
                 logger.info("Setting replica identity back to DEFAULT for caggs ...")
                 set_replica_identity_for_caggs('DEFAULT')
 
-    except KeyboardInterrupt:
-        logger.info("Exiting ... (Ctrl+C)")
-    except Exception as e:
-        logger.error(f"Unexpected exception: {e}")
-        logger.error(traceback.format_exc())
-        telemetry.complete_fail()
-    else:
         logger.info("Migration successfully completed.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean'))
         telemetry.complete_success()
-    finally:
-        if not matview_restore_complete:
-            logger.info("Restoring materialized views ...")
-            restore_matview(target_pg_uri)
 
+    finally:
         # TODO: Use daemon threads for housekeeping and health_checker.
         health_checker.stop_all()
         if housekeeping_stop_event:
