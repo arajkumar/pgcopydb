@@ -113,6 +113,9 @@ typedef struct TableFilePaths
 	char chksumFile[MAXPGPATH]; /* table checksum file */
 
 	char truncateDoneFile[MAXPGPATH];    /* table truncate done file */
+
+	char constraintsLockFile[MAXPGPATH];    /* table constraints lock file */
+	char constraintsDoneFile[MAXPGPATH];    /* table constraints done file */
 } TableFilePaths;
 
 
