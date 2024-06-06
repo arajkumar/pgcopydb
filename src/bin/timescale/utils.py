@@ -15,13 +15,22 @@ from exec import run_cmd, psql
 logger = logging.getLogger(__name__)
 
 class timeit:
+    def __init__(self, topic: str = None):
+        self.topic = topic
+
     def __enter__(self):
+        if self.topic:
+            logger.info("Begin %s", self.topic)
+
         self.start = perf_counter()
         return self
 
     def __exit__(self, type, value, traceback):
         self.time = perf_counter() - self.start
-        logger.info(f"=> Completed in {seconds_to_human(self.time)}")
+
+        logger.info("=> Completed %s in %s",
+                    self.topic,
+                    seconds_to_human(self.time))
 
 
 class DBType(Enum):
