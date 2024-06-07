@@ -753,6 +753,126 @@ copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 }
 
 
+bool
+copydb_table_constraints_create_lockfile(CopyDataSpec *specs,
+										 CopyTableDataSpec *tableSpecs,
+										 bool *isDone)
+{
+	/* enter the critical section */
+	(void) semaphore_lock(&(specs->tableSemaphore));
+
+	/*
+	 * If the doneFile exists, then the table has been processed already,
+	 * skip it.
+	 */
+	if (file_exists(tableSpecs->tablePaths.constraintsDoneFile))
+	{
+		*isDone = true;
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+		return true;
+	}
+
+	/* okay so it's not done yet */
+	*isDone = false;
+
+	if (file_exists(tableSpecs->tablePaths.constraintsLockFile))
+	{
+		/*
+		 * Now it could be that the lockFile still exists and has been created
+		 * on a previous run, in which case the pid in there would be a stale
+		 * pid.
+		 *
+		 * So check for that situation before returning with the happy path.
+		 */
+		CopyTableSummary tableSummary = { .table = tableSpecs->sourceTable };
+
+		if (!read_table_summary(&tableSummary, tableSpecs->tablePaths.constraintsLockFile))
+		{
+			/* errors have already been logged */
+			(void) semaphore_unlock(&(specs->tableSemaphore));
+			return false;
+		}
+
+		/* if we can signal the pid, it is still running */
+		if (kill(tableSummary.pid, 0) == 0)
+		{
+			(void) semaphore_unlock(&(specs->tableSemaphore));
+
+			log_error("Failed to start table-constraints worker for table %s (%u), "
+					  "lock file \"%s\" is owned by running process %d",
+					  tableSpecs->sourceTable->qname,
+					  tableSpecs->sourceTable->oid,
+					  tableSpecs->tablePaths.constraintsLockFile,
+					  tableSummary.pid);
+			return false;
+		}
+		else
+		{
+			log_notice("Found stale pid %d in file \"%s\", removing it "
+					   "and processing table %s",
+					   tableSummary.pid,
+					   tableSpecs->tablePaths.constraintsLockFile,
+					   tableSpecs->sourceTable->qname);
+
+			/* stale pid, remove the old lockFile now, then process the table */
+			if (!unlink_file(tableSpecs->tablePaths.constraintsLockFile))
+			{
+				log_error("Failed to remove the stale lockFile \"%s\"",
+						  tableSpecs->tablePaths.constraintsLockFile);
+				(void) semaphore_unlock(&(specs->tableSemaphore));
+				return false;
+			}
+
+			/* pass through to the rest of this function */
+		}
+	}
+
+	/*
+	 * Now, write the lockFile, with a summary of what's going-on.
+	 */
+	CopyTableSummary emptySummary = { 0 };
+	CopyTableSummary *summary =
+		(CopyTableSummary *) calloc(1, sizeof(CopyTableSummary));
+
+	*summary = emptySummary;
+
+	summary->pid = getpid();
+	summary->table = tableSpecs->sourceTable;
+
+	/* "CONSTRAINT " is 11 bytes, then 1 for \0 */
+	int len = strlen(tableSpecs->sourceTable->qname) + 11 + 1;
+	summary->command = (char *) calloc(len, sizeof(char));
+
+	if (summary->command == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	sformat(summary->command, len, "CONSTRAINT %s", tableSpecs->sourceTable->qname);
+
+	if (!open_table_summary(summary, tableSpecs->tablePaths.constraintsLockFile))
+	{
+		log_info("Failed to create the lock file for table %s at \"%s\"",
+				 tableSpecs->sourceTable->qname,
+				 tableSpecs->tablePaths.constraintsLockFile);
+
+		/* end of the critical section */
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+
+		return false;
+	}
+
+	/* attach the new summary to the tableSpecs, where it was NULL before */
+	tableSpecs->summary = summary;
+
+	/* end of the critical section */
+	(void) semaphore_unlock(&(specs->tableSemaphore));
+
+	return true;
+}
+
+
 /*
  * copydb_table_create_lockfile checks done file to see if a given table has
  * already been processed in a previous run, and creates the lockfile to
@@ -882,6 +1002,47 @@ copydb_table_create_lockfile(CopyDataSpec *specs,
 
 	/* attach the new summary to the tableSpecs, where it was NULL before */
 	tableSpecs->summary = summary;
+
+	/* end of the critical section */
+	(void) semaphore_unlock(&(specs->tableSemaphore));
+
+	return true;
+}
+
+
+/*
+ * copydb_mark_table_as_done creates the table doneFile with the expected
+ * summary content. To create a doneFile we must acquire the synchronisation
+ * semaphore first. The lockFile is also removed here.
+ */
+bool
+copydb_mark_table_constraints_as_done(CopyDataSpec *specs,
+									  CopyTableDataSpec *tableSpecs)
+{
+	/* enter the critical section to communicate that we're done */
+	(void) semaphore_lock(&(specs->tableSemaphore));
+
+	if (!unlink_file(tableSpecs->tablePaths.constraintsLockFile))
+	{
+		log_error("Failed to remove the lockFile \"%s\"",
+				  tableSpecs->tablePaths.constraintsLockFile);
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+		return false;
+	}
+
+	/* write the doneFile with the summary and timings now */
+	if (!finish_table_summary(tableSpecs->summary,
+							  tableSpecs->tablePaths.constraintsDoneFile))
+	{
+		log_error("Failed to create the summary file at \"%s\"",
+				  tableSpecs->tablePaths.constraintsDoneFile);
+		(void) semaphore_unlock(&(specs->tableSemaphore));
+		return false;
+	}
+
+	log_debug("Wrote summary for table constraints %s at \"%s\"",
+			  tableSpecs->sourceTable->qname,
+			  tableSpecs->tablePaths.constraintsDoneFile);
 
 	/* end of the critical section */
 	(void) semaphore_unlock(&(specs->tableSemaphore));

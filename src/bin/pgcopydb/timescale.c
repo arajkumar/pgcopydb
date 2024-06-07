@@ -1,3 +1,4 @@
+#include "copydb.h"
 #include "timescale.h"
 #include "log.h"
 #include "string_utils.h"

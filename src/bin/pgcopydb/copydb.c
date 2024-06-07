@@ -929,7 +929,7 @@ copydb_init_tablepaths(CopyFilePaths *cfPaths,
 			cfPaths->rundir,
 			oid);
 
-	sformat(tablePaths->constraintsLockFile, MAXPGPATH, "%s/%d.constraints.done",
+	sformat(tablePaths->constraintsDoneFile, MAXPGPATH, "%s/%d.constraints.done",
 			cfPaths->tbldir,
 			oid);
 

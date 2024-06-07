@@ -252,6 +252,11 @@ copydb_create_index_by_oid(CopyDataSpec *specs, uint32_t indexOid)
 		return false;
 	}
 
+	log_info("qname %s builtAllIndexes: %d, constraintsAreBeingBuilt: %d",
+			 table->qname,
+			 builtAllIndexes,
+			 constraintsAreBeingBuilt);
+
 	if (builtAllIndexes && !constraintsAreBeingBuilt)
 	{
 		/*
@@ -300,22 +305,52 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 	/* enter the index lockfile/donefile critical section */
 	(void) semaphore_lock(&(specs->indexSemaphore));
 
-	/*
-	 * The table-data process creates an empty idxListFile, and this function
-	 * creates a file with proper content while in the critical section.
-	 *
-	 * As a result, if the file exists and is empty, then another process was
-	 * there first and is now taking care of the constraints.
-	 */
-	if (file_exists(tablePaths->idxListFile) &&
-		!file_is_empty(tablePaths->idxListFile))
-	{
+    /*
+     * The table-data process creates an empty idxListFile, and this function
+     * creates a file with proper content while in the critical section.
+     *
+     * As a result, if the file exists and is empty, then another process was
+     * there first and is now taking care of the constraints.
+     */
+    if (file_exists(tablePaths->constraintsLockFile))
+    {
 		*indexesAreDone = true;
 		*constraintsAreBeingBuilt = true;
 
 		(void) semaphore_unlock(&(specs->indexSemaphore));
 		return true;
+    }
+
+	bool contraintsAreDone = false;
+	CopyTableDataSpec tableSpecs = { 0 };
+
+	if (!copydb_init_table_specs(&tableSpecs, specs, table, 0))
+	{
+		/* errors have already been logged */
+		return false;
 	}
+
+	if (!copydb_table_constraints_create_lockfile(specs,
+												  &tableSpecs,
+												  &contraintsAreDone))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(specs->indexSemaphore));
+		return false;
+	}
+
+	if (contraintsAreDone)
+	{
+		*constraintsAreBeingBuilt = false;
+		*indexesAreDone = true;
+
+		/* end of the critical section around lockfile and donefile handling */
+		(void) semaphore_unlock(&(specs->indexSemaphore));
+		return true;
+	}
+
+	/* end of the critical section around lockfile and donefile handling */
+	(void) semaphore_unlock(&(specs->indexSemaphore));
 
 	SourceIndexList *indexListEntry = table->firstIndex;
 
@@ -351,9 +386,6 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 
 	*indexesAreDone = builtAllIndexes;
 	*constraintsAreBeingBuilt = false;
-
-	/* end of the critical section around lockfile and donefile handling */
-	(void) semaphore_unlock(&(specs->indexSemaphore));
 
 	return true;
 }
@@ -1316,6 +1348,20 @@ copydb_create_constraints(CopyDataSpec *specs, SourceTable *table)
 			log_error("Failed to remove the lockFile \"%s\"", lockFile);
 			continue;
 		}
+	}
+
+	CopyTableDataSpec tableSpecs = { 0 };
+
+	if (!copydb_init_table_specs(&tableSpecs, specs, table, 0))
+	{
+		/* errors have already been logged */
+		errors++;
+	}
+
+	if (!copydb_mark_table_constraints_as_done(specs, &tableSpecs))
+	{
+		/* errors have already been logged */
+		errors++;
 	}
 
 	/* close connection to the target database now */
