@@ -305,22 +305,6 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 	/* enter the index lockfile/donefile critical section */
 	(void) semaphore_lock(&(specs->indexSemaphore));
 
-    /*
-     * The table-data process creates an empty idxListFile, and this function
-     * creates a file with proper content while in the critical section.
-     *
-     * As a result, if the file exists and is empty, then another process was
-     * there first and is now taking care of the constraints.
-     */
-    if (file_exists(tablePaths->constraintsLockFile))
-    {
-		*indexesAreDone = true;
-		*constraintsAreBeingBuilt = true;
-
-		(void) semaphore_unlock(&(specs->indexSemaphore));
-		return true;
-    }
-
 	bool contraintsAreDone = false;
 	CopyTableDataSpec tableSpecs = { 0 };
 
@@ -334,9 +318,14 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 												  &tableSpecs,
 												  &contraintsAreDone))
 	{
-		/* errors have already been logged */
+		/*
+		 * Couldn't create the lock file, which means the constraints are
+		 * already being built by another process.
+		 */
+		*constraintsAreBeingBuilt = true;
+		*indexesAreDone = true;
 		(void) semaphore_unlock(&(specs->indexSemaphore));
-		return false;
+		return true;
 	}
 
 	if (contraintsAreDone)
@@ -348,9 +337,6 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 		(void) semaphore_unlock(&(specs->indexSemaphore));
 		return true;
 	}
-
-	/* end of the critical section around lockfile and donefile handling */
-	(void) semaphore_unlock(&(specs->indexSemaphore));
 
 	SourceIndexList *indexListEntry = table->firstIndex;
 
@@ -386,6 +372,9 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 
 	*indexesAreDone = builtAllIndexes;
 	*constraintsAreBeingBuilt = false;
+
+	/* end of the critical section around lockfile and donefile handling */
+	(void) semaphore_unlock(&(specs->indexSemaphore));
 
 	return true;
 }
