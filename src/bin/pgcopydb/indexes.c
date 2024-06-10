@@ -252,12 +252,35 @@ copydb_create_index_by_oid(CopyDataSpec *specs, uint32_t indexOid)
 		return false;
 	}
 
-	log_info("qname %s builtAllIndexes: %d, constraintsAreBeingBuilt: %d",
-			 table->qname,
-			 builtAllIndexes,
-			 constraintsAreBeingBuilt);
+	CopyTableDataSpec tableSpecs = { 0 };
 
-	if (builtAllIndexes && !constraintsAreBeingBuilt)
+	if (!copydb_init_table_specs(&tableSpecs, specs, table, 0))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool contraintsAreDone = false;
+
+	if (builtAllIndexes)
+	{
+		if (!copydb_table_constraints_create_lockfile(specs,
+													  &tableSpecs,
+													  &contraintsAreDone))
+		{
+			/*
+			 * Couldn't create the lock file, which means the constraints are
+			 * already being built by another process.
+			 */
+			constraintsAreBeingBuilt = true;
+		}
+		else
+		{
+			constraintsAreBeingBuilt = false;
+		}
+	}
+
+	if (builtAllIndexes && !constraintsAreBeingBuilt && !contraintsAreDone)
 	{
 		/*
 		 * Once the indexes are built, it's time to:
@@ -269,6 +292,13 @@ copydb_create_index_by_oid(CopyDataSpec *specs, uint32_t indexOid)
 		if (!copydb_create_constraints(specs, table))
 		{
 			log_error("Failed to create constraints for table %s",
+					  table->qname);
+			return false;
+		}
+
+		if (!copydb_mark_table_constraints_as_done(specs, &tableSpecs))
+		{
+			log_error("Failed to mark constraints as done for table %s",
 					  table->qname);
 			return false;
 		}
@@ -305,35 +335,18 @@ copydb_table_indexes_are_done(CopyDataSpec *specs,
 	/* enter the index lockfile/donefile critical section */
 	(void) semaphore_lock(&(specs->indexSemaphore));
 
-	bool contraintsAreDone = false;
-	CopyTableDataSpec tableSpecs = { 0 };
-
-	if (!copydb_init_table_specs(&tableSpecs, specs, table, 0))
+	/*
+	 * The table-data process creates an empty idxListFile, and this function
+	 * creates a file with proper content while in the critical section.
+	 *
+	 * As a result, if the file exists and is empty, then another process was
+	 * there first and is now taking care of the constraints.
+	 */
+	if (file_exists(tablePaths->idxListFile) &&
+		!file_is_empty(tablePaths->idxListFile))
 	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!copydb_table_constraints_create_lockfile(specs,
-												  &tableSpecs,
-												  &contraintsAreDone))
-	{
-		/*
-		 * Couldn't create the lock file, which means the constraints are
-		 * already being built by another process.
-		 */
 		*constraintsAreBeingBuilt = true;
 		*indexesAreDone = true;
-		(void) semaphore_unlock(&(specs->indexSemaphore));
-		return true;
-	}
-
-	if (contraintsAreDone)
-	{
-		*constraintsAreBeingBuilt = false;
-		*indexesAreDone = true;
-
-		/* end of the critical section around lockfile and donefile handling */
 		(void) semaphore_unlock(&(specs->indexSemaphore));
 		return true;
 	}
@@ -1337,20 +1350,6 @@ copydb_create_constraints(CopyDataSpec *specs, SourceTable *table)
 			log_error("Failed to remove the lockFile \"%s\"", lockFile);
 			continue;
 		}
-	}
-
-	CopyTableDataSpec tableSpecs = { 0 };
-
-	if (!copydb_init_table_specs(&tableSpecs, specs, table, 0))
-	{
-		/* errors have already been logged */
-		errors++;
-	}
-
-	if (!copydb_mark_table_constraints_as_done(specs, &tableSpecs))
-	{
-		/* errors have already been logged */
-		errors++;
 	}
 
 	/* close connection to the target database now */
