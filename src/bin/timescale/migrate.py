@@ -425,6 +425,8 @@ sed -i -E \
 -e 's/GRANTED BY "[^"]*"//g' \
 -e '/CREATE ROLE "tsdbadmin";/d' \
 -e '/ALTER ROLE "tsdbadmin"/d' \
+-e 's/WITH ADMIN OPTION, INHERIT TRUE//g' \
+-e 's/WITH ADMIN OPTION,//g' \
 -e 's/WITH ADMIN OPTION//g' \
 -e 's/GRANTED BY ".*"//g' \
 -e '/GRANT "pg_.*" TO/d' \
