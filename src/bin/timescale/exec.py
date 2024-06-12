@@ -118,7 +118,7 @@ def run_cmd(cmd: str, log_file: LogFile = None, ignore_non_zero_code: bool = Fal
                 stderr.close()
 
 
-def run_sql(execute_on_target: bool, sql: str):
+def run_sql(execute_on_target: bool, sql: str) -> str:
     dest = "$PGCOPYDB_SOURCE_PGURI"
     if execute_on_target:
         dest = "$PGCOPYDB_TARGET_PGURI"

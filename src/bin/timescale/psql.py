@@ -2,9 +2,9 @@ import subprocess
 import csv
 from io import StringIO
 
-def psql(conn, sql):
+def psql(conn, sql) -> list[dict]:
     """
-    Execute the given SQL query using psql and return the result as a dictionary.
+    Execute the given SQL query using psql and return the result as a list of dictionaries.
     """
     command = ["psql", "-d", conn, "--csv", "-c", sql]
 
@@ -14,4 +14,5 @@ def psql(conn, sql):
         raise RuntimeError(f"Error executing SQL: {e.stderr}")
 
     reader = csv.DictReader(StringIO(result), delimiter=',')
-    return reader
+    # Convert the reader to a list to avoid the generator being exhausted
+    return list(reader)

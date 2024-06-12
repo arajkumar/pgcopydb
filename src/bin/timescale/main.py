@@ -12,7 +12,8 @@ from version import SCRIPT_VERSION, nudge_user_to_update
 from snapshot import snapshot
 from migrate import migrate
 from clean import clean
-from environ import pgcopydb_init_env
+from environ import pgcopydb_init_env, env
+from inspect import target_activity
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -103,6 +104,15 @@ def main():
                                 help=argparse.SUPPRESS,
                                 default=(os.environ.get('POSTGRES_TARGET') == "true"))
 
+    # inspect
+    parser_inspect = subparsers.add_parser('inspect',
+                               parents=[common],
+                               add_help=False,
+                               help='Inspect real-time migration activity on target')
+    parser_inspect.add_argument('--interval', default=1, type=int,
+                               help='Interval in seconds for refreshing live migration querying activity. ' \
+                                    'Defaults to 1 second.')
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -123,6 +133,12 @@ def main():
             clean(args)
         case 'migrate':
             migrate(args)
+        case 'inspect':
+            target_uri = env["PGCOPYDB_TARGET_PGURI"]
+            if not target_uri:
+                logger.error("Target db URI not found when reading $PGCOPYDB_TARGET_PGURI")
+                return
+            target_activity(args=args, conn=target_uri)
 
 
 if __name__ == "__main__":
