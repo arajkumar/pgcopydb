@@ -3230,14 +3230,16 @@ schema_list_pg_depend(PGSQL *pgsql,
 
 
 /*
- * schema_list_partitions prepares the list of partitions that we can drive
- * from our parameters: table size, --split-tables-larger-than.
+ * schema_list_partitions prepares the list of partitions that we can drive from
+ * our parameters: table size, --split-tables-larger-than, and
+ * --split-max-parts.
  */
 bool
 schema_list_partitions(PGSQL *pgsql,
 					   DatabaseCatalog *catalog,
 					   SourceTable *table,
-					   uint64_t partSize)
+					   uint64_t partSize,
+					   int splitMaxParts)
 {
 	/* no partKey, no partitions, done. */
 	if (IS_EMPTY_STRING_BUFFER(table->partKey))
@@ -3285,10 +3287,26 @@ schema_list_partitions(PGSQL *pgsql,
 		min = 0;
 		max = table->relpages;
 
-		/* Postgres page size is static: 8192 Bytes */
-		uint64_t pagesPerPart = ceil((double) partSize / POSTGRES_BLOCK_SIZE);
+		/*
+		 * Get the block size from the origin in the first attempt
+		 * and then memoize it.
+		 */
+		static int blockSize = 0;
+		bool isBlockSizeCached = blockSize != 0;
+		if (!isBlockSizeCached && !pgsql_get_block_size(pgsql, &blockSize))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+		uint64_t pagesPerPart = ceil((double) partSize / blockSize);
 
 		partsCount = ceil((double) table->relpages / (double) pagesPerPart);
+
+		if (splitMaxParts > 0 && partsCount > splitMaxParts)
+		{
+			partsCount = splitMaxParts;
+		}
+
 		partsSize = ceil((double) table->relpages / partsCount);
 	}
 
@@ -3315,6 +3333,12 @@ schema_list_partitions(PGSQL *pgsql,
 	{
 		/* add a partition for IS NULL (first) */
 		partsCount = ceil((double) table->bytes / (double) partSize) + 1;
+
+		if (splitMaxParts > 0 && partsCount > splitMaxParts)
+		{
+			partsCount = splitMaxParts;
+		}
+
 		partsSize = ceil((double) (max - min + 1) / partsCount);
 	}
 

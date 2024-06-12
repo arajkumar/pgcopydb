@@ -35,6 +35,7 @@
 	"  --restore-jobs                Number of concurrent jobs for pg_restore\n" \
 	"  --large-objects-jobs          Number of concurrent Large Objects jobs to run\n" \
 	"  --split-tables-larger-than    Same-table concurrency size threshold\n" \
+	"  --split-max-parts             Maximum number of jobs for Same-table concurrency \n" \
 	"  --estimate-table-sizes        Allow using estimates for relation sizes\n" \
 	"  --drop-if-exists              On the target database, clean-up from a previous run first\n" \
 	"  --roles                       Also copy roles found on source to target\n" \
@@ -595,9 +596,7 @@ cloneDB(CopyDataSpec *copySpecs)
 
 	log_info("STEP 2: dump the source database schema (pre/post data)");
 
-	if (!copydb_dump_source_schema(copySpecs,
-								   copySpecs->sourceSnapshot.snapshot,
-								   PG_DUMP_SECTION_SCHEMA))
+	if (!copydb_dump_source_schema(copySpecs, copySpecs->sourceSnapshot.snapshot))
 	{
 		/* errors have already been logged */
 		return false;

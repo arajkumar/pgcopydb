@@ -32,10 +32,8 @@
        constraints  Create all the constraints found in the source database in the target
    
      pgcopydb dump
-       schema     Dump source database schema as custom files in work directory
-       pre-data   Dump source database pre-data schema as custom files in work directory
-       post-data  Dump source database post-data schema as custom files in work directory
-       roles      Dump source database roles as custome file in work directory
+       schema  Dump source database schema as custom files in work directory
+       roles   Dump source database roles as custome file in work directory
    
      pgcopydb restore
        schema      Restore a database schema from custom files to target database
@@ -62,19 +60,19 @@
        prefetch   Stream JSON changes from the source database and transform them to SQL
        catchup    Apply prefetched changes from SQL files to the target database
        replay     Replay changes from the source to the target database, live
-     + sentinel   Maintain a sentinel table on the source database
+     + sentinel   Maintain a sentinel table
        receive    Stream changes from the source database
        transform  Transform changes from the source database into SQL commands
        apply      Apply changes from the source database into the target database
    
      pgcopydb stream sentinel
        setup  Setup the sentinel table
-       get    Get the sentinel table values on the source database
-     + set    Maintain a sentinel table on the source database
+       get    Get the sentinel table values
+     + set    Set the sentinel table values
    
      pgcopydb stream sentinel set
-       startpos  Set the sentinel start position LSN on the source database
-       endpos    Set the sentinel end position LSN on the source database
-       apply     Set the sentinel apply mode on the source database
-       prefetch  Set the sentinel prefetch mode on the source database
+       startpos  Set the sentinel start position LSN
+       endpos    Set the sentinel end position LSN
+       apply     Set the sentinel apply mode
+       prefetch  Set the sentinel prefetch mode
    
