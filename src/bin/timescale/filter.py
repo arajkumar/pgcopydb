@@ -10,6 +10,7 @@ from collections import defaultdict
 class Filter:
 
     EXCLUDE_EXTENSION = "exclude-extension"
+    EXCLUDE_TABLE_DATA = "exclude-table-data"
 
     def __init__(self):
         self._filter = defaultdict(set)
@@ -19,6 +20,15 @@ class Filter:
         Exclude extensions.
         """
         self._filter[self.EXCLUDE_EXTENSION].update(extensions)
+
+    def exclude_table_data(self, tables: list[str]):
+        """
+        Exclude table data from initial data migration.
+        """
+        for table in tables:
+            if "." not in table:
+                raise Exception(f"dot separator ('.') not found: {table}")
+        self._filter[self.EXCLUDE_TABLE_DATA].update(tables)
 
     def write(self, f):
         """

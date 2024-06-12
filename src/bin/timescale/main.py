@@ -13,9 +13,22 @@ from snapshot import snapshot
 from migrate import migrate
 from clean import clean
 from environ import pgcopydb_init_env
+from exec import INIT_TIME
 
-logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T",timespec="milliseconds"))
-logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.INFO)
+def setup_logging(work_dir: Path):
+    logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(work_dir / f"logs/main_{INIT_TIME}.log")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
 
 def main():
     parser = argparse.ArgumentParser(description='Live migration moves your PostgreSQL/TimescaleDB to Timescale Cloud with minimal downtime.', add_help=False)
@@ -71,6 +84,11 @@ def main():
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
+    parser_migrate.add_argument('--skip-table-data', nargs='+',
+                                help='Skips data from the given table during migration. However, the table schema will be migrated. ' \
+                                    'To skip data from a Hypertable, you will need to specify a list of schema qualified chunks belonging to the Hypertable. ' \
+                                    'Currently, this flag does not skip data during live replay from the specified table. ' \
+                                    'Values for this flag must be schema qualified. Eg: --skip-table-data public.exclude_table_1 public.exclude_table_2')
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',
@@ -91,6 +109,7 @@ def main():
 
     pgcopydb_init_env(args)
     create_dirs(args.dir)
+    setup_logging(args.dir)
 
     match args.command:
         case 'snapshot':

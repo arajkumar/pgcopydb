@@ -596,6 +596,7 @@ name = "integration"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "postgres",
  "pretty_env_logger",
  "rand",
  "tempfile",
@@ -1260,8 +1261,8 @@ checksum = "3369f5ac52d5eb6ab48c6b4ffdc8efbcad6b89c765749064ba298f2c68a16a76"
 
 [[package]]
 name = "test-common"
-version = "0.16.0"
-source = "git+ssh://git@github.com/timescale/test-common.git?rev=v0.16.0#9155028250437e06eabf333dce512ab197e05550"
+version = "0.19.0"
+source = "git+ssh://git@github.com/timescale/test-common.git?rev=v0.19.0#837c2cb8b9d4abac931073d8f7b3fb3811b274a5"
 dependencies = [
  "assert_cmd",
  "assert_fs",

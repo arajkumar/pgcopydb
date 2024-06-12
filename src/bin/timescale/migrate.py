@@ -19,6 +19,7 @@ from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from exec import Command, run_cmd, run_sql, psql, print_logs_with_error, LogFile
 from filter import Filter
+from psql import psql as psql_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,95 @@ def is_section_migration_complete(section):
 def mark_section_complete(section):
     Path(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done").touch()
 
+def convert_matview_to_view(conn):
+    query = """
+BEGIN;
+
+CREATE SCHEMA IF NOT EXISTS __live_migration;
+CREATE OR REPLACE FUNCTION __live_migration.skip_dml_function() RETURNS TRIGGER AS $$
+BEGIN
+    -- Do nothing and return NULL to skip the DML operation
+    RAISE INFO 'live-migration: Skipping % DML in MATERIALIZED VIEW %.%', TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE
+    mv RECORD;
+    populated BOOLEAN;
+BEGIN
+    -- Create the audit table if it does not exist
+    CREATE TABLE IF NOT EXISTS __live_migration.matview_audit (
+        schemaname TEXT,
+        matviewname TEXT,
+        renamed BOOLEAN DEFAULT FALSE
+    );
+
+    SELECT COUNT(*) > 0 INTO populated FROM __live_migration.matview_audit;
+
+    -- Populate the audit table with materialized views if not already populated
+    IF populated = FALSE THEN
+        INSERT INTO __live_migration.matview_audit (schemaname, matviewname)
+        SELECT schemaname, matviewname
+        FROM pg_matviews;
+    END IF;
+
+    -- Loop through all materialized views in the current schema that have not been renamed
+    FOR mv IN
+        SELECT schemaname, matviewname
+        FROM __live_migration.matview_audit
+        WHERE NOT renamed
+    LOOP
+        -- Rename the materialized view with a live_migration_ prefix
+        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I RENAME TO %I', mv.schemaname, mv.matviewname, 'live_migration_' || mv.matviewname);
+
+        -- Update the audit table to mark the view as renamed
+        EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = true WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
+
+        -- Create a view to replace the materialized view
+        EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %I.%I', mv.schemaname, mv.matviewname, mv.schemaname, 'live_migration_' || mv.matviewname);
+        EXECUTE format('CREATE TRIGGER skip_dml_trigger
+                        INSTEAD OF INSERT OR UPDATE OR DELETE ON %I.%I
+                        FOR EACH ROW EXECUTE FUNCTION __live_migration.skip_dml_function()', mv.schemaname, mv.matviewname);
+    END LOOP;
+END $$;
+
+COMMIT;
+"""
+    psql_cmd(conn, query)
+    return True
+
+def restore_matview(conn):
+    query = """
+BEGIN;
+
+DO $$
+DECLARE
+    mv RECORD;
+BEGIN
+    -- Loop through all materialized views in the current schema that have not been renamed
+    FOR mv IN
+        SELECT schemaname, matviewname
+        FROM __live_migration.matview_audit
+        WHERE renamed
+    LOOP
+        -- Drop the view if it exists
+        EXECUTE format('DROP VIEW IF EXISTS %I.%I', mv.schemaname, mv.matviewname);
+
+        -- Rename the materialized view with a live_migration_ prefix
+        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I RENAME TO %I', mv.schemaname, 'live_migration_' || mv.matviewname, mv.matviewname);
+
+        -- Update the audit table to mark the view as renamed
+        EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = false WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
+
+    END LOOP;
+END $$;
+
+COMMIT;
+"""
+    psql_cmd(conn, query)
+    return True
 
 @telemetry_command("create_follow")
 def create_follow(resume: bool = False):
@@ -124,7 +214,11 @@ def skip_extensions_list(args):
         return skip_extensions_default
 
 
-def prepare_exclude_extensions(clone_cmd: list[str], args, filter: Filter):
+def prepare_filters(clone_cmd: list[str], args, filter: Filter):
+    if args.skip_table_data:
+        logger.info("Excluding table data: %s", args.skip_table_data)
+        filter.exclude_table_data(args.skip_table_data)
+
     # empty list of skip_extensions ignores all extensions
     if args.skip_extensions is not None and len(args.skip_extensions) == 0:
         logger.warn("Ignoring all extensions")
@@ -212,7 +306,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
             "--resume",
         ]
 
-        prepare_exclude_extensions(copy_extensions, args, filter)
+        prepare_filters(copy_extensions, args, filter)
         # Apply filters
         with open(args.dir / "filter.ini", "w") as f:
             filter.write(f)
@@ -271,11 +365,13 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
         logger.info("Perform ANALYZE on target DB tables ...")
         with timeit():
             vaccumdb_command = " ".join(["vacuumdb",
-                                        # There won't be anything to
-                                        # vacuum after a fresh restore.
-                                        "--analyze-only",
-                                        "--analyze-in-stages",
+                                        "--analyze",
                                         "--echo",
+                                        "--exclude-schema=pg_catalog",
+                                        "--exclude-schema=information_schema",
+                                        "--exclude-schema=timescaledb_information",
+                                        "--exclude-schema=_timescaledb_internal",
+                                        "--exclude-schema=_timescaledb_debug",
                                         "--dbname",
                                         '"$PGCOPYDB_TARGET_PGURI"',
                                         "--jobs",
@@ -329,6 +425,8 @@ sed -i -E \
 -e 's/GRANTED BY "[^"]*"//g' \
 -e '/CREATE ROLE "tsdbadmin";/d' \
 -e '/ALTER ROLE "tsdbadmin"/d' \
+-e 's/WITH ADMIN OPTION, INHERIT TRUE//g' \
+-e 's/WITH ADMIN OPTION,//g' \
 -e 's/WITH ADMIN OPTION//g' \
 -e 's/GRANTED BY ".*"//g' \
 -e '/GRANT "pg_.*" TO/d' \
@@ -379,7 +477,7 @@ def migrate_existing_data_from_ts(args):
     ]
 
     filter = Filter()
-    prepare_exclude_extensions(clone_table_data, args, filter)
+    prepare_filters(clone_table_data, args, filter)
     # Apply filters
     with open(args.dir / "filter.ini", "w") as f:
         filter.write(f)
@@ -609,6 +707,9 @@ def migrate(args):
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
+        logger.info("Converting materialized views to views ...")
+        convert_matview_to_view(target_pg_uri)
+
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
 
@@ -621,8 +722,23 @@ def migrate(args):
         follow_proc.wait()
         follow_proc = None
 
+    except KeyboardInterrupt:
+        logger.info("Exiting ... (Ctrl+C)")
+
+    except Exception as e:
+        logger.error(f"Unexpected exception: {e}")
+        logger.error(traceback.format_exc())
+        telemetry.complete_fail()
+        logger.error("An error occurred during the live migration. "
+                     "Please report this issue to support@timescale.com "
+                     "with all log files from the <volume-mount>/logs "
+                     "directory.")
+    else:
         logger.info("Copying sequences ...")
         copy_sequences()
+
+        logger.info("Restoring materialized views ...")
+        restore_matview(target_pg_uri)
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")
@@ -631,17 +747,11 @@ def migrate(args):
                 logger.info("Setting replica identity back to DEFAULT for caggs ...")
                 set_replica_identity_for_caggs('DEFAULT')
 
-    except KeyboardInterrupt:
-        logger.info("Exiting ... (Ctrl+C)")
-    except Exception as e:
-        logger.error(f"Unexpected exception: {e}")
-        logger.error(traceback.format_exc())
-        telemetry.complete_fail()
-    else:
         logger.info("Migration successfully completed.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean'))
         telemetry.complete_success()
+
     finally:
         # TODO: Use daemon threads for housekeeping and health_checker.
         health_checker.stop_all()

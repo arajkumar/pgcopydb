@@ -1,7 +1,9 @@
 import datetime
+import signal
 import subprocess
 import threading
 import logging
+import os
 
 from pathlib import Path
 
@@ -60,7 +62,7 @@ class Command:
     def __init__(self, command: str = "", env=env, use_shell: bool = False, log_file: LogFile = None):
         self.command = command
         self.stderr_path = ""
-        if log_file == None:
+        if log_file is None:
             self.process = subprocess.Popen("exec " + self.command, shell=use_shell, env=env)
         else:
             f_stdout = open(log_file.stdout, "w")
@@ -109,20 +111,42 @@ class Command:
 
 
 def run_cmd(cmd: str, log_file: LogFile = None, ignore_non_zero_code: bool = False) -> str:
-    stdout = subprocess.PIPE
-    stderr = subprocess.PIPE
-    if log_file != None:
+    if log_file is not None:
         stdout = open(log_file.stdout, "w")
         stderr = open(log_file.stderr, "w")
-    result = subprocess.run(cmd, shell=True, env=env, stderr=stderr, stdout=stdout, text=True)
-    if result.returncode != 0 and not ignore_non_zero_code:
-        if log_file != None:
-            print_logs_with_error(log_path=log_file.stderr)
-        cmd_name = cmd.split()[0]
-        raise RedactedException(
-            f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}. stdout={result.stdout}",
-            f"{cmd_name} exited with code {result.returncode}")
-    return str(result.stdout)
+    else:
+        stdout = subprocess.PIPE
+        stderr = subprocess.PIPE
+
+    with subprocess.Popen("exec " + cmd,
+                           shell=True,
+                           env=env,
+                           stderr=stderr,
+                           stdout=stdout,
+                           text=True,
+                           ) as process:
+
+        try:
+            out, err = process.communicate()
+        except:
+            os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            process.wait()
+            raise
+        else:
+            retcode = process.poll()
+            if retcode != 0 and not ignore_non_zero_code:
+                if log_file is not None:
+                    print_logs_with_error(log_path=log_file.stderr)
+                cmd_name = cmd.split()[0]
+                raise RedactedException(
+                    f"""command '{cmd}' exited with {retcode} code.
+                    stderr={err}. stdout={out}""",
+                    f"{cmd_name} exited with code {retcode}")
+            return str(out)
+        finally:
+            if log_file is not None:
+                stdout.close()
+                stderr.close()
 
 
 def run_sql(execute_on_target: bool, sql: str):
