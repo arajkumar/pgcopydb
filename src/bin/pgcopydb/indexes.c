@@ -21,6 +21,115 @@
 
 
 /*
+ * copydb_start_index_supervisor starts a INDEX supervisor process, whose job is
+ * to create the index workers and then wait for them to complete. Once the index
+ * workers exit, the supervisor will send a STOP message to the vacuum workers.
+ */
+bool
+copydb_start_index_supervisor(CopyDataSpec *specs)
+{
+	/*
+	 * Flush stdio channels just before fork, to avoid double-output problems.
+	 */
+	fflush(stdout);
+	fflush(stderr);
+
+	int fpid = fork();
+
+	switch (fpid)
+	{
+		case -1:
+		{
+			log_error("Failed to fork copy supervisor process: %m");
+			return false;
+		}
+
+		case 0:
+		{
+			/* child process runs the command */
+			(void) set_ps_title("pgcopydb: index supervisor");
+
+			if (!copydb_index_supervisor(specs))
+			{
+				log_error("Failed to copy table data, see above for details");
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+
+			exit(EXIT_CODE_QUIT);
+		}
+
+		default:
+		{
+			/* fork succeeded, in parent */
+			break;
+		}
+	}
+
+	/* now we're done, and we want async behavior, do not wait */
+	return true;
+}
+
+
+/*
+ * copydb_index_supervisor starts --index-jobs index workers to
+ * process table index oids from the queue.
+ */
+bool
+copydb_index_supervisor(CopyDataSpec *specs)
+{
+	pid_t pid = getpid();
+
+	log_notice("Started index supervisor %d [%d]", pid, getppid());
+
+	/*
+	 * Start as many index worker process as --index-jobs
+	 */
+	if (!copydb_start_index_workers(specs))
+	{
+		log_fatal("Failed to start table index workers, "
+				  "see above for details");
+
+		(void) copydb_fatal_exit();
+
+		return false;
+	}
+
+	/*
+	 * Now just wait for the table index processes to be done.
+	 */
+	if (!copydb_wait_for_subprocesses(specs->failFast))
+	{
+		log_error("Some index worker process(es) have exited with error, "
+				  "see above for details");
+
+		/* make sure vacuum and create index processes see a STOP message */
+		if (!vacuum_send_stop(specs) ||
+			!copydb_index_workers_send_stop(specs))
+		{
+			(void) copydb_fatal_exit();
+		}
+
+		return false;
+	}
+
+	if (!vacuum_send_stop(specs))
+	{
+		/*
+		 * The other subprocesses need to see a STOP message to stop their
+		 * processing. Failing to send the STOP messages means that the main
+		 * pgcopydb never finishes, and we want to ensure the command
+		 * terminates.
+		 */
+		(void) copydb_fatal_exit();
+
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * copydb_start_index_workers create as many sub-process as needed, per
  * --index-jobs.
  */

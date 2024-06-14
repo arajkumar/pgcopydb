@@ -123,7 +123,7 @@ copydb_process_table_data(CopyDataSpec *specs)
 		/*
 		 * Start as many index worker process as --index-jobs
 		 */
-		if (errors == 0 && !copydb_start_index_workers(specs))
+		if (errors == 0 && !copydb_start_index_supervisor(specs))
 		{
 			/* errors have already been logged */
 			++errors;
@@ -339,17 +339,14 @@ copydb_copy_supervisor(CopyDataSpec *specs)
 				 specs->cfPaths.done.tables);
 	}
 
-	bool success = true;
-
 	/*
 	 * Now that the COPY processes are done, signal this is the end to the
-	 * vacuum and CREATE INDEX sub-processes by adding the STOP message to
+	 * CREATE INDEX sub-processes by adding the STOP message to
 	 * their queues.
+	 *
+	 * Index supervisor will then send the STOP message to the vacuum workers.
 	 */
-	success = success && vacuum_send_stop(specs);
-	success = success && copydb_index_workers_send_stop(specs);
-
-	if (!success)
+	if (!copydb_index_workers_send_stop(specs))
 	{
 		/*
 		 * The other subprocesses need to see a STOP message to stop their

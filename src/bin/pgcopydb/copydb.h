@@ -390,6 +390,8 @@ bool copydb_skip_extension(CopyDataSpec *copySpecs, char *extname);
 
 /* indexes.c */
 
+bool copydb_start_index_supervisor(CopyDataSpec *specs);
+bool copydb_index_supervisor(CopyDataSpec *specs);
 bool copydb_start_index_workers(CopyDataSpec *specs);
 bool copydb_index_worker(CopyDataSpec *specs);
 bool copydb_create_index_by_oid(CopyDataSpec *specs, uint32_t indexOid);
