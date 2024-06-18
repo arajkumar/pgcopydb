@@ -21,6 +21,16 @@ fn generate_test_network_name() -> String {
     format!("network-{}", rng.gen_range(10_000..=99_999))
 }
 
+// TODO: Move this to test_common crate.
+fn has_table_count(dba: &mut DbAssert, table: &str, count: i64) {
+    let client = dba.connection();
+    let v: i64 = client
+        .query_one(format!("select count(*) from {}", table).as_str(), &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(v, count);
+}
+
 fn start_source<'a>(
     docker: &'a Cli,
     pg_version: PgVersion,
@@ -208,13 +218,13 @@ fn test_exclude_existing_table_data() -> Result<()> {
 
     psql(
         &source_container,
-        Sql(r"
-		CREATE TABLE metrics_data_excluded(time timestamptz primary key, value float8);
-		INSERT INTO metrics_data_excluded(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+        Sql(r#"
+		CREATE TABLE "Metrics_data_excluded"(time timestamptz primary key, value float8);
+		INSERT INTO "Metrics_data_excluded"(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
 
 		CREATE TABLE metrics(time timestamptz primary key, value float8);
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
-	"),
+	"#),
     )?;
 
     let temp_dir = tempdir().unwrap();
@@ -236,7 +246,7 @@ fn test_exclude_existing_table_data() -> Result<()> {
         vec![
             String::from("migrate"),
             String::from("--skip-table-data"),
-            String::from("public.metrics_data_excluded"),
+            String::from("public.Metrics_data_excluded"),
         ],
     ))
     .with_network(&network_name);
@@ -244,15 +254,15 @@ fn test_exclude_existing_table_data() -> Result<()> {
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
 
-    target_assert.has_table_count("public", "metrics_data_excluded", 0);
+    has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 0);
     target_assert.has_table_count("public", "metrics", 744);
 
     psql(
         &source_container,
-        Sql(r"
-        INSERT INTO metrics_data_excluded(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+        Sql(r#"
+        INSERT INTO "Metrics_data_excluded"(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
         INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
-    "),
+    "#),
     )?;
 
     wait_for_source_target_sync(
@@ -263,7 +273,7 @@ fn test_exclude_existing_table_data() -> Result<()> {
 
     // Currently, we do not skip data during live replay. This is why
     // "metrics_data_excluded" has count as 696 which was added during CDC.
-    target_assert.has_table_count("public", "metrics_data_excluded", 696);
+    has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 696);
     target_assert.has_table_count("public", "metrics", 1440);
 
     Ok(())
@@ -346,7 +356,7 @@ fn test_skip_dml_on_matview() -> Result<()> {
 }
 
 #[test]
-fn test_case_sensitive_objects() -> Result<()> {
+fn test_case_sensitive_object_live_replication() -> Result<()> {
     let _ = pretty_env_logger::try_init();
 
     let docker = Cli::default();
@@ -385,22 +395,14 @@ fn test_case_sensitive_objects() -> Result<()> {
         .with_network(&network_name);
     let _migrate = docker.run(migrate);
 
-    let check_count = |dba: &mut DbAssert, count: i64| {
-        let client = dba.connection();
-        let v: i64 = client
-            .query_one(
-                r#"select count(*) from "Sensitive_Schema0"."Sensitive_Metric1""#,
-                &[],
-            )
-            .unwrap()
-            .get(0);
-        assert_eq!(v, count);
-    };
-
     {
         let mut target_assert = DbAssert::new(&target_container.connection_string())?;
         target_assert.has_table("Sensitive_Schema0", "Sensitive_Metric1");
-        check_count(&mut target_assert, 744);
+        has_table_count(
+            &mut target_assert,
+            r#""Sensitive_Schema0"."Sensitive_Metric1""#,
+            744,
+        );
     }
 
     // Perform CDC on sensitive SQL objects.
@@ -419,7 +421,11 @@ fn test_case_sensitive_objects() -> Result<()> {
     )?;
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
-    check_count(&mut target_assert, 1440);
+    has_table_count(
+        &mut target_assert,
+        r#""Sensitive_Schema0"."Sensitive_Metric1""#,
+        1440,
+    );
 
     Ok(())
 }
