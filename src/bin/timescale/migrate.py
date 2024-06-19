@@ -338,6 +338,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
                                  "$PGCOPYDB_DIR/copy_table_data",
                                  "--snapshot",
                                  "$(cat $PGCOPYDB_DIR/snapshot)",
+                                 f"--filters={f.name}",
                                  ])
         with timeit():
             run_cmd(copy_table_data, LogFile("copy_table_data"))
