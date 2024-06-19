@@ -230,8 +230,8 @@ def prepare_filters(clone_cmd: list[str], args, filter: Filter):
     filter.exclude_extensions(skip_list)
 
 
-@telemetry_command("migrate_existing_data_from_pg")
-def migrate_existing_data_from_pg(target_type: DBType, args):
+@telemetry_command("migrate_existing_data_from_pg_to_tsdb")
+def migrate_existing_data_from_pg_to_tsdb(args):
     # TODO: Switch to the following simplified commands once we
     # figure out how to deal with incompatible indexes.
     # pgcopydb dump schema
@@ -315,8 +315,7 @@ def migrate_existing_data_from_pg(target_type: DBType, args):
         copy_extensions = " ".join(copy_extensions)
         run_cmd(copy_extensions, LogFile("copy_extensions"))
 
-    if (target_type == DBType.TIMESCALEDB and
-        not is_section_migration_complete("hypertable-creation")):
+    if not is_section_migration_complete("hypertable-creation"):
         show_hypertable_creation_prompt()
         mark_section_complete("hypertable-creation")
 
@@ -455,10 +454,9 @@ sed -i -E \
         print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
 
 
-def migrate_existing_data_from_ts(args):
+@telemetry_command("migrate_existing_data")
+def migrate_existing_data(args):
     logger.info("Copying table data ...")
-
-    timescaledb_pre_restore()
 
     clone_table_data = [
         "pgcopydb",
@@ -495,11 +493,6 @@ def migrate_existing_data_from_ts(args):
        run_cmd(clone_table_data, LogFile("pgcopydb_clone"))
 
     stop_progress.set()
-
-    # Note: timescaledb_post_restore must come after post-data, otherwise there
-    # are issues restoring indexes and foreign key constraints to chunks.
-    timescaledb_post_restore()
-
 
 @telemetry_command("wait_for_DBs_to_sync")
 def wait_for_DBs_to_sync(follow_proc):
@@ -700,10 +693,21 @@ def migrate(args):
 
         if not is_section_migration_complete("initial-data-migration"):
             logger.info("Migrating existing data from Source DB to Target DB ...")
-            if source_type == DBType.POSTGRES:
-                migrate_existing_data_from_pg(target_type, args)
-            else:
-                migrate_existing_data_from_ts(args)
+            match (source_type, target_type):
+                case (DBType.POSTGRES, DBType.POSTGRES):
+                    migrate_existing_data(args)
+                case (DBType.POSTGRES, DBType.TIMESCALEDB):
+                    migrate_existing_data_from_pg_to_tsdb(args)
+                case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
+                    timescaledb_pre_restore()
+                    migrate_existing_data(args)
+                    # IMPORTANT: timescaledb_post_restore must come after post-data,
+                    # otherwise there are issues restoring indexes and
+                    # foreign key constraints to chunks.
+                    timescaledb_post_restore()
+                case (DBType.TIMESCALEDB, DBType.POSTGRES):
+                    logger.error("Migration from TimescaleDB to Postgres is not supported")
+                    sys.exit(1)
             mark_section_complete("initial-data-migration")
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
