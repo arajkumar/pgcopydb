@@ -200,6 +200,8 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 
 	const char *denylist[][2] = {
 		{ "_timescaledb_catalog", NULL },
+		{ "_timescaledb_config", NULL },
+		{ "_timescaledb_cache", NULL },
 		{ "_timescaledb_internal", "bgw_job_stat" },
 		{ "_timescaledb_internal", "compress_hyper_" },
 	};
