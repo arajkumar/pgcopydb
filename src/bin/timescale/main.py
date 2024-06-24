@@ -86,11 +86,35 @@ def main():
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
-    parser_migrate.add_argument('--skip-table-data', nargs='+',
-                                help='Skips data from the given table during migration. However, the table schema will be migrated. ' \
-                                    'To skip data from a Hypertable, you will need to specify a list of schema qualified chunks belonging to the Hypertable. ' \
-                                    'Currently, this flag does not skip data during live replay from the specified table. ' \
-                                    'Values for this flag must be schema qualified. Eg: --skip-table-data public.exclude_table_1 public.exclude_table_2')
+    parser_migrate.add_argument('--skip-table-data',
+                                '--exclude-table-data',
+                                dest='skip_table_data',
+                                nargs='+',
+                                help='Skips data from the given table during '
+                                     'migration. However, the table schema '
+                                     'will be migrated. To skip data from a '
+                                     'Hypertable, you will need to specify a '
+                                     'list of schema qualified chunks belonging '
+                                     'to the Hypertable. Currently, this flag '
+                                     'does not skip data during live replay from '
+                                     'the specified table. Values for this '
+                                     'flag must be schema qualified. '
+                                     'Eg: --skip-table-data public.exclude_table_1 public.exclude_table_2')
+    parser_migrate.add_argument('--skip-index',
+                                '--exclude-index',
+                                dest='skip_index',
+                                nargs='+',
+                                help='Skips the given indexes during migration. '
+                                     'Values for this flag must be schema '
+                                     'qualified. '
+                                     'Eg: --skip-index public.metrics_pkey public.metrics_time_idx')
+    parser_migrate.add_argument('--skip-index-constraint-compatibility-check',
+                                action='store_true',
+                                help='Skip the index compatibility check during migration')
+    parser_migrate.add_argument('--auto-skip-incompatible-index-constraint',
+                                action='store_true',
+                                help='Automatically skip incompatible indexes and constraints during migration')
+
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',

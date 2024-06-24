@@ -14,4 +14,5 @@ def psql(conn, sql):
         raise RuntimeError(f"Error executing SQL: {e.stderr}")
 
     reader = csv.DictReader(StringIO(result), delimiter=',')
-    return reader
+    # Convert the reader to a list to avoid the generator being exhausted
+    return list(reader)

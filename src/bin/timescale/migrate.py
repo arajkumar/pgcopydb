@@ -10,6 +10,7 @@ import logging
 import traceback
 
 from pathlib import Path
+from collections import defaultdict
 
 from housekeeping import start_housekeeping
 from health_check import health_checker
@@ -215,210 +216,272 @@ def skip_extensions_list(args):
         return skip_extensions_default
 
 
-def get_hypertables(pguri) -> csv.DictReader:
-    hypertables = psql_run(conn=pguri,
-                           sql="select hypertable_schema, hypertable_name from timescaledb_information.hypertables")
-    return hypertables
-
-def get_hypertable_conflicting_constraints(pguri, hypertables: csv.DictReader) -> csv.DictReader:
+def get_hypertable_dimensions(pguri) -> csv.DictReader:
     sql = """
-        SELECT
-            con.conname AS constraint_name,
-            cls.relname AS relname,
-            ns.nspname AS nspname,
-            con.contype AS constraint_type,
-            idxcls.relname AS idx_relname,
-            FORMAT('%I.%I', ns.nspname, idxcls.relname) AS index_name,
-            pg_get_indexdef(idx.indexrelid) AS index_definition
-        FROM
-            pg_constraint con
-        JOIN
-            pg_class cls ON con.conrelid = cls.oid
-        JOIN
-            pg_namespace ns ON cls.relnamespace = ns.oid
-        JOIN
-            pg_index idx ON idx.indexrelid = con.conindid
-        JOIN
-            pg_class idxcls ON idx.indexrelid = idxcls.oid
-        WHERE
-            con.contype IN ('p', 'u') -- 'p' for primary key, 'u' for unique constraints
-        $$CONDITION$$
+select
+    hypertable_schema as nspname,
+    hypertable_name as relname,
+    array_agg(FORMAT('%I', column_name::text)) as dimensions
+from timescaledb_information.dimensions group by 1, 2;
+ """
+    dimensions = psql_cmd(conn=pguri,
+                           sql=sql)
+    return dimensions
+
+def get_hypertable_incompatible_source_tables(pguri, hypertables: csv.DictReader,
+                                              exclude_indexes) -> dict:
+    sql = """
+WITH indexes AS (
+    SELECT
+        ns.nspname AS nspname,
+        cls.relname AS relname,
+        idxns.nspname AS idxnspname,
+        idxcls.relname AS idxrelname,
+        am.amname AS index_type,
+        array_agg(FORMAT('%I', att.attname::text) ORDER BY array_position(idx.indkey, att.attnum)) AS columns,
+        pg_get_indexdef(idx.indexrelid) AS index_definition,
+        con.conname AS constraint_name,
+        CASE WHEN con.oid IS NOT NULL THEN pg_get_constraintdef(con.oid) ELSE NULL END AS constraint_definition,
+        idx.indisprimary as is_primary_key
+    FROM
+        pg_index idx
+    JOIN
+        pg_class cls ON cls.oid = idx.indrelid
+    JOIN
+        pg_namespace ns ON ns.oid = cls.relnamespace
+    JOIN
+        pg_class idxcls ON idxcls.oid = idx.indexrelid
+    JOIN
+        pg_namespace idxns ON idxns.oid = idxcls.relnamespace
+    JOIN
+        pg_attribute att ON att.attrelid = idx.indrelid AND att.attnum = ANY(idx.indkey)
+    JOIN
+        pg_am am ON idxcls.relam = am.oid
+    LEFT JOIN
+        pg_constraint con ON con.conindid = idx.indexrelid
+    WHERE
+        (idx.indisunique OR idx.indisprimary)
+    GROUP BY
+        ns.nspname, cls.relname, idxns.nspname, idxcls.relname, am.amname, idx.indisunique, idx.indexrelid, con.conname, con.oid
+    ORDER BY
+        ns.nspname, cls.relname, idxns.nspname, idxcls.relname
+)
+SELECT
+    nspname,
+    relname,
+    idxnspname,
+    idxrelname,
+    columns,
+    index_definition,
+    CASE WHEN constraint_name IS NOT NULL THEN FORMAT('%I', constraint_name) ELSE NULL END as constraint_name,
+    constraint_definition,
+    is_primary_key
+FROM indexes
+WHERE
+    $$CONDITION$$
     """
-    condition = map(lambda row: f"(cls.relname = '{row['hypertable_name']}' AND ns.nspname = '{row['hypertable_schema']}')", hypertables)
-    sql = sql.replace("$$CONDITION$$", " OR ".join(condition))
-    return psql_run(conn=pguri, sql=sql)
+    condition = "FALSE"
+    if hypertables:
+        condition = map(lambda row: f"""
+                    (
+                        nspname = '{row['nspname']}'
+                        AND
+                        relname = '{row['relname']}'
+                        -- parition column must be a superset of
+                        -- the hypertable dimensions
+                        AND NOT columns @> '{row['dimensions']}'::text[]
+                    )""", hypertables)
+
+        condition = " OR ".join(condition)
+        condition = f"({condition})"
+
+    if exclude_indexes:
+        exclude_indexes = map(lambda idx: f"'{idx}'", exclude_indexes)
+        exclude_indexes = ", ".join(exclude_indexes)
+        exclude_indexes = f"FORMAT('%s.%s', idxnspname, idxrelname) NOT IN ({exclude_indexes})"
+        condition = f"{condition} AND {exclude_indexes}"
+
+    sql = sql.replace("$$CONDITION$$", condition)
+    result = psql_cmd(conn=pguri, sql=sql)
+
+    group_dimension = {}
+    for row in hypertables:
+        fq_table_name = f"{row['nspname']}.{row['relname']}"
+        group_dimension[fq_table_name] = row['dimensions']
+
+    group_by_table = defaultdict(list)
+    for row in result:
+        fq_table_name = f"{row['nspname']}.{row['relname']}"
+        row['dimensions'] = group_dimension[fq_table_name]
+        group_by_table[fq_table_name].append(row)
+
+    return group_by_table
 
 
-def prepare_conflicting_constraints_filter(indexes: csv.DictReader, filter: Filter):
-    exclude_indexes = map(lambda row: row["index_name"], indexes)
-    filter.exclude_indexes(exclude_indexes)
+def show_hypertable_incompatibility(incompatible_tables, error = True):
+    if error:
+        log_func = logger.error
+    else:
+        log_func = logger.warn
+
+    incompatible = False
+    for table, incompats in incompatible_tables.items():
+        log_func(f"Table {table} has incompatible constraints/indexes:")
+        for incompat in incompats:
+            idx_type = ''
+            nspname = incompat['nspname']
+            if incompat['constraint_name']:
+                is_primary_key = incompat['is_primary_key'] == 't'
+                idx_type = 'PRIMARY KEY' if is_primary_key else 'UNIQUE CONSTRAINT'
+                idxname = incompat['constraint_name']
+            else:
+                idx_type = 'UNIQUE INDEX'
+                idxname = incompat['idxrelname']
+            dimensions = incompat['dimensions']
+            log_func(f""" {nspname}.{idxname} {idx_type} doesn't include hypertable """
+                         f"dimension {dimensions} as part of "
+                         f"its definition.")
+
+        incompatible = True
+
+    if incompatible and error:
+        logger.error("Please resolve the above issues on source database "
+                     "before proceeding.")
+        logger.error("Alternatively, you can skip problematic indexes/constraints "
+                     "using the --skip-index flag. Beware that "
+                     "ignoring indexes might slow down the UPDATE/DELETE "
+                     "replication on the target. You can choose to create them "
+                     "manually to avoid the problem.")
 
 
-def prepare_filters(clone_cmd: list[str], args, filter: Filter):
+def check_hypertable_incompatibility(source_pg_uri, target_pg_uri, skip_index):
+    dimensions = get_hypertable_dimensions(target_pg_uri)
+
+    incompatible_tables = get_hypertable_incompatible_source_tables(source_pg_uri, dimensions, skip_index)
+
+    return incompatible_tables
+
+
+def prepare_auto_skip_incompatible_index_constraint(incompatible_tables):
+    incompatible_indexes = []
+    for table, incompats in incompatible_tables.items():
+        for incompat in incompats:
+            nspname = incompat['nspname']
+            idxname = incompat['idxrelname']
+            indexname = f"{nspname}.{idxname}"
+            incompatible_indexes.append(indexname)
+
+    return incompatible_indexes
+
+
+def prepare_filters(args):
+    pgcopydb_args = []
+    filter = Filter()
     if args.skip_table_data:
         logger.info("Excluding table data: %s", args.skip_table_data)
         filter.exclude_table_data(args.skip_table_data)
 
+    if args.skip_index:
+        logger.info("Excluding indexes: %s", args.skip_index)
+        filter.exclude_indexes(args.skip_index)
+
     # empty list of skip_extensions ignores all extensions
     if args.skip_extensions is not None and len(args.skip_extensions) == 0:
         logger.warn("Ignoring all extensions")
-        clone_cmd.append("--skip-extensions")
-        return
+        pgcopydb_args.append("--skip-extensions")
+    else:
+        skip_list = skip_extensions_list(args)
+        logger.info("Skipping extensions: %s", skip_list)
+        filter.exclude_extensions(skip_list)
 
-    skip_list = skip_extensions_list(args)
-    logger.info("Skipping extensions: %s", skip_list)
-    filter.exclude_extensions(skip_list)
+    filter_file = str(args.dir / "filter.ini")
 
+    # Apply filters
+    with open(filter_file, "w") as f:
+        filter.write(f)
+
+    pgcopydb_args.append(f"--filters={filter_file}")
+    return pgcopydb_args
 
 @telemetry_command("migrate_existing_data_from_pg_to_tsdb")
 def migrate_existing_data_from_pg_to_tsdb(args):
-    # TODO: Switch to the following simplified commands once we
-    # figure out how to deal with incompatible indexes.
-    # pgcopydb dump schema
-    # pgcopydb restore pre-data --skip-extensions --no-acl --no-owner
-    # <-- create hypertables -->
-    # pgcopydb clone --skip-extensions --no-acl --no-owner
+    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
+    target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
 
-    if not is_section_migration_complete("pre-data-dump"):
-        logger.info(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-        with timeit():
-            pgdump_command = " ".join(["pg_dump",
-                                       "-d",
-                                       '"$PGCOPYDB_SOURCE_PGURI"',
-                                       "--format=plain",
-                                       "--quote-all-identifiers",
-                                       "--no-tablespaces",
-                                       "--no-owner",
-                                       "--no-privileges",
-                                       "--section=pre-data",
-                                       "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
-                                       ])
-            run_cmd(pgdump_command, LogFile("pre_data_dump"))
-        mark_section_complete("pre-data-dump")
+    filter_args = prepare_filters(args)
 
-    if not is_section_migration_complete("post-data-dump"):
-        logger.info(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-        with timeit():
-            pgdump_command = " ".join(["pg_dump",
-                                       "-d",
-                                       '"$PGCOPYDB_SOURCE_PGURI"',
-                                       "--format=plain",
-                                       "--quote-all-identifiers",
-                                       "--no-tablespaces",
-                                       "--no-owner",
-                                       "--no-privileges",
-                                       "--section=post-data",
-                                       "--file=$PGCOPYDB_DIR/post-data-dump.sql",
-                                       ])
-            run_cmd(pgdump_command, LogFile("post_data_dump"))
-        mark_section_complete("post-data-dump")
+    with timeit("Dump schema"):
+        dump_schema = " ".join(["pgcopydb",
+                                "dump",
+                                "schema",
+                                "--dir",
+                                "$PGCOPYDB_DIR/pgcopydb_clone",
+                                "--snapshot",
+                                "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--resume",
+                                ])
+        run_cmd(dump_schema, LogFile("dump_schema"))
 
-    if not is_section_migration_complete("pre-data-restore"):
-        logger.info("Restoring pre-data ...")
-        with timeit():
-            log_file = LogFile("pre_data_restore")
-            psql_command = " ".join(["psql",
-                                     "-X",
-                                     "-d",
-                                     '"$PGCOPYDB_TARGET_PGURI"',
-                                     "--echo-errors",
-                                     "-v",
-                                     "ON_ERROR_STOP=0",
-                                     "-f",
-                                     "$PGCOPYDB_DIR/pre-data-dump.sql",
-                                     ])
-            run_cmd(psql_command, log_file)
-            print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
-        mark_section_complete("pre-data-restore")
-
-    filter = Filter()
-
-    with timeit():
-        logger.info("Copy extension config tables ...")
-        copy_extensions = [
-            "pgcopydb",
-            "copy",
-            "extensions",
-            "--dir",
-            "$PGCOPYDB_DIR/copy_extensions",
-            "--snapshot",
-            "$(cat $PGCOPYDB_DIR/snapshot)",
-            "--resume",
-        ]
-
-        prepare_filters(copy_extensions, args, filter)
-        # Apply filters
-        with open(args.dir / "filter.ini", "w") as f:
-            filter.write(f)
-            copy_extensions.append(f"--filters={f.name}")
-
-        copy_extensions = " ".join(copy_extensions)
-        run_cmd(copy_extensions, LogFile("copy_extensions"))
+    with timeit("Restore pre-data"):
+        restore_pre_data = " ".join(["pgcopydb",
+                                     "restore",
+                                     "pre-data",
+                                     "--no-acl",
+                                     "--no-owner",
+                                     "--dir",
+                                     "$PGCOPYDB_DIR/pgcopydb_clone",
+                                     "--snapshot",
+                                     "$(cat $PGCOPYDB_DIR/snapshot)",
+                                     "--resume",
+                                     ] + filter_args)
+        run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
     if not is_section_migration_complete("hypertable-creation"):
         show_hypertable_creation_prompt()
         mark_section_complete("hypertable-creation")
 
+    incompatible = check_hypertable_incompatibility(source_pg_uri,
+                                                    target_pg_uri,
+                                                    args.skip_index)
+
+    if incompatible:
+        if args.auto_skip_incompatible_index_constraint:
+            skip_index = prepare_auto_skip_incompatible_index_constraint(incompatible)
+            logger.warn("Automatically skipping incompatible indexes/constraints: %s", skip_index)
+            if args.skip_index:
+                args.skip_index.extend(skip_index)
+            else:
+                args.skip_index = skip_index
+
+            filter_args = prepare_filters(args)
+        elif args.skip_index_constraint_compatibility_check:
+            show_hypertable_incompatibility(incompatible, error=False)
+        else:
+            show_hypertable_incompatibility(incompatible, error=True)
+            sys.exit(1)
+
     stop_progress = monitor_db_sizes()
 
-    if not is_section_migration_complete("copy-table-data"):
-        logger.info("Copying table data ...")
+    with timeit("Copy table data"):
         copy_table_data = " ".join(["pgcopydb",
-                                 "copy",
-                                 "table-data",
+                                 "clone",
                                  "--table-jobs",
                                  args.table_jobs,
                                  "--index-jobs",
                                  args.index_jobs,
                                  "--split-tables-larger-than='1 GB'",
                                  "--notice",
-                                 "--skip-vacuum",
                                  "--dir",
-                                 "$PGCOPYDB_DIR/copy_table_data",
+                                 "$PGCOPYDB_DIR/pgcopydb_clone",
+                                 "--resume",
+                                 "--no-acl",
+                                 "--no-owner",
                                  "--snapshot",
                                  "$(cat $PGCOPYDB_DIR/snapshot)",
-                                 f"--filters={f.name}",
-                                 ])
-        with timeit():
-            run_cmd(copy_table_data, LogFile("copy_table_data"))
-        mark_section_complete("copy-table-data")
+                                 ] + filter_args)
+        log = LogFile("pgcopydb_clone")
+        run_cmd(copy_table_data, log)
 
-    if not is_section_migration_complete("post-data-restore"):
-        logger.info("Restoring post-data ...")
-        with timeit():
-            log_file = LogFile("post_data_restore")
-            psql_command = " ".join(["psql",
-                                     "-X",
-                                     "-d",
-                                     '"$PGCOPYDB_TARGET_PGURI"',
-                                     "--echo-errors",
-                                     "-v",
-                                     "ON_ERROR_STOP=0",
-                                     "-f",
-                                     "$PGCOPYDB_DIR/post-data-dump.sql",
-                                     ])
-            run_cmd(psql_command, log_file)
-            print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
-        mark_section_complete("post-data-restore")
-
-    if not is_section_migration_complete("analyze-db"):
-        logger.info("Perform ANALYZE on target DB tables ...")
-        with timeit():
-            vaccumdb_command = " ".join(["vacuumdb",
-                                        "--analyze",
-                                        "--echo",
-                                        "--exclude-schema=pg_catalog",
-                                        "--exclude-schema=information_schema",
-                                        "--exclude-schema=timescaledb_information",
-                                        "--exclude-schema=_timescaledb_internal",
-                                        "--exclude-schema=_timescaledb_debug",
-                                        "--dbname",
-                                        '"$PGCOPYDB_TARGET_PGURI"',
-                                        "--jobs",
-                                        args.table_jobs,
-                                        ])
-            run_cmd(vaccumdb_command, LogFile("analyze_db"))
-        mark_section_complete("analyze-db")
     stop_progress.set()
 
 
@@ -498,6 +561,8 @@ sed -i -E \
 def migrate_existing_data(args):
     logger.info("Copying table data ...")
 
+    filter_args = prepare_filters(args)
+
     clone_table_data = [
         "pgcopydb",
         "clone",
@@ -513,14 +578,7 @@ def migrate_existing_data(args):
         "--snapshot",
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
-    ]
-
-    filter = Filter()
-    prepare_filters(clone_table_data, args, filter)
-    # Apply filters
-    with open(args.dir / "filter.ini", "w") as f:
-        filter.write(f)
-        clone_table_data.append(f"--filters={f.name}")
+    ] + filter_args
 
     if args.resume:
         clone_table_data.append("--resume")
