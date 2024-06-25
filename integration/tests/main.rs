@@ -691,13 +691,8 @@ fn test_incompatible_index_constraint_migration_for_pg_to_ts() -> Result<()> {
     let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
         .with_wait_for(WaitFor::message_on_stdout("send a SIGUSR1 signal with"));
 
-    let migrate = RunnableImage::from((
-        migrate_image,
-        vec![
-            String::from("migrate"),
-        ],
-    ))
-    .with_network(&network_name);
+    let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
+        .with_network(&network_name);
 
     let migrate = docker.run(migrate);
 
