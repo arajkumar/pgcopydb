@@ -9,6 +9,7 @@ import threading
 import logging
 import traceback
 
+from multiprocessing import Pool
 from pathlib import Path
 from collections import defaultdict
 
@@ -228,10 +229,44 @@ from timescaledb_information.dimensions group by 1, 2;
                            sql=sql)
     return dimensions
 
-def get_hypertable_incompatible_source_tables(pguri, hypertables: csv.DictReader,
-                                              exclude_indexes) -> dict:
-    sql = """
-WITH indexes AS (
+def get_hypertable_incompatible_objects(pguri, hypertables: csv.DictReader,
+                                        exclude_indexes) -> defaultdict[str, list[csv.DictReader]]:
+    """
+    Get list of indexes/constraints that are incompatible with hypertables.
+
+    :param pguri: URI of the source database
+    :param hypertables: List of hypertables
+    :param exclude_indexes: List of indexes to exclude
+    :return: Dictionary where key is the table name and value is the list of incompatible indexes/constraints
+    """
+
+    if exclude_indexes:
+        index_names = map(lambda row: f"('{row['fq_index_name']}')", exclude_indexes)
+        index_names = ", ".join(index_names)
+    else:
+        index_names = "(NULL)"
+
+    index_filter_sql = f"""
+index_filter(faq_indexname) as (
+        VALUES {index_names}
+)
+"""
+    if hypertables:
+        hypertable_names = map(lambda row: f"""
+(
+    '{row['nspname']}', '{row['relname']}', '{row['dimensions']}'
+)""", hypertables)
+        hypertable_names = ", ".join(hypertable_names)
+    else:
+        hypertable_names = "(NULL, NULL, NULL)"
+    hypertable_filter_sql = f"""
+hypertable_filter(nspname, relname, dimensions) as (
+        VALUES {hypertable_names}
+)
+"""
+
+    sql = f"""
+WITH {index_filter_sql}, {hypertable_filter_sql}, indexes AS (
     SELECT
         ns.nspname AS nspname,
         cls.relname AS relname,
@@ -267,41 +302,23 @@ WITH indexes AS (
         ns.nspname, cls.relname, idxns.nspname, idxcls.relname
 )
 SELECT
-    nspname,
-    relname,
-    idxnspname,
-    idxrelname,
+    i.nspname,
+    i.relname,
+    i.idxnspname,
+    i.idxrelname,
+    FORMAT('%I.%I', i.nspname, i.relname) as fq_table_name,
+    FORMAT('%I.%I', i.idxnspname, i.idxrelname) as fq_index_name,
     columns,
     index_definition,
     CASE WHEN constraint_name IS NOT NULL THEN FORMAT('%I', constraint_name) ELSE NULL END as constraint_name,
     constraint_definition,
-    is_primary_key
-FROM indexes
-WHERE
-    $$CONDITION$$
-    """
-    condition = "FALSE"
-    if hypertables:
-        condition = map(lambda row: f"""
-                    (
-                        nspname = '{row['nspname']}'
-                        AND
-                        relname = '{row['relname']}'
-                        -- parition column must be a superset of
-                        -- the hypertable dimensions
-                        AND NOT columns @> '{row['dimensions']}'::text[]
-                    )""", hypertables)
-
-        condition = " OR ".join(condition)
-        condition = f"({condition})"
-
-    if exclude_indexes:
-        exclude_indexes = map(lambda idx: f"'{idx}'", exclude_indexes)
-        exclude_indexes = ", ".join(exclude_indexes)
-        exclude_indexes = f"FORMAT('%s.%s', idxnspname, idxrelname) NOT IN ({exclude_indexes})"
-        condition = f"{condition} AND {exclude_indexes}"
-
-    sql = sql.replace("$$CONDITION$$", condition)
+    is_primary_key,
+    i.columns @> hf.dimensions::text[] as is_compatible
+FROM indexes i
+JOIN hypertable_filter hf ON hf.nspname = i.nspname AND hf.relname = i.relname
+LEFT JOIN index_filter idxf ON idxf.faq_indexname = FORMAT('%s.%s', i.idxnspname, i.idxrelname)
+WHERE idxf.faq_indexname IS NULL
+"""
     result = psql_cmd(conn=pguri, sql=sql)
 
     group_dimension = {}
@@ -318,31 +335,106 @@ WHERE
     return group_by_table
 
 
-def show_hypertable_incompatibility(incompatible_tables, error = True):
+# This could be a innter function, but it can't be pickled for multiprocessing.
+def _create_index(index, args):
+
+    if args.skip_hypertable_incompatible_objects and index['is_compatible'] == 'f':
+        logger.warn(f"Skipping incompatible index {index['fq_index_name']}")
+        return True
+
+    create_index = index['index_definition']
+
+    # Add IF NOT EXISTS to the index creation statement
+    if create_index.startswith("CREATE UNIQUE INDEX"):
+        create_index = create_index.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS")
+    elif create_index.startswith("CREATE INDEX"):
+        create_index = create_index.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS")
+    else:
+        raise ValueError(f"Unexpected index definition: {create_index}")
+
+    logger.info(f"Creating index {create_index}")
+    psql_cmd(conn=args.target, sql=create_index)
+    return True
+
+
+# This could be a innter function, but it can't be pickled for multiprocessing.
+def _filter_constraint(table_name, args, hypertable_info):
+    objs = hypertable_info[table_name]
+    objs = filter(lambda i: i['constraint_name'], objs)
+    for constraint in objs:
+        if args.skip_hypertable_incompatible_objects and constraint['is_compatible'] == 'f':
+            logger.warn(f"Skipping incompatible constraint {constraint['constraint_name']}")
+            continue
+
+        # Unlike indexes, constraints can't be created with IF NOT EXISTS.
+        # We need to check if the constraint already exists before creating it.
+        constraint_definition = f"ALTER TABLE {constraint['fq_table_name']} ADD CONSTRAINT {constraint['constraint_name']} {constraint['constraint_definition']}"
+        sql = f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON(c.connamespace=n.oid) WHERE conname = '{constraint['constraint_name']}' AND nspname = '{constraint['nspname']}') THEN
+                EXECUTE '{constraint_definition}';
+            END IF;
+        END $$;
+        """
+        logger.info(f"Creating constraint {constraint_definition} if not exist...")
+        psql_cmd(conn=args.target, sql=sql)
+    return True
+
+
+def try_creating_incompatible_objects(args, hypertable_info):
+    logger.info("Creating indexes and constraints on the target hypertable ...")
+
+    # Building indexes in parallel across tables
+    with Pool(processes=int(args.index_jobs)) as pool:
+        # Prepare the list of indexes to create, excluding constraints.
+        indexes = []
+        for table, info in hypertable_info.items():
+            for obj in info:
+                if not obj['constraint_name']:
+                    indexes.append((obj, args))
+        pool.starmap(_create_index, indexes)
+
+    # Building constraints sequentially on each table, but in
+    # parallel across tables
+    with Pool(processes=int(args.index_jobs)) as pool:
+        args = [(table, args, hypertable_info) for table in hypertable_info.keys()]
+        pool.starmap(_filter_constraint, args)
+
+    # TODO: Should we run ANALYZE on the hypertables?
+
+
+def show_hypertable_incompatibility(hypertable_info, error = True):
     if error:
         log_func = logger.error
     else:
         log_func = logger.warn
 
     incompatible = False
-    for table, incompats in incompatible_tables.items():
-        log_func(f"Table {table} has incompatible constraints/indexes:")
-        for incompat in incompats:
-            idx_type = ''
-            nspname = incompat['nspname']
-            if incompat['constraint_name']:
-                is_primary_key = incompat['is_primary_key'] == 't'
-                idx_type = 'PRIMARY KEY' if is_primary_key else 'UNIQUE CONSTRAINT'
-                idxname = incompat['constraint_name']
-            else:
-                idx_type = 'UNIQUE INDEX'
-                idxname = incompat['idxrelname']
-            dimensions = incompat['dimensions']
-            log_func(f""" {nspname}.{idxname} {idx_type} doesn't include hypertable """
+    for table, info in hypertable_info.items():
+        print_table_name = True
+        for i in info:
+            if i['is_compatible'] == 'f':
+                idx_type = ''
+                nspname = i['nspname']
+                if i['constraint_name']:
+                    is_primary_key = i['is_primary_key'] == 't'
+                    idx_type = 'PRIMARY KEY' if is_primary_key else 'UNIQUE CONSTRAINT'
+                    idxname = i['constraint_name']
+                else:
+                    idx_type = 'UNIQUE INDEX'
+                    idxname = i['idxrelname']
+                dimensions = i['dimensions']
+
+                if print_table_name:
+                    log_func(f"Table {table} has incompatible constraints/indexes:")
+                    print_table_name = False
+
+                log_func(f"""{nspname}.{idxname} {idx_type} doesn't include hypertable """
                          f"dimension {dimensions} as part of "
                          f"its definition.")
 
-        incompatible = True
+                incompatible = True
 
     if incompatible and error:
         logger.error("Please resolve the above issues on source database "
@@ -354,20 +446,29 @@ def show_hypertable_incompatibility(incompatible_tables, error = True):
                      "manually to avoid the problem.")
 
 
-def check_hypertable_incompatibility(source_pg_uri, target_pg_uri, skip_index):
-    dimensions = get_hypertable_dimensions(target_pg_uri)
+def check_hypertable_incompatibility(args):
+    dimensions = get_hypertable_dimensions(args.target)
 
-    incompatible_tables = get_hypertable_incompatible_source_tables(source_pg_uri, dimensions, skip_index)
+    incompatible_tables = get_hypertable_incompatible_objects(args.source, dimensions, args.skip_index)
 
     return incompatible_tables
 
 
-def prepare_auto_skip_incompatible_index_constraint(incompatible_tables):
+def hypertable_has_incompatible_objects(hypertable_info):
+    for table, info in hypertable_info.items():
+        for i in info:
+            if i['is_compatible'] == 'f':
+                return True
+
+    return False
+
+
+def filter_incompatible_index_constraint(incompatible_tables):
     incompatible_indexes = []
-    for table, incompats in incompatible_tables.items():
-        for incompat in incompats:
-            nspname = incompat['nspname']
-            idxname = incompat['idxrelname']
+    for table, info in incompatible_tables.items():
+        for i in info:
+            nspname = i['nspname']
+            idxname = i['idxrelname']
             indexname = f"{nspname}.{idxname}"
             incompatible_indexes.append(indexname)
 
@@ -405,9 +506,6 @@ def prepare_filters(args):
 
 @telemetry_command("migrate_existing_data_from_pg_to_tsdb")
 def migrate_existing_data_from_pg_to_tsdb(args):
-    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
-    target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
-
     filter_args = prepare_filters(args)
 
     with timeit("Dump schema"):
@@ -440,24 +538,22 @@ def migrate_existing_data_from_pg_to_tsdb(args):
         show_hypertable_creation_prompt()
         mark_section_complete("hypertable-creation")
 
-    incompatible = check_hypertable_incompatibility(source_pg_uri,
-                                                    target_pg_uri,
-                                                    args.skip_index)
+    hypertable_info = check_hypertable_incompatibility(args)
 
-    if incompatible:
-        if args.auto_skip_incompatible_index_constraint:
-            skip_index = prepare_auto_skip_incompatible_index_constraint(incompatible)
-            logger.warn("Automatically skipping incompatible indexes/constraints: %s", skip_index)
-            if args.skip_index:
-                args.skip_index.extend(skip_index)
-            else:
-                args.skip_index = skip_index
+    # Always skip primary key, unique constraints and unique indexes
+    # The way pgcopydb build the above objects is not compatible with hypertables.
+    skip_index = filter_incompatible_index_constraint(hypertable_info)
+    if args.skip_index:
+        args.skip_index.extend(skip_index)
+    else:
+        args.skip_index = skip_index
+    filter_args = prepare_filters(args)
 
-            filter_args = prepare_filters(args)
-        elif args.skip_index_constraint_compatibility_check:
-            show_hypertable_incompatibility(incompatible, error=False)
+    if hypertable_has_incompatible_objects(hypertable_info):
+        if args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check:
+            show_hypertable_incompatibility(hypertable_info, error=False)
         else:
-            show_hypertable_incompatibility(incompatible, error=True)
+            show_hypertable_incompatibility(hypertable_info, error=True)
             sys.exit(1)
 
     stop_progress = monitor_db_sizes()
@@ -482,6 +578,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
         log = LogFile("pgcopydb_clone")
         run_cmd(copy_table_data, log)
 
+    try_creating_incompatible_objects(args, hypertable_info)
     stop_progress.set()
 
 
@@ -748,11 +845,8 @@ def migrate(args):
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(1)
 
-    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
-    target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
-
-    source_type = get_dbtype(source_pg_uri)
-    target_type = get_dbtype(target_pg_uri)
+    source_type = get_dbtype(args.source)
+    target_type = get_dbtype(args.target)
 
     if args.pg_src:
         source_type = DBType.POSTGRES
@@ -811,7 +905,7 @@ def migrate(args):
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
         logger.info("Converting materialized views to views ...")
-        convert_matview_to_view(target_pg_uri)
+        convert_matview_to_view(args.target)
 
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
@@ -841,7 +935,7 @@ def migrate(args):
         copy_sequences()
 
         logger.info("Restoring materialized views ...")
-        restore_matview(target_pg_uri)
+        restore_matview(args.target)
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")

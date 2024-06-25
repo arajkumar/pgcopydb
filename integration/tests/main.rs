@@ -511,7 +511,7 @@ fn test_pg_to_ts_with_table_data_filtering() -> Result<()> {
 		CREATE TABLE "Metrics_data_excluded"(time timestamptz primary key, value float8);
 		INSERT INTO "Metrics_data_excluded"(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
 
-		CREATE TABLE metrics(id serial primary key, time timestamptz, value float8);
+		CREATE TABLE metrics(id serial, time timestamptz, value float8, primary key(id, time));
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
 	"#),
     )?;
@@ -651,6 +651,165 @@ fn test_pg_to_pg_with_table_data_filtering() -> Result<()> {
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
     has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 0);
+    target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
+
+#[test]
+fn test_incompatible_index_constraint_migration_for_pg_to_ts() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    psql(
+        &source_container,
+        Sql(r"
+		-- We want to test Postgres to TimescaleDB migration.
+		DROP EXTENSION IF EXISTS timescaledb CASCADE;
+		CREATE TABLE metrics(id serial primary key, time timestamptz, value float8);
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+	"),
+    )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout("send a SIGUSR1 signal with"));
+
+    let migrate = RunnableImage::from((
+        migrate_image,
+        vec![
+            String::from("migrate"),
+        ],
+    ))
+    .with_network(&network_name);
+
+    let migrate = docker.run(migrate);
+
+    // Wait for the signal handler to be installed.
+    sleep(Duration::from_secs(5));
+
+    psql(
+        &target_container,
+        Sql(r"
+			SELECT create_hypertable('metrics', by_range('id', 100));
+	"),
+    )?;
+
+    Command::new("docker")
+        .args(["kill", "--signal", "SIGUSR1", migrate.id()])
+        .spawn()
+        .expect("failed to send signal");
+
+    psql(
+        &source_container,
+        Sql(r"
+        INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+    "),
+    )?;
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+    target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
+
+#[test]
+fn test_skip_incompatible_index_constraint_on_pg_to_ts() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    psql(
+        &source_container,
+        Sql(r"
+		-- We want to test Postgres to TimescaleDB migration.
+		DROP EXTENSION IF EXISTS timescaledb CASCADE;
+		CREATE TABLE metrics(id serial primary key, time timestamptz, value float8);
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+	"),
+    )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout("send a SIGUSR1 signal with"));
+
+    let migrate = RunnableImage::from((
+        migrate_image,
+        vec![
+            String::from("migrate"),
+            String::from("--skip-hypertable-incompatible-objects"),
+        ],
+    ))
+    .with_network(&network_name);
+
+    let migrate = docker.run(migrate);
+
+    // Wait for the signal handler to be installed.
+    sleep(Duration::from_secs(5));
+
+    psql(
+        &target_container,
+        Sql(r"
+			SELECT create_hypertable('metrics', by_range('time', '1hr'::interval));
+	"),
+    )?;
+
+    Command::new("docker")
+        .args(["kill", "--signal", "SIGUSR1", migrate.id()])
+        .spawn()
+        .expect("failed to send signal");
+
+    psql(
+        &source_container,
+        Sql(r"
+        INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+    "),
+    )?;
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
     target_assert.has_table_count("public", "metrics", 1440);
 
     Ok(())
