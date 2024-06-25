@@ -22,23 +22,23 @@ class Filter:
         """
         self._filter[self.EXCLUDE_EXTENSION].update(extensions)
 
-    def _check_dot(self, relation: list[str]):
+    def _check_schema(self, relation: list[str]):
         for r in relation:
             if "." not in r:
-                raise Exception(f"dot separator ('.') not found: {r}")
+                raise Exception(f"Must be a fully qualified Postgres name(schema.relation): {r}")
 
     def exclude_table_data(self, tables: list[str]):
         """
         Exclude table data from initial data migration.
         """
-        self._check_dot(tables)
+        self._check_schema(tables)
         self._filter[self.EXCLUDE_TABLE_DATA].update(tables)
 
     def exclude_indexes(self, indexes: list[str]):
         """
         Exclude indexes.
         """
-        self._check_dot(indexes)
+        self._check_schema(indexes)
         self._filter[self.EXCLUDE_INDEX].update(indexes)
 
     def write(self, f):
