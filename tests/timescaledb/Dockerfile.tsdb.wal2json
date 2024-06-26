@@ -1,0 +1,11 @@
+# based on https://github.com/eulerto/wal2json/issues/68#issuecomment-529136552
+
+FROM postgres:15-alpine AS builder
+
+RUN apk add --no-cache build-base git clang15
+RUN git clone https://github.com/eulerto/wal2json.git
+WORKDIR wal2json
+RUN make with_llvm=no && make with_llvm=no install
+
+FROM timescale/timescaledb:latest-pg15
+COPY --from=builder /wal2json/wal2json.so /usr/local/lib/postgresql/

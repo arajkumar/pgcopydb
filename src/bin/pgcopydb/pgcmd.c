@@ -1402,6 +1402,11 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 		/* ignore errors, that's stuff we don't support yet (no need to) */
 		(void) parse_archive_acl_or_comment(token.ptr, item);
 	}
+	else if (item->desc == ARCHIVE_TAG_EXTENSION)
+	{
+		/* ignore errors, that's stuff we don't support yet (no need to) */
+		(void) parse_archive_extension(token.ptr, item);
+	}
 	else
 	{
 		/* 10. restore list name */
@@ -1527,6 +1532,56 @@ tokenize_archive_list_entry(ArchiveToken *token)
 	}
 
 	token->type = ARCHIVE_TOKEN_UNKNOWN;
+	return true;
+}
+
+
+/*
+ * parse_archive_extension parses the EXTENSION entry of the
+ * pg_restore archive catalog TOC.
+ *
+ * 5; 3079 80839 EXTENSION - aiven_extras
+ *
+ * Here the - is for the namespace, which doesn't apply.
+ *
+ * The ptr argument is positioned after the space following EXTENSION tag.
+ */
+bool
+parse_archive_extension(char *ptr, ArchiveContentItem *item)
+{
+	log_trace("parse_archive_extension: \"%s\"", ptr);
+
+	ArchiveToken token = { .ptr = ptr };
+
+	if (!tokenize_archive_list_entry(&token) ||
+		token.type != ARCHIVE_TOKEN_DASH)
+	{
+		log_error("Failed to parse Archive TOC: %s", ptr);
+		return false;
+	}
+
+	/* space */
+	if (!tokenize_archive_list_entry(&token) ||
+		token.type != ARCHIVE_TOKEN_SPACE)
+	{
+		log_error("Failed to parse Archive TOC: %s", ptr);
+		return false;
+	}
+
+	/* Now parse the extension name */
+	char *extname = token.ptr;
+	int len = strlen(extname);
+
+	item->restoreListName = (char *) calloc(len, sizeof(char));
+
+	if (item->restoreListName == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	strlcpy(item->restoreListName, extname, len);
+
 	return true;
 }
 

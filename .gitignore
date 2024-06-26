@@ -42,3 +42,5 @@ lib*.pc
 /GIT-VERSION-FILE
 /version
 ci/Dockerfile.docs
+
+/src/bin/timescale/__pycache__/

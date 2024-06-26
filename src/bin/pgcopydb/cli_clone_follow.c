@@ -24,6 +24,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 #define PGCOPYDB_CLONE_GETOPTS_HELP \
 	"  --source                      Postgres URI to the source database\n" \
@@ -216,6 +217,13 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs->connStrings.source_pguri))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	/*
 	 * When using pgcopydb clone --follow --restart we first cleanup the
 	 * previous setup, and that includes dropping the replication slot.
@@ -389,6 +397,13 @@ cli_follow(int argc, char **argv)
 						   copyDBoptions.stdIn,
 						   copyDBoptions.stdOut,
 						   logSQL))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	PGSQL src;
+	if (!timescale_init(&src, copySpecs.connStrings.source_pguri))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);

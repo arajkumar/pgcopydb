@@ -31,6 +31,7 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 typedef struct TestDecodingHeader
@@ -175,6 +176,24 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 			log_debug("Filtering out message for schema \"%s\": %s",
 					  header.table.nspname,
 					  context->buffer);
+			metadata->filterOut = true;
+		}
+
+		if (!timescale_allow_relation(header.table.nspname, header.table.relname))
+		{
+			log_warn("Filtering out message action %s for %s.%s",
+					 StreamActionToString(header.action),
+					 header.table.nspname, header.table.relname);
+
+			metadata->filterOut = true;
+		}
+
+		if (header.action == STREAM_ACTION_TRUNCATE &&
+			timescale_is_chunk(header.table.nspname, header.table.relname))
+		{
+			log_warn("Filtering out message action TRUNCATE for %s.%s",
+					 header.table.nspname, header.table.relname);
+
 			metadata->filterOut = true;
 		}
 
@@ -352,10 +371,6 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	header->table.nspname = strndup(idp, dot - idp);
 	header->table.relname = strndup(dot + 1, sep - dot - 1);
 
-	sformat(header->qname, sizeof(header->qname), "%s.%s",
-			header->table.nspname,
-			header->table.relname);
-
 	/* now grab the action */
 	char action[BUFSIZE] = { 0 };
 	strlcpy(action, acp, end - acp + 1);
@@ -384,6 +399,31 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 				  message);
 		return false;
 	}
+
+	/* Map if the relation is chunk */
+	if (timescale_is_chunk(header->table.nspname, header->table.relname) &&
+		header->action != STREAM_ACTION_TRUNCATE)
+	{
+		char nspname[PG_NAMEDATALEN] = { 0 };
+		char relname[PG_NAMEDATALEN] = { 0 };
+
+		if (!timescale_chunk_to_hypertable(header->table.nspname,
+										   header->table.relname,
+										   nspname,
+										   relname))
+		{
+			log_error("Failed to map chunk %s.%s to hypertable",
+					  header->table.nspname, header->table.relname);
+			return false;
+		}
+
+		strlcpy(header->table.nspname, nspname, sizeof(nspname));
+		strlcpy(header->table.relname, relname, sizeof(relname));
+	}
+
+	sformat(header->qname, sizeof(header->qname), "%s.%s",
+			header->table.nspname,
+			header->table.relname);
 
 	return true;
 }

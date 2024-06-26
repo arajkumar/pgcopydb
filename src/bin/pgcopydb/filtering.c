@@ -152,6 +152,7 @@ parse_filters(const char *filename, SourceFilters *filters)
 	{
 		{ "include-only-schema", SOURCE_FILTER_INCLUDE_ONLY_SCHEMA, NULL },
 		{ "exclude-schema", SOURCE_FILTER_EXCLUDE_SCHEMA, NULL },
+		{ "exclude-extension", SOURCE_FILTER_EXCLUDE_EXTENSION, NULL },
 		{
 			"exclude-table",
 			SOURCE_FILTER_EXCLUDE_TABLE,
@@ -301,6 +302,28 @@ parse_filters(const char *filename, SourceFilters *filters)
 							  table->relname);
 				}
 
+				break;
+			}
+
+			case SOURCE_FILTER_EXCLUDE_EXTENSION:
+			{
+				filters->excludeExtensionList.count = optionCount;
+				filters->excludeExtensionList.array =
+					(SourceFilterExtension *) calloc(optionCount,
+													 sizeof(SourceFilterExtension));
+
+				for (int o = 0; o < optionCount; o++)
+				{
+					SourceFilterExtension *extension =
+						&(filters->excludeExtensionList.array[o]);
+
+					const char *optionName =
+						ini_property_name(ini, sectionIndex, o);
+
+					strlcpy(extension->extname, optionName, sizeof(extension->extname));
+
+					log_debug("excluding extension \"%s\"", extension->extname);
+				}
 				break;
 			}
 

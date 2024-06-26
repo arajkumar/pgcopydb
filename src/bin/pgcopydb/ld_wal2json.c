@@ -31,9 +31,11 @@
 #include "signals.h"
 #include "string_utils.h"
 #include "summary.h"
+#include "timescale.h"
 
 
 static bool SetMessageRelation(JSON_Object *jsobj,
+							   LogicalMessageMetadata *metadata,
 							   LogicalMessageRelation *table,
 							   PGSQL *pgsql);
 static bool SetColumnNamesAndValues(LogicalMessageTuple *tuple,
@@ -101,6 +103,32 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 		metadata->xid = (uint32_t) xid;
 	}
 
+	if (metadata->action == STREAM_ACTION_INSERT ||
+		metadata->action == STREAM_ACTION_UPDATE ||
+		metadata->action == STREAM_ACTION_DELETE ||
+		metadata->action == STREAM_ACTION_TRUNCATE)
+	{
+		const char *nspname = json_object_get_string(jsobj, "schema");
+		const char *relname = json_object_get_string(jsobj, "table");
+
+		if (!timescale_allow_relation(nspname, relname))
+		{
+			log_warn("Filtering out message action %s for %s.%s",
+					 StreamActionToString(metadata->action),
+					 nspname, relname);
+
+			metadata->filterOut = true;
+		}
+
+		if (metadata->action == STREAM_ACTION_TRUNCATE &&
+			timescale_is_chunk(nspname, relname))
+		{
+			log_warn("Filtering out message action TRUNCATE for %s.%s",
+					 nspname, relname);
+
+			metadata->filterOut = true;
+		}
+	}
 
 	return true;
 }
@@ -128,7 +156,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
 
 	PGSQL *pgsql = privateContext->transformPGSQL;
 
-	if (!SetMessageRelation(jsobj, &table, pgsql))
+	if (!SetMessageRelation(jsobj, metadata, &table, pgsql))
 	{
 		log_error("Failed to parse truncated message missing "
 				  "schema or table property: %s",
@@ -277,6 +305,7 @@ parseWal2jsonMessage(StreamContext *privateContext,
  */
 static bool
 SetMessageRelation(JSON_Object *jsobj,
+				   LogicalMessageMetadata *metadata,
 				   LogicalMessageRelation *table,
 				   PGSQL *pgsql)
 {
@@ -290,6 +319,28 @@ SetMessageRelation(JSON_Object *jsobj,
 	if (schema == NULL || relname == NULL)
 	{
 		return false;
+	}
+
+	char chunk_schema[PG_NAMEDATALEN] = { 0 };
+	char chunk_table[PG_NAMEDATALEN] = { 0 };
+
+	if (timescale_is_chunk(schema, relname) &&
+		(metadata->action == STREAM_ACTION_INSERT ||
+		 metadata->action == STREAM_ACTION_UPDATE ||
+		 metadata->action == STREAM_ACTION_DELETE))
+	{
+		if (!timescale_chunk_to_hypertable(schema,
+										   relname,
+										   chunk_schema,
+										   chunk_table))
+		{
+			log_error("Failed to map chunk %s.%s to hypertable",
+					  table->nspname, table->relname);
+			return false;
+		}
+
+		schema = chunk_schema;
+		relname = chunk_table;
 	}
 
 	table->nspname = pgsql_escape_identifier(pgsql, schema);
@@ -387,11 +438,13 @@ SetColumnNamesAndValues(LogicalMessageTuple *tuple,
 
 			case JSONNumber:
 			{
-				double x = json_value_get_number(jsval);
+				const char *x = json_value_get_number_as_string(jsval);
 
-				valueColumn->oid = FLOAT8OID;
-				valueColumn->val.float8 = x;
+				valueColumn->oid = TEXTOID;
+				valueColumn->val.str = strdup(x);
 				valueColumn->isNull = false;
+				valueColumn->isQuoted = false;
+
 				break;
 			}
 

@@ -341,6 +341,8 @@ bool copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions);
 
 bool copydb_parse_extensions_requirements(CopyDataSpec *copySpecs,
 										  char *filename);
+bool copydb_skip_extension(CopyDataSpec *copySpecs, char *extname);
+
 
 /* indexes.c */
 bool copydb_start_index_supervisor(CopyDataSpec *specs);

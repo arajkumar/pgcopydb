@@ -16,9 +16,40 @@
 #include "signals.h"
 
 
+static bool prepareTableSpecsForExtension(CopyTableDataSpec *tableSpecs,
+										  CopyDataSpec *copySpecs,
+										  SourceExtensionConfig *config);
 static bool copydb_copy_ext_table(PGSQL *src, PGSQL *dst, char *qname, char *condition);
 static bool copydb_copy_ext_sequence(PGSQL *src, PGSQL *dst, char *qname);
 static bool copydb_copy_extensions_hook(void *ctx, SourceExtension *ext);
+
+
+/*
+ * prepareTableSpecsForExtension prepares the table specs for the extension
+ * configuration table.
+ */
+static bool
+prepareTableSpecsForExtension(CopyTableDataSpec *tableSpecs,
+							  CopyDataSpec *copySpecs,
+							  SourceExtensionConfig *config)
+{
+	SourceTable table = { 0 };
+
+	strlcpy(table.nspname, config->nspname, sizeof(table.nspname));
+	strlcpy(table.relname, config->relname, sizeof(table.relname));
+	sformat(table.qname, sizeof(table.qname),
+			"%s.%s",
+			config->nspname, config->relname);
+	table.oid = config->reloid;
+
+	if (!copydb_init_table_specs(tableSpecs, copySpecs, &table, 0))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
 
 
 /*
@@ -84,6 +115,8 @@ typedef struct CopyExtensionsContext
 	PGSQL *dst;
 	bool createExtensions;
 	ExtensionReqs *reqs;
+
+	CopyDataSpec *copySpecs;
 } CopyExtensionsContext;
 
 
@@ -136,7 +169,8 @@ copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 		.src = &(copySpecs->sourceSnapshot.pgsql),
 		.dst = &dst,
 		.createExtensions = createExtensions,
-		.reqs = copySpecs->extRequirements
+		.reqs = copySpecs->extRequirements,
+		.copySpecs = copySpecs
 	};
 
 	if (!catalog_iter_s_extension(filtersDB,
@@ -222,6 +256,12 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 	CopyExtensionsContext *context = (CopyExtensionsContext *) ctx;
 	PGSQL *src = context->src;
 	PGSQL *dst = context->dst;
+	CopyDataSpec *copySpecs = context->copySpecs;
+
+	if (copydb_skip_extension(copySpecs, ext->extname))
+	{
+		return true;
+	}
 
 	if (context->createExtensions)
 	{
@@ -281,6 +321,36 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 			sformat(qname, sizeof(qname), "%s.%s",
 					config->nspname,
 					config->relname);
+			CopyTableDataSpec tableSpecs = { 0 };
+
+			if (!prepareTableSpecsForExtension(&tableSpecs, copySpecs, config))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			/*
+			 * Skip tables that have been entirely done already on a previous run.
+			 */
+			bool isDone = false;
+
+			if (!copydb_table_create_lockfile(copySpecs,
+											  &tableSpecs,
+											  dst,
+											  &isDone))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			if (isDone)
+			{
+				log_info("Skipping table %s (%u), already done on a previous run",
+						 tableSpecs.sourceTable->qname,
+						 tableSpecs.sourceTable->oid);
+				continue;
+			}
+
 
 			switch (config->relkind)
 			{
@@ -343,6 +413,12 @@ copydb_copy_extensions_hook(void *ctx, SourceExtension *ext)
 					return false;
 				}
 			}
+
+			if (!copydb_mark_table_as_done(copySpecs, &tableSpecs))
+			{
+				/* errors have already been logged */
+				return false;
+			}
 		}
 	}
 
@@ -404,4 +480,33 @@ copydb_parse_extensions_requirements(CopyDataSpec *copySpecs, char *filename)
 	copySpecs->extRequirements = reqs;
 
 	return true;
+}
+
+
+/*
+ * copydb_skip_extension checks if the extension should be skipped.
+ * It returns true if the extension should be skipped, false otherwise.
+ */
+bool
+copydb_skip_extension(CopyDataSpec *copySpecs, char *extname)
+{
+	if (copySpecs->skipExtensions)
+	{
+		log_info("Skipping extension \"%s\"", extname);
+		return true;
+	}
+
+	SourceFilterExtensionList *filterExtensions =
+		&(copySpecs->filters.excludeExtensionList);
+	for (int i = 0; i < filterExtensions->count; i++)
+	{
+		SourceFilterExtension *filter = &(filterExtensions->array[i]);
+
+		if (streq(filter->extname, extname))
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
