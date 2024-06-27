@@ -385,6 +385,9 @@ def _filter_constraint(table_name, args, hypertable_info):
 def try_creating_incompatible_objects(args, hypertable_info):
     logger.info("Creating indexes and constraints on the target hypertable ...")
 
+    # First build all indexes in parallel followed by constraints. Otherwise,
+    # constraint building will block the index building as it takes table lock.
+
     # Building indexes in parallel across tables
     with Pool(processes=int(args.index_jobs)) as pool:
         # Prepare the list of indexes to create, excluding constraints.
@@ -437,13 +440,16 @@ def show_hypertable_incompatibility(hypertable_info, error = True):
                 incompatible = True
 
     if incompatible and error:
-        logger.error("Please resolve the above issues on source database "
-                     "before proceeding.")
-        logger.error("Alternatively, you can skip problematic indexes/constraints "
-                     "using the --skip-index flag. Beware that "
-                     "ignoring indexes might slow down the UPDATE/DELETE "
-                     "replication on the target. You can choose to create them "
-                     "manually to avoid the problem.")
+        message = f"""
+{"*" * 72}
+You can do one of the following to resolve the issue:
+    1) Skip the compatibility check using the `--skip-hypertable-compatibility-check` flag and manually create the indexes/constraints on the target when the tool fails to create them. This is a most optimal way to resolve the issue.
+    2) Fix the incompatible indexes/constraints on the source to include hypertable dimensions and restart the migration from the beginning.
+    3) Skip the incompatible indexes/constraints using the `--skip-hypertable-incompatible-objects` flag. Beware, skipping them might slow down the replication of the UPDATE/DELETE operations on the target.
+    4) Skip the incompatible indexes/constraints using the `--skip-index` flag and resume the migration.
+{"*" * 72}
+"""
+        log_func(message)
 
 
 def check_hypertable_incompatibility(args):
