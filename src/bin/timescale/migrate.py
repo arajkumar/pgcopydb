@@ -344,16 +344,16 @@ def _create_index(index, args):
 
     create_index = index['index_definition']
 
-    # Add IF NOT EXISTS to the index creation statement
-    if create_index.startswith("CREATE UNIQUE INDEX"):
-        create_index = create_index.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS")
-    elif create_index.startswith("CREATE INDEX"):
-        create_index = create_index.replace("CREATE INDEX", "CREATE INDEX IF NOT EXISTS")
-    else:
-        raise ValueError(f"Unexpected index definition: {create_index}")
-
+    sql = f"""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = '{index['idxrelname']}' AND schemaname = '{index['idxnspname']}') THEN
+            EXECUTE '{create_index}';
+        END IF;
+    END $$;
+    """
     logger.info(f"Creating index {create_index}")
-    psql_cmd(conn=args.target, sql=create_index)
+    psql_cmd(conn=args.target, sql=sql)
     return True
 
 
@@ -540,15 +540,6 @@ def migrate_existing_data_from_pg_to_tsdb(args):
 
     hypertable_info = check_hypertable_incompatibility(args)
 
-    # Always skip primary key, unique constraints and unique indexes
-    # The way pgcopydb build the above objects is not compatible with hypertables.
-    skip_index = filter_incompatible_index_constraint(hypertable_info)
-    if args.skip_index:
-        args.skip_index.extend(skip_index)
-    else:
-        args.skip_index = skip_index
-    filter_args = prepare_filters(args)
-
     if hypertable_has_incompatible_objects(hypertable_info):
         if args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check:
             show_hypertable_incompatibility(hypertable_info, error=False)
@@ -557,6 +548,15 @@ def migrate_existing_data_from_pg_to_tsdb(args):
             sys.exit(1)
 
     stop_progress = monitor_db_sizes()
+
+    # Always skip primary key, unique constraints and unique indexes
+    # The way pgcopydb build the above objects is not compatible with hypertables.
+    skip_index = filter_incompatible_index_constraint(hypertable_info)
+    if args.skip_index:
+        args.skip_index.extend(skip_index)
+    else:
+        args.skip_index = skip_index
+    filter_args = prepare_filters(args)
 
     with timeit("Copy table data"):
         copy_table_data = " ".join(["pgcopydb",
