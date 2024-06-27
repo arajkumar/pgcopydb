@@ -8,7 +8,7 @@ import datetime
 from pathlib import Path
 
 from utils import create_dirs
-from version import SCRIPT_VERSION
+from version import SCRIPT_VERSION, nudge_user_to_update
 from snapshot import snapshot
 from migrate import migrate
 from clean import clean
@@ -28,6 +28,8 @@ def setup_logging(work_dir: Path):
     file_handler = logging.FileHandler(work_dir / f"logs/main_{INIT_TIME}.log")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+
+    return logger
 
 
 def main():
@@ -109,7 +111,10 @@ def main():
 
     pgcopydb_init_env(args)
     create_dirs(args.dir)
-    setup_logging(args.dir)
+    logger = setup_logging(args.dir)
+
+    logger.info(f"Running live-migration {SCRIPT_VERSION}")
+    nudge_user_to_update()
 
     match args.command:
         case 'snapshot':
