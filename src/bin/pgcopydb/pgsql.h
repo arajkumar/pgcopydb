@@ -324,7 +324,7 @@ bool validate_connection_string(const char *connectionString);
 
 bool pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode);
 
-bool pgsql_truncate(PGSQL *pgsql, const char *qname, bool only);
+bool pgsql_truncate(PGSQL *pgsql, const char *qname, bool includeChilds);
 
 bool pgsql_is_table_partition_root(PGSQL *pgsql,
 								   const char *nspname,
@@ -341,7 +341,7 @@ typedef struct CopyArgs
 	bool truncate;
 
 	/* By default TRUNCATE ONLY is used, but we can also truncate descendants */
-	bool truncateDescendants;
+	bool truncateChilds;
 	bool freeze;
 	uint64_t bytesTransmitted;
 } CopyArgs;

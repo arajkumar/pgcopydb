@@ -1,3 +1,4 @@
+#include "copydb.h"
 #include "timescale.h"
 #include "log.h"
 #include "string_utils.h"
@@ -282,10 +283,11 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 
 
 bool
-timescale_is_hypertable_root(PGSQL *pgsql,
-							 const char *nspname,
-							 const char *relname,
-							 bool *isRoot)
+copydb_is_hypertable(PGSQL *pgsql,
+					 const char *nspname,
+					 const char *relname,
+					 bool restoring,
+					 bool *isHypertable)
 {
 	bool exists = false;
 
@@ -298,7 +300,7 @@ timescale_is_hypertable_root(PGSQL *pgsql,
 	if (!exists)
 	{
 		/* The table does not exist, so it cannot be a hypertable root */
-		*isRoot = false;
+		*isHypertable = false;
 		return true;
 	}
 
@@ -314,17 +316,18 @@ timescale_is_hypertable_root(PGSQL *pgsql,
 		 * TimescaleDB, and the hypertable is not yet fully migrated.
 		 */
 		"   where "
-		"     current_setting('timescaledb.restoring') = 'off' "
-		"     and hypertable_schema=$1 "
+		"     hypertable_schema=$1 "
 		"     and hypertable_name=$2 "
+		"     and current_setting('timescaledb.restoring')::bool = $3"
 		"   ) ";
 
-	int paramCount = 2;
-	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
-	const char *paramValues[2] = { 0 };
+	int paramCount = 3;
+	const Oid paramTypes[3] = { TEXTOID, TEXTOID, BOOLOID };
+	const char *paramValues[3] = { 0 };
 
 	paramValues[0] = nspname;
 	paramValues[1] = relname;
+	paramValues[2] = restoring ? "on" : "off";
 
 	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
 
@@ -343,7 +346,7 @@ timescale_is_hypertable_root(PGSQL *pgsql,
 		return false;
 	}
 
-	*isRoot = context.boolVal;
+	*isHypertable = context.boolVal;
 
 	return true;
 }

@@ -29,14 +29,14 @@
 
 static bool copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table);
 
-static bool copydb_find_truncate_decendants(PGSQL *pgsql,
-											SourceTable *table,
-											bool *decendants);
+static bool copydb_table_has_childs(PGSQL *pgsql,
+									SourceTable *table,
+									bool *childs);
 
 static bool
-copydb_find_truncate_decendants(PGSQL *pgsql,
-								SourceTable *table,
-								bool *decendants)
+copydb_table_has_childs(PGSQL *pgsql,
+						SourceTable *table,
+						bool *childs)
 {
 	bool isPartitionRoot = false;
 
@@ -65,17 +65,20 @@ copydb_find_truncate_decendants(PGSQL *pgsql,
 	 * This scenario is only possible when the target table is a hypertable
 	 * but the source table is not.
 	 */
-	if (!isPartitionRoot && !timescale_is_hypertable_root(pgsql,
-														  table->nspname,
-														  table->relname,
-														  &isPartitionRoot))
+	bool isHyperTable = false;
+
+	if (!isPartitionRoot && !copydb_is_hypertable(pgsql,
+												  table->nspname,
+												  table->relname,
+												  false, /* restoring */
+												  &isHyperTable))
 	{
 		log_error("Failed to check if \"%s\" is a hypertable", table->qname);
 
 		return false;
 	}
 
-	*decendants = isPartitionRoot;
+	*childs = isPartitionRoot || isHyperTable;
 
 	return true;
 }
@@ -633,7 +636,7 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 		{
 			bool decendants = false;
 
-			if (!copydb_find_truncate_decendants(dst, table, &decendants))
+			if (!copydb_table_has_childs(dst, table, &decendants))
 			{
 				/* errors have already been logged */
 				return false;
@@ -1190,7 +1193,7 @@ copydb_table_create_lockfile(CopyDataSpec *specs,
 	args->truncate = false;     /* default value, see below */
 	args->freeze = tableSpecs->sourceTable->partition.partCount <= 1;
 	args->bytesTransmitted = 0;
-	args->truncateDescendants = false;
+	args->truncateChilds = false;
 
 	/*
 	 * Check to see if we want to TRUNCATE the table and benefit from the COPY
@@ -1218,16 +1221,16 @@ copydb_table_create_lockfile(CopyDataSpec *specs,
 
 		bool decendants = false;
 
-		if (!copydb_find_truncate_decendants(dst,
-											 tableSpecs->sourceTable,
-											 &decendants))
+		if (!copydb_table_has_childs(dst,
+									 tableSpecs->sourceTable,
+									 &decendants))
 		{
 			/* errors have already been logged */
 			return false;
 		}
 
 		args->truncate = granted;
-		args->truncateDescendants = decendants;
+		args->truncateChilds = decendants;
 		args->freeze = granted && !decendants;
 	}
 
