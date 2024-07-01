@@ -183,19 +183,13 @@ stream_apply_setup(StreamSpecs *specs, StreamApplyContext *context)
 {
 	/* init our context */
 	if (!stream_apply_init_context(context,
+								   specs->sourceDB,
 								   &(specs->paths),
 								   specs->connStrings,
 								   specs->origin,
 								   specs->endpos))
 	{
 		/* errors have already been logged */
-		return false;
-	}
-
-	/* read-in the previous lsn tracking file, if it exists */
-	if (!stream_apply_read_lsn_tracking(context))
-	{
-		log_error("Failed to read LSN tracking file");
 		return false;
 	}
 
@@ -285,25 +279,15 @@ stream_apply_cleanup(StreamApplyContext *context)
 
 
 /*
- * stream_apply_wait_for_sentinel fetches the current pgcopydb sentinel values
- * on the source database: the catchup processing only gets to start when the
- * sentinel "apply" column has been set to true.
+ * stream_apply_wait_for_sentinel fetches the current pgcopydb sentinel values:
+ * the catchup processing only gets to start when the sentinel "apply" column
+ * has been set to true.
  */
 bool
 stream_apply_wait_for_sentinel(StreamSpecs *specs, StreamApplyContext *context)
 {
-	PGSQL src = { 0 };
 	bool firstLoop = true;
 	CopyDBSentinel sentinel = { 0 };
-
-	if (!pgsql_init(&src, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* skip logging the sentinel queries, we log_debug the values fetched */
-	src.logSQL = context->logSQL;
 
 	/* make sure context->apply is false before entering the loop */
 	context->apply = false;
@@ -319,7 +303,7 @@ stream_apply_wait_for_sentinel(StreamSpecs *specs, StreamApplyContext *context)
 		}
 
 		/* this reconnects on each loop iteration, every 10s by default */
-		if (!pgsql_get_sentinel(&src, &sentinel))
+		if (!sentinel_get(specs->sourceDB, &sentinel))
 		{
 			log_warn("Retrying to fetch pgcopydb sentinel values in %ds",
 					 CATCHINGUP_SLEEP_MS / 10);
@@ -342,7 +326,7 @@ stream_apply_wait_for_sentinel(StreamSpecs *specs, StreamApplyContext *context)
 		{
 			context->endpos = sentinel.endpos;
 		}
-		else
+		else if (context->endpos != sentinel.endpos)
 		{
 			log_warn("Sentinel endpos is %X/%X, overriden by --endpos %X/%X",
 					 LSN_FORMAT_ARGS(sentinel.endpos),
@@ -401,25 +385,6 @@ stream_apply_wait_for_sentinel(StreamSpecs *specs, StreamApplyContext *context)
 bool
 stream_apply_sync_sentinel(StreamApplyContext *context, bool findDurableLSN)
 {
-	PGSQL src = { 0 };
-	CopyDBSentinel sentinel = { 0 };
-
-	/* now is a good time to write the LSN tracking to disk */
-	if (!stream_apply_write_lsn_tracking(context))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!pgsql_init(&src, context->connStrings->source_pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/* limit the amount of logging of the apply process */
-	src.logSQL = context->logSQL;
-
 	uint64_t durableLSN = InvalidXLogRecPtr;
 
 	/*
@@ -439,7 +404,9 @@ stream_apply_sync_sentinel(StreamApplyContext *context, bool findDurableLSN)
 		}
 	}
 
-	if (!pgsql_sync_sentinel_apply(&src, durableLSN, &sentinel))
+	CopyDBSentinel sentinel = { 0 };
+
+	if (!sentinel_sync_apply(context->sourceDB, durableLSN, &sentinel))
 	{
 		log_warn("Failed to sync progress with the pgcopydb sentinel");
 		return true;
@@ -448,86 +415,17 @@ stream_apply_sync_sentinel(StreamApplyContext *context, bool findDurableLSN)
 	context->apply = sentinel.apply;
 	context->endpos = sentinel.endpos;
 	context->startpos = sentinel.startpos;
-
-	return true;
-}
-
-
-/*
- * stream_apply_send_sync_sentinel sends a query to sync with the pgcopydb
- * sentinel table using the libpq async API. Use the associated function
- * stream_apply_fetch_sync_sentinel to check for availability of the result and
- * fetch it when it's available.
- */
-bool
-stream_apply_send_sync_sentinel(StreamApplyContext *context)
-{
-	PGSQL *src = &(context->src);
-
-	if (context->sentinelQueryInProgress)
-	{
-		log_error("BUG: stream_apply_send_sync_sentinel already in progress");
-		return false;
-	}
-
-	/* we're going to keep the connection around */
-	context->src.connectionStatementType = PGSQL_CONNECTION_MULTI_STATEMENT;
-
-	/* limit the amount of logging of the apply process */
-	src->logSQL = true;
-
-	uint64_t durableLSN = InvalidXLogRecPtr;
-
-	if (!stream_apply_find_durable_lsn(context, &durableLSN))
-	{
-		log_debug("Skipping sentinel replay_lsn update, "
-				  "failed to find a durable LSN matching current flushLSN");
-		return true;
-	}
-
-	if (!pgsql_send_sync_sentinel_apply(src, durableLSN))
-	{
-		log_warn("Failed to sync progress with the pgcopydb sentinel");
-		return true;
-	}
-
 	context->sentinelSyncTime = time(NULL);
-	context->sentinelQueryInProgress = true;
 
-	return true;
-}
-
-
-/*
- * stream_apply_fetch_sync_sentinel checks to see if the result of the
- * pgcopydb sentinel sync query is available and fetches it then.
- */
-bool
-stream_apply_fetch_sync_sentinel(StreamApplyContext *context)
-{
-	PGSQL *src = &(context->src);
-
-	bool retry;
-	CopyDBSentinel sentinel = { 0 };
-
-	if (!pgsql_fetch_sync_sentinel_apply(src, &retry, &sentinel))
-	{
-		log_error("Failed to fetch sentinel update query results");
-		return false;
-	}
-
-	if (!retry)
-	{
-		context->sentinelQueryInProgress = false;
-
-		/* also disconnect between async queries */
-		(void) pgsql_finish(&(context->src));
-
-		context->apply = sentinel.apply;
-		context->endpos = sentinel.endpos;
-		context->startpos = sentinel.startpos;
-		context->replay_lsn = sentinel.replay_lsn;
-	}
+	log_debug("stream_apply_sync_sentinel: "
+			  "write_lsn %X/%X flush_lsn %X/%X replay_lsn %X/%X "
+			  "startpos %X/%X endpos %X/%X apply %s",
+			  LSN_FORMAT_ARGS(sentinel.write_lsn),
+			  LSN_FORMAT_ARGS(sentinel.flush_lsn),
+			  LSN_FORMAT_ARGS(sentinel.replay_lsn),
+			  LSN_FORMAT_ARGS(context->startpos),
+			  LSN_FORMAT_ARGS(context->endpos),
+			  context->apply ? "enabled" : "disabled");
 
 	return true;
 }
@@ -545,46 +443,50 @@ stream_apply_file(StreamApplyContext *context)
 
 	strlcpy(content.filename, context->sqlFileName, sizeof(content.filename));
 
-	if (!read_file(content.filename, &(content.buffer), &size))
+	char *contents = NULL;
+
+	if (!read_file(content.filename, &contents, &size))
 	{
 		/* errors have already been logged */
 		return false;
 	}
 
-	content.count = countLines(content.buffer);
-	content.lines = (char **) calloc(content.count, sizeof(char *));
-	content.count = splitLines(content.buffer, content.lines, content.count);
-
-	if (content.lines == NULL)
+	if (!splitLines(&(content.lbuf), contents))
 	{
-		log_error(ALLOCATION_FAILED_ERROR);
+		/* errors have already been logged */
 		return false;
 	}
 
 	log_info("Replaying changes from file \"%s\"", context->sqlFileName);
 
-	log_debug("Read %d lines in file \"%s\"",
-			  content.count,
+	log_debug("Read %lld lines in file \"%s\"",
+			  (long long) content.lbuf.count,
 			  content.filename);
 
+	/*
+	 * If the file contains zero lines, we're done already, Also malloc(zero)
+	 * leads to "corrupted size vs. prev_size" run-time errors.
+	 */
+	if (content.lbuf.count == 0)
+	{
+		return true;
+	}
+
 	LogicalMessageMetadata *mArray =
-		(LogicalMessageMetadata *) calloc(content.count,
+		(LogicalMessageMetadata *) calloc(content.lbuf.count,
 										  sizeof(LogicalMessageMetadata));
 
 	LogicalMessageMetadata *lastCommit = NULL;
 
 	/* parse the SQL commands metadata from the SQL file */
-	for (int i = 0; i < content.count && !context->reachedEndPos; i++)
+	for (uint64_t i = 0; i < content.lbuf.count && !context->reachedEndPos; i++)
 	{
-		const char *sql = content.lines[i];
+		const char *sql = content.lbuf.lines[i];
 		LogicalMessageMetadata *metadata = &(mArray[i]);
 
 		if (!parseSQLAction(sql, metadata))
 		{
 			/* errors have already been logged */
-			free(content.buffer);
-			free(content.lines);
-
 			return false;
 		}
 
@@ -592,17 +494,14 @@ stream_apply_file(StreamApplyContext *context)
 		 * The SWITCH WAL command should always be the last line of the file.
 		 */
 		if (metadata->action == STREAM_ACTION_SWITCH &&
-			i != (content.count - 1))
+			i != (content.lbuf.count - 1))
 		{
-			log_error("SWITCH command for LSN %X/%X found in \"%s\" line %d, "
-					  "before last line %d",
+			log_error("SWITCH command for LSN %X/%X found in \"%s\" line %lld, "
+					  "before last line %lld",
 					  LSN_FORMAT_ARGS(metadata->lsn),
 					  content.filename,
-					  i + 1,
-					  content.count);
-
-			free(content.buffer);
-			free(content.lines);
+					  (long long) i + 1,
+					  (long long) content.lbuf.count);
 
 			return false;
 		}
@@ -614,9 +513,9 @@ stream_apply_file(StreamApplyContext *context)
 	}
 
 	/* replay the SQL commands from the SQL file */
-	for (int i = 0; i < content.count && !context->reachedEndPos; i++)
+	for (uint64_t i = 0; i < content.lbuf.count && !context->reachedEndPos; i++)
 	{
-		const char *sql = content.lines[i];
+		const char *sql = content.lbuf.lines[i];
 		LogicalMessageMetadata *metadata = &(mArray[i]);
 
 		/* last commit of a file requires synchronous_commit on */
@@ -628,11 +527,9 @@ stream_apply_file(StreamApplyContext *context)
 					  "see above for details",
 					  content.filename);
 
-			free(content.buffer);
-			free(content.lines);
-
 			return false;
 		}
+
 
 		/* rate limit to 1 pipeline sync per second */
 		if ((metadata->action == STREAM_ACTION_COMMIT ||
@@ -642,10 +539,6 @@ stream_apply_file(StreamApplyContext *context)
 			/* fetch results until done */
 			if (!pgsql_sync_pipeline(&(context->applyPgConn)))
 			{
-				/* errors have already been logged */
-				free(content.buffer);
-				free(content.lines);
-
 				log_error("Failed to sync the pipeline, see previous error for "
 						  "details");
 				return false;
@@ -653,22 +546,13 @@ stream_apply_file(StreamApplyContext *context)
 		}
 	}
 
-	/* always sync at the end of a file */
+	/* Always sync pipline at the end of file */
 	if (!pgsql_sync_pipeline(&(context->applyPgConn)))
 	{
-		/* errors have already been logged */
-		free(content.buffer);
-		free(content.lines);
-
 		log_error("Failed to sync the pipeline, see previous error for "
 				  "details");
 		return false;
 	}
-
-
-	/* free dynamic memory that's not needed anymore */
-	free(content.buffer);
-	free(content.lines);
 
 	/*
 	 * Each time we are done applying a file, we update our progress and
@@ -969,17 +853,6 @@ stream_apply_sql(StreamApplyContext *context,
 				return true;
 			}
 
-			/*
-			 * An idle source producing only KEEPALIVE should move the
-			 * replay_lsn forward.
-			 */
-			if (!stream_apply_track_insert_lsn(context, metadata->lsn))
-			{
-				log_error("Failed to track target LSN position, "
-						  "see above for details");
-				return false;
-			}
-
 			break;
 		}
 
@@ -1096,11 +969,21 @@ stream_apply_sql(StreamApplyContext *context,
 			}
 
 			/*
-			 * when the source is idle, the replay_lsn won't move forward.
-			 * Emit a message to move LSN forward.
+			 * Replication origin is handled differently by the postgres
+			 * backend to avoid database bloat and runtime overhead[1].
+			 * This optimization leads to persist origin progress only when
+			 * the txn modifies the state of the database. So, an empty txn
+			 * created to update KEEPALIVE LSN effectively ignored by the
+			 * backend leading to not updating the origin progress.
+			 *
+			 * To workaround this, we execute `SELECT txid_current()` query to
+			 * force the backend to update the origin progress.
+			 *
+			 * [1] https://www.postgresql.org/docs/current/replication-origins.html
 			 */
-			if (!pgsql_execute(applyPgConn,
-							   "select pg_logical_emit_message(true, 'pgcopydb', 'keepalive')"))
+			char *sql = "SELECT txid_current()";
+
+			if (!pgsql_execute(applyPgConn, sql))
 			{
 				/* errors have already been logged */
 				return false;
@@ -1145,13 +1028,6 @@ stream_apply_sql(StreamApplyContext *context,
 				break;
 			}
 
-			if (!stream_apply_track_insert_lsn(context, metadata->lsn))
-			{
-				log_error("Failed to track target LSN position, "
-						  "see above for details");
-				return false;
-			}
-
 			break;
 		}
 
@@ -1185,9 +1061,7 @@ stream_apply_sql(StreamApplyContext *context,
 					return false;
 				}
 
-				PreparedStmt *stmt =
-					(PreparedStmt *) calloc(1, sizeof(PreparedStmt));
-
+				stmt = (PreparedStmt *) calloc(1, sizeof(PreparedStmt));
 				stmt->hash = hash;
 				stmt->prepared = true;
 
@@ -1238,32 +1112,33 @@ stream_apply_sql(StreamApplyContext *context,
 			JSON_Array *jsArray = json_value_get_array(js);
 
 			int count = json_array_get_count(jsArray);
-			const char **paramValues =
-				(const char **) calloc(count, sizeof(char *));
 
-			if (paramValues == NULL)
+			if (0 < count)
 			{
-				log_error(ALLOCATION_FAILED_ERROR);
-				return false;
+				const char **paramValues =
+					(const char **) calloc(count, sizeof(char *));
+
+				if (paramValues == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
+
+				for (int i = 0; i < count; i++)
+				{
+					const char *value = json_array_get_string(jsArray, i);
+					paramValues[i] = value;
+				}
+
+				if (!pgsql_execute_prepared(applyPgConn, name,
+											count, paramValues,
+											NULL, NULL))
+				{
+					/* errors have already been logged */
+					return false;
+				}
 			}
 
-			for (int i = 0; i < count; i++)
-			{
-				const char *value = json_array_get_string(jsArray, i);
-				paramValues[i] = value;
-			}
-
-			if (!pgsql_execute_prepared(applyPgConn, name,
-										count, paramValues,
-										NULL, NULL))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
-			free(paramValues);
-			free(metadata->jsonBuffer);
-			json_value_free(js);
 
 			break;
 		}
@@ -1329,6 +1204,17 @@ setupConnection(PGSQL *pgsql, StreamApplyContext *context)
 
 	/* we also might want to skip logging any SQL query that we apply */
 	pgsql->logSQL = context->logSQL;
+
+	/*
+	 * Grab the Postgres server version on the target, we need to know that for
+	 * being able to call pgsql_current_wal_insert_lsn using the right Postgres
+	 * function name.
+	 */
+	if (!pgsql_server_version(pgsql))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	return true;
 }
@@ -1470,11 +1356,13 @@ setupReplicationOrigin(StreamApplyContext *context, bool logSQL)
  */
 bool
 stream_apply_init_context(StreamApplyContext *context,
+						  DatabaseCatalog *sourceDB,
 						  CDCPaths *paths,
 						  ConnStrings *connStrings,
 						  char *origin,
 						  uint64_t endpos)
 {
+	context->sourceDB = sourceDB;
 	context->paths = *paths;
 
 	/*
@@ -1615,11 +1503,9 @@ parseSQLAction(const char *query, LogicalMessageMetadata *metadata)
 		if (!parseMessageMetadata(metadata, message, json, true))
 		{
 			/* errors have already been logged */
-			json_value_free(json);
 			return false;
 		}
 
-		json_value_free(json);
 
 		return true;
 	}
@@ -1738,226 +1624,28 @@ parseSQLAction(const char *query, LogicalMessageMetadata *metadata)
 
 
 /*
- * stream_apply_track_insert_lsn tracks the current pg_current_wal_insert_lsn()
- * location on the target system right after a COMMIT; of a transaction that
- * was assigned sourceLSN on the source system.
- */
-bool
-stream_apply_track_insert_lsn(StreamApplyContext *context, uint64_t sourceLSN)
-{
-	LSNTracking *lsn_tracking = (LSNTracking *) calloc(1, sizeof(LSNTracking));
-
-	if (lsn_tracking == NULL)
-	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		return false;
-	}
-
-	lsn_tracking->sourceLSN = sourceLSN;
-
-	if (!pgsql_current_wal_insert_lsn(&(context->controlPgConn),
-									  &(lsn_tracking->insertLSN)))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	log_debug("stream_apply_track_insert_lsn: %X/%X :: %X/%X",
-			  LSN_FORMAT_ARGS(sourceLSN),
-			  LSN_FORMAT_ARGS(lsn_tracking->insertLSN));
-
-	/* update the linked list */
-	lsn_tracking->previous = context->lsnTrackingList;
-	context->lsnTrackingList = lsn_tracking;
-
-	return true;
-}
-
-
-/*
  * stream_apply_find_durable_lsn fetches the LSN for the current durable
- * location on the target system, and finds the greatest sourceLSN with an
- * associated insertLSN that's before the current (durable) write location.
+ * location on the target system using pg_replication_origin_progress.
  */
 bool
 stream_apply_find_durable_lsn(StreamApplyContext *context, uint64_t *durableLSN)
 {
-	PGSQL *pgsql = &(context->controlPgConn);
-
 	uint64_t flushLSN = InvalidXLogRecPtr;
 
-	if (!pgsql_current_wal_flush_lsn(pgsql, &flushLSN))
+	bool flush = true;
+
+	if (!pgsql_replication_origin_progress(&(context->controlPgConn),
+										   context->origin,
+										   flush,
+										   &flushLSN))
 	{
 		/* errors have already been logged */
+		log_error("Failed to retrieve origin progress, "
+				  "see above for details");
 		return false;
 	}
 
-	bool found = false;
-	LSNTracking *current = context->lsnTrackingList;
-
-	for (; current != NULL; current = current->previous)
-	{
-		if (current->insertLSN <= flushLSN)
-		{
-			found = true;
-			*durableLSN = current->sourceLSN;
-			break;
-		}
-	}
-
-	if (!found)
-	{
-		*durableLSN = InvalidXLogRecPtr;
-
-		log_debug("Failed to find a durable source LSN for target LSN %X/%X",
-				  LSN_FORMAT_ARGS(flushLSN));
-
-		return false;
-	}
-
-	log_debug("stream_apply_find_durable_lsn(%X/%X): %X/%X :: %X/%X",
-			  LSN_FORMAT_ARGS(flushLSN),
-			  LSN_FORMAT_ARGS(current->sourceLSN),
-			  LSN_FORMAT_ARGS(current->insertLSN));
-
-	/* clean-up the lsn tracking list */
-	LSNTracking *tail = current->previous;
-	current->previous = NULL;
-
-	while (tail != NULL)
-	{
-		LSNTracking *previous = tail->previous;
-		free(tail);
-		tail = previous;
-	}
-
-	return true;
-}
-
-
-/*
- * stream_apply_write_lsn_tracking writes the context->LSNTracking linked-list
- * as a JSON array on-disk.
- */
-bool
-stream_apply_write_lsn_tracking(StreamApplyContext *context)
-{
-	const char *filename = context->paths.lsntrackingfile;
-	LSNTracking *current = context->lsnTrackingList;
-
-	JSON_Value *js = json_value_init_array();
-	JSON_Array *jsArray = json_value_get_array(js);
-
-	for (; current != NULL; current = current->previous)
-	{
-		JSON_Value *jsObj = json_value_init_object();
-		JSON_Object *jsLSNObj = json_value_get_object(jsObj);
-
-		char sourceLSN[PG_LSN_MAXLENGTH] = { 0 };
-		char insertLSN[PG_LSN_MAXLENGTH] = { 0 };
-
-		sformat(sourceLSN, sizeof(sourceLSN), "%X/%X",
-				LSN_FORMAT_ARGS(current->sourceLSN));
-
-		sformat(insertLSN, sizeof(insertLSN), "%X/%X",
-				LSN_FORMAT_ARGS(current->insertLSN));
-
-		json_object_set_string(jsLSNObj, "source", sourceLSN);
-		json_object_set_string(jsLSNObj, "insert", insertLSN);
-
-		json_array_append_value(jsArray, jsObj);
-	}
-
-	char *serialized_string = json_serialize_to_string(js);
-	size_t len = strlen(serialized_string);
-
-	if (!write_file(serialized_string, len, filename))
-	{
-		log_error("Failed to write LSN tracking to file \"%s\"", filename);
-		return false;
-	}
-
-	json_free_serialized_string(serialized_string);
-	json_value_free(js);
-
-	return true;
-}
-
-
-/*
- * stream_apply_read_lsn_tracking reads the context->LSNTracking linked-list
- * from a JSON array on-disk.
- */
-bool
-stream_apply_read_lsn_tracking(StreamApplyContext *context)
-{
-	const char *filename = context->paths.lsntrackingfile;
-	LSNTracking *current = context->lsnTrackingList;
-
-	if (current != NULL)
-	{
-		log_error("BUG: stream_apply_read_lsn_tracking current is not NULL");
-		return false;
-	}
-
-	/* it's okay if the file does not exists, just skip the operation */
-	if (!file_exists(filename))
-	{
-		log_notice("Failed to parse JSON file \"%s\": file does not exists",
-				   filename);
-		return true;
-	}
-
-	JSON_Value *json = json_parse_file(filename);
-
-	if (json == NULL)
-	{
-		log_error("Failed to parse JSON file \"%s\"", filename);
-		return false;
-	}
-
-	JSON_Array *jsArray = json_value_get_array(json);
-	int count = json_array_get_count(jsArray);
-
-	for (int i = 0; i < count; i++)
-	{
-		LSNTracking *lsn_tracking =
-			(LSNTracking *) calloc(1, sizeof(LSNTracking));
-
-		if (lsn_tracking == NULL)
-		{
-			log_error(ALLOCATION_FAILED_ERROR);
-
-			(void) json_value_free(json);
-			return false;
-		}
-
-		JSON_Object *jsObj = json_array_get_object(jsArray, i);
-		const char *source = json_object_get_string(jsObj, "source");
-		const char *insert = json_object_get_string(jsObj, "insert");
-
-		if (!parseLSN(source, &(lsn_tracking->sourceLSN)))
-		{
-			log_error("Failed to parse source LSN \"%s\"", source);
-
-			(void) json_value_free(json);
-			return false;
-		}
-
-		if (!parseLSN(insert, &(lsn_tracking->insertLSN)))
-		{
-			log_error("Failed to parse insert LSN \"%s\"", insert);
-
-			(void) json_value_free(json);
-			return false;
-		}
-
-		/* update the linked list */
-		lsn_tracking->previous = context->lsnTrackingList;
-		context->lsnTrackingList = lsn_tracking;
-	}
-
-	(void) json_value_free(json);
+	*durableLSN = flushLSN;
 
 	return true;
 }
@@ -2045,12 +1733,9 @@ parseTxnMetadataFile(const char *filename, LogicalMessageMetadata *metadata)
 	if (!parseMessageMetadata(metadata, txnMetadataContent, json, true))
 	{
 		/* errors have already been logged */
-		json_value_free(json);
 		return false;
 	}
 
-	json_value_free(json);
-	free(txnMetadataContent);
 
 	if (metadata->txnCommitLSN == InvalidXLogRecPtr ||
 		metadata->xid != xid ||

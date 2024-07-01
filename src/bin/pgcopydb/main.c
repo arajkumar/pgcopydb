@@ -6,11 +6,15 @@
 #include <getopt.h>
 #include <unistd.h>
 
+#include <gc/gc.h>
+
 #include "postgres.h"
 
 #if (PG_VERSION_NUM >= 120000)
 #include "common/logging.h"
 #endif
+
+#include "parson.h"
 
 #include "cli_root.h"
 #include "copydb.h"
@@ -59,6 +63,9 @@ main(int argc, char **argv)
 	/* allows changing process title in ps/top/ptree etc */
 	(void) init_ps_buffer(argc, argv);
 
+	/* set memory allocation function for JSON parson lib to use libgc */
+	(void) json_set_allocation_functions(GC_malloc, GC_free);
+
 	/* set our logging infrastructure */
 	(void) set_logger();
 
@@ -74,15 +81,6 @@ main(int argc, char **argv)
 
 	/* register our System V resources clean-up atexit */
 	atexit(unlink_system_res_atexit);
-
-	/*
-	 * When PGCOPYDB_DEBUG is set in the environment, provide the user
-	 * commands available to debug a pgcopydb instance.
-	 */
-	if (env_exists(PGCOPYDB_DEBUG))
-	{
-		command = root_with_debug;
-	}
 
 	/*
 	 * We need to follow POSIX specifications for argument parsing, in

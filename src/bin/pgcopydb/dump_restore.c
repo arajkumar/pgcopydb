@@ -13,6 +13,7 @@
 #include "pqexpbuffer.h"
 #include "dumputils.h"
 
+#include "catalog.h"
 #include "copydb.h"
 #include "env_utils.h"
 #include "lock_utils.h"
@@ -24,100 +25,111 @@
 #include "summary.h"
 
 
+static bool copydb_append_table_hook(void *context, SourceTable *table);
+static bool copydb_copy_database_properties_hook(void *ctx,
+												 SourceProperty *property);
+
+
 /*
- * copydb_objectid_has_been_processed_already returns true when a doneFile
- * could be found on-disk for the given target object OID.
+ * copydb_objectid_has_been_processed_already returns true when the given
+ * target object OID is found in our SQLite summary catalogs. This only applies
+ * to indexes or constraints, as TABLE DATA is not part of either the
+ * --pre-data parts of the schema nor the --post-data parts of the schema.
  */
 bool
-copydb_objectid_has_been_processed_already(CopyDataSpec *specs, uint32_t oid)
+copydb_objectid_has_been_processed_already(CopyDataSpec *specs,
+										   ArchiveContentItem *item)
 {
-	char doneFile[MAXPGPATH] = { 0 };
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	/* build the doneFile for the target index or constraint */
-	sformat(doneFile, sizeof(doneFile), "%s/%u.done",
-			specs->cfPaths.idxdir,
-			oid);
+	uint32_t oid = item->objectOid;
 
-	return file_exists(doneFile);
+	switch (item->desc)
+	{
+		case ARCHIVE_TAG_INDEX:
+		{
+			SourceIndex index = { .indexOid = oid };
+			CopyIndexSpec indexSpecs = { .sourceIndex = &index };
+
+			if (!summary_lookup_index(sourceDB, &indexSpecs))
+			{
+				/* errors have aleady been logged */
+				return false;
+			}
+
+			return indexSpecs.summary.doneTime > 0;
+		}
+
+		case ARCHIVE_TAG_CONSTRAINT:
+		{
+			SourceIndex index = { .constraintOid = oid };
+			CopyIndexSpec indexSpecs = { .sourceIndex = &index };
+
+			if (!summary_lookup_constraint(sourceDB, &indexSpecs))
+			{
+				/* errors have aleady been logged */
+				return false;
+			}
+
+			return indexSpecs.summary.doneTime > 0;
+		}
+
+		/* we don't have internal pgcopydb support for other objects */
+		default:
+		{
+			return false;
+		}
+	}
+
+	/* keep compiler happy */
+	return false;
 }
 
 
 /*
- * copydb_dump_source_schema uses pg_dump -Fc --schema --section=pre-data or
- * --section=post-data to dump the source database schema to files.
+ * copydb_dump_source_schema uses pg_dump -Fc --schema --schema-only
+ * to dump the source database schema to file.
  */
 bool
 copydb_dump_source_schema(CopyDataSpec *specs,
-						  const char *snapshot,
-						  PostgresDumpSection section)
+						  const char *snapshot)
 {
-	SourceExtensionArray *extensionArray = NULL;
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	if (specs->skipExtensions)
+	if (specs->runState.schemaDumpIsDone)
 	{
-		extensionArray = &(specs->catalog.extensionArray);
+		log_info("Skipping pg_dump for pre-data/post-data section, "
+				 "done on a previous run");
+		return true;
 	}
 
-	if (section == PG_DUMP_SECTION_SCHEMA ||
-		section == PG_DUMP_SECTION_PRE_DATA ||
-		section == PG_DUMP_SECTION_ALL)
+	if (!summary_start_timing(sourceDB, TIMING_SECTION_DUMP_SCHEMA))
 	{
-		if (file_exists(specs->cfPaths.done.preDataDump))
-		{
-			log_info("Skipping pg_dump --section=pre-data, "
-					 "as \"%s\" already exists",
-					 specs->cfPaths.done.preDataDump);
-		}
-		else if (!pg_dump_db(&(specs->pgPaths),
-							 &(specs->connStrings),
-							 snapshot,
-							 "pre-data",
-							 &(specs->filters),
-							 extensionArray,
-							 specs->dumpPaths.preFilename))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		/* now write the doneFile to keep track */
-		if (!write_file("", 0, specs->cfPaths.done.preDataDump))
-		{
-			log_error("Failed to write the tracking file \"%s\"",
-					  specs->cfPaths.done.preDataDump);
-			return false;
-		}
+		/* errors have already been logged */
+		return false;
 	}
 
-	if (section == PG_DUMP_SECTION_SCHEMA ||
-		section == PG_DUMP_SECTION_POST_DATA ||
-		section == PG_DUMP_SECTION_ALL)
+	if (file_exists(specs->dumpPaths.dumpFilename))
 	{
-		if (file_exists(specs->cfPaths.done.postDataDump))
-		{
-			log_info("Skipping pg_dump --section=post-data, "
-					 "as \"%s\" already exists",
-					 specs->cfPaths.done.postDataDump);
-		}
-		else if (!pg_dump_db(&(specs->pgPaths),
-							 &(specs->connStrings),
-							 snapshot,
-							 "post-data",
-							 &(specs->filters),
-							 extensionArray,
-							 specs->dumpPaths.postFilename))
-		{
-			/* errors have already been logged */
-			return false;
-		}
+		log_info("Skipping source schema dump, "
+				 "as \"%s\" already exists",
+				 specs->dumpPaths.dumpFilename);
+	}
+	else if (!pg_dump_db(&(specs->pgPaths),
+						 &(specs->connStrings),
+						 snapshot,
+						 &(specs->filters),
+						 &(specs->catalogs.filter),
+						 specs->dumpPaths.dumpFilename))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
-		/* now write the doneFile to keep track */
-		if (!write_file("", 0, specs->cfPaths.done.postDataDump))
-		{
-			log_error("Failed to write the tracking file \"%s\"",
-					  specs->cfPaths.done.postDataDump);
-			return false;
-		}
+	if (!summary_stop_timing(sourceDB, TIMING_SECTION_DUMP_SCHEMA))
+	{
+		/* errors have already been logged */
+		return false;
 	}
 
 	return true;
@@ -125,23 +137,31 @@ copydb_dump_source_schema(CopyDataSpec *specs,
 
 
 /*
- * copydb_target_prepare_schema restores the pre.dump file into the target
+ * copydb_target_prepare_schema restores the schema.dump file into the target
  * database.
  */
 bool
 copydb_target_prepare_schema(CopyDataSpec *specs)
 {
-	if (!file_exists(specs->dumpPaths.preFilename))
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	if (!file_exists(specs->dumpPaths.dumpFilename))
 	{
-		log_fatal("File \"%s\" does not exists", specs->dumpPaths.preFilename);
+		log_fatal("File \"%s\" does not exists", specs->dumpPaths.dumpFilename);
 		return false;
 	}
 
-	if (file_exists(specs->cfPaths.done.preDataRestore))
+	if (specs->runState.schemaPreDataHasBeenRestored)
 	{
-		log_info("Skipping pg_restore of pre-data section, "
+		log_info("Skipping pg_restore for pre-data section, "
 				 "done on a previous run");
 		return true;
+	}
+
+	if (!summary_start_timing(sourceDB, TIMING_SECTION_PREPARE_SCHEMA))
+	{
+		/* errors have already been logged */
+		return false;
 	}
 
 	/*
@@ -161,7 +181,7 @@ copydb_target_prepare_schema(CopyDataSpec *specs)
 	{
 		log_error("Failed to prepare the pg_restore --use-list catalogs, "
 				  "see above for details");
-		return true;
+		return false;
 	}
 
 	/*
@@ -181,10 +201,11 @@ copydb_target_prepare_schema(CopyDataSpec *specs)
 		}
 	}
 
+	specs->restoreOptions.section = PG_RESTORE_SECTION_PRE_DATA;
 	if (!pg_restore_db(&(specs->pgPaths),
 					   &(specs->connStrings),
 					   &(specs->filters),
-					   specs->dumpPaths.preFilename,
+					   specs->dumpPaths.dumpFilename,
 					   specs->dumpPaths.preListFilename,
 					   specs->restoreOptions))
 	{
@@ -192,16 +213,21 @@ copydb_target_prepare_schema(CopyDataSpec *specs)
 		return false;
 	}
 
-	/* now write the doneFile to keep track */
-	if (!write_file("", 0, specs->cfPaths.done.preDataRestore))
+	if (!summary_stop_timing(sourceDB, TIMING_SECTION_PREPARE_SCHEMA))
 	{
-		log_error("Failed to write the tracking file \"%s\"",
-				  specs->cfPaths.done.preDataRestore);
+		/* errors have already been logged */
 		return false;
 	}
 
 	return true;
 }
+
+
+typedef struct CopyPropertiesContext
+{
+	CopyDataSpec *specs;
+	PGSQL *dst;
+} CopyPropertiesContext;
 
 
 /*
@@ -212,6 +238,8 @@ copydb_target_prepare_schema(CopyDataSpec *specs)
 bool
 copydb_copy_database_properties(CopyDataSpec *specs)
 {
+	const char *s_dbname = specs->connStrings.safeSourcePGURI.uriParams.dbname;
+
 	PGSQL dst = { 0 };
 
 	if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
@@ -226,87 +254,21 @@ copydb_copy_database_properties(CopyDataSpec *specs)
 		return false;
 	}
 
-	PGconn *conn = dst.connection;
-	SourceRole *rolesHashByName = specs->targetCatalog.rolesHashByName;
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
 
-	if (specs->catalog.gucsArray.count > 0)
+	CopyPropertiesContext context = {
+		.specs = specs,
+		.dst = &dst
+	};
+
+	if (!catalog_iter_s_database_guc(sourceDB,
+									 s_dbname,
+									 &context,
+									 &copydb_copy_database_properties_hook))
 	{
-		for (int i = 0; i < specs->catalog.gucsArray.count; i++)
-		{
-			SourceProperty *property = &(specs->catalog.gucsArray.array[i]);
-
-			/*
-			 * ALTER ROLE rolname IN DATABASE datname SET ...
-			 */
-			if (property->roleInDatabase)
-			{
-				char *rolname = property->rolname;
-				int len = strlen(rolname);
-
-				SourceRole *role = NULL;
-
-				HASH_FIND(hh, rolesHashByName, rolname, len, role);
-
-				if (role != NULL)
-				{
-					PQExpBuffer command = createPQExpBuffer();
-
-					makeAlterConfigCommand(conn, property->setconfig,
-										   "ROLE", property->rolname,
-										   "DATABASE", specs->connStrings.safeTargetPGURI.uriParams.dbname,
-										   command);
-
-					/* chomp the \n */
-					if (command->data[command->len - 1] == '\n')
-					{
-						command->data[command->len - 1] = '\0';
-					}
-
-					log_info("%s", command->data);
-
-					if (!pgsql_execute(&dst, command->data))
-					{
-						/* errors have already been logged */
-						return false;
-					}
-
-					destroyPQExpBuffer(command);
-				}
-				else
-				{
-					log_warn("Skipping database properties for role %s which "
-							 "does not exists on the target database",
-							 rolname);
-				}
-			}
-
-			/*
-			 * ALTER DATABASE datname SET ...
-			 */
-			else
-			{
-				PQExpBuffer command = createPQExpBuffer();
-
-				makeAlterConfigCommand(conn, property->setconfig,
-									   "DATABASE", specs->connStrings.safeTargetPGURI.uriParams.dbname, NULL, NULL,
-									   command);
-
-				if (command->data[command->len - 1] == '\n')
-				{
-					command->data[command->len - 1] = '\0';
-				}
-
-				log_info("%s", command->data);
-
-				if (!pgsql_execute(&dst, command->data))
-				{
-					/* errors have already been logged */
-					return false;
-				}
-
-				destroyPQExpBuffer(command);
-			}
-		}
+		/* errors have already been logged */
+		(void) pgsql_rollback(&dst);
+		return false;
 	}
 
 	if (!pgsql_commit(&dst))
@@ -320,6 +282,137 @@ copydb_copy_database_properties(CopyDataSpec *specs)
 
 
 /*
+ * copydb_copy_database_properties_hook is an iterator callback function.
+ */
+static bool
+copydb_copy_database_properties_hook(void *ctx, SourceProperty *property)
+{
+	CopyPropertiesContext *context = (CopyPropertiesContext *) ctx;
+
+	CopyDataSpec *specs = context->specs;
+
+	PGSQL *dst = context->dst;
+	PGconn *conn = dst->connection;
+
+	char *t_dbname = specs->connStrings.safeTargetPGURI.uriParams.dbname;
+	char *t_escaped_dbname = pgsql_escape_identifier(dst, t_dbname);
+
+	if (t_escaped_dbname == NULL)
+	{
+		/* errors are already logged */
+		return false;
+	}
+
+	/*
+	 * ALTER ROLE rolname IN DATABASE datname SET ...
+	 */
+	if (property->roleInDatabase)
+	{
+		DatabaseCatalog *targetDB = &(specs->catalogs.target);
+
+		SourceRole *role = (SourceRole *) calloc(1, sizeof(SourceRole));
+
+		if (role == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		if (!catalog_lookup_s_role_by_name(targetDB, property->rolname, role))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (role->oid > 0)
+		{
+			PQExpBuffer command = createPQExpBuffer();
+
+			makeAlterConfigCommand(conn, property->setconfig,
+								   "ROLE", property->rolname,
+								   "DATABASE",
+								   t_escaped_dbname,
+								   command);
+
+			/* chomp the \n */
+			if (command->data[command->len - 1] == '\n')
+			{
+				command->data[command->len - 1] = '\0';
+			}
+
+			log_info("%s", command->data);
+
+			if (!pgsql_execute(dst, command->data))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			destroyPQExpBuffer(command);
+		}
+		else
+		{
+			log_warn("Skipping database properties for role %s which "
+					 "does not exists on the target database",
+					 property->rolname);
+		}
+	}
+
+	/*
+	 * ALTER DATABASE datname SET ...
+	 */
+	else
+	{
+		bool exists = false;
+
+		if (!pgsql_configuration_exists(dst, property->setconfig, &exists))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		if (!exists)
+		{
+			log_warn("Skipping database property %s which "
+					 "does not exists on the target database",
+					 property->setconfig);
+			return true;
+		}
+
+		PQExpBuffer command = createPQExpBuffer();
+
+		makeAlterConfigCommand(conn, property->setconfig,
+							   "DATABASE", t_escaped_dbname,
+							   NULL, NULL,
+							   command);
+
+		if (command->data[command->len - 1] == '\n')
+		{
+			command->data[command->len - 1] = '\0';
+		}
+
+		log_info("%s", command->data);
+
+		if (!pgsql_execute(dst, command->data))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		destroyPQExpBuffer(command);
+	}
+
+	return true;
+}
+
+
+typedef struct DropTableContext
+{
+	PQExpBuffer query;
+	uint64_t tableIndex;
+} DropTableContext;
+
+/*
  * copydb_target_drop_tables prepares and executes a SQL query that prepares
  * our target database by means of a DROP IF EXISTS ... CASCADE statement that
  * includes all our target tables.
@@ -327,28 +420,36 @@ copydb_copy_database_properties(CopyDataSpec *specs)
 bool
 copydb_target_drop_tables(CopyDataSpec *specs)
 {
-	log_info("Drop tables on the target database, per --drop-if-exists");
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+	CatalogStats stats = { 0 };
 
-	SourceTableArray *tableArray = &(specs->catalog.sourceTableArray);
-
-	if (tableArray->count == 0)
+	if (!catalog_stats(sourceDB, &stats))
 	{
-		log_info("No tables to migrate, skipping drop tables on the target database");
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (stats.count.tables == 0)
+	{
+		log_info("No tables to migrate, skipping drop tables "
+				 "on the target database");
 		return true;
 	}
 
+	log_info("Drop tables on the target database, per --drop-if-exists");
+
 	PQExpBuffer query = createPQExpBuffer();
+
+	DropTableContext context = { .query = query, .tableIndex = 0 };
 
 	appendPQExpBufferStr(query, "DROP TABLE IF EXISTS");
 
-	for (int tableIndex = 0; tableIndex < tableArray->count; tableIndex++)
+	if (!catalog_iter_s_table(sourceDB, &context, &copydb_append_table_hook))
 	{
-		SourceTable *source = &(tableArray->array[tableIndex]);
-
-		appendPQExpBuffer(query, "%s %s.%s",
-						  tableIndex == 0 ? " " : ",",
-						  source->nspname,
-						  source->relname);
+		log_error("Failed to create DROP IF EXISTS query: "
+				  "see above for details");
+		destroyPQExpBuffer(query);
+		return false;
 	}
 
 	appendPQExpBufferStr(query, " CASCADE");
@@ -360,6 +461,8 @@ copydb_target_drop_tables(CopyDataSpec *specs)
 		destroyPQExpBuffer(query);
 		return false;
 	}
+
+	log_notice("%s", query->data);
 
 	PGSQL dst = { 0 };
 
@@ -384,6 +487,29 @@ copydb_target_drop_tables(CopyDataSpec *specs)
 
 
 /*
+ * copydb_append_table_hook is an iterator callback function.
+ */
+static bool
+copydb_append_table_hook(void *ctx, SourceTable *table)
+{
+	if (table == NULL)
+	{
+		log_error("BUG: copydb_append_table_hook called with a NULL table");
+		return false;
+	}
+
+	DropTableContext *context = (DropTableContext *) ctx;
+
+	appendPQExpBuffer(context->query, "%s %s.%s",
+					  context->tableIndex++ == 0 ? " " : ",",
+					  table->nspname,
+					  table->relname);
+
+	return true;
+}
+
+
+/*
  * copydb_target_finalize_schema finalizes the schema after all the data has
  * been copied over, and after indexes and their constraints have been created
  * too.
@@ -391,17 +517,25 @@ copydb_target_drop_tables(CopyDataSpec *specs)
 bool
 copydb_target_finalize_schema(CopyDataSpec *specs)
 {
-	if (!file_exists(specs->dumpPaths.postFilename))
+	DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+	if (!file_exists(specs->dumpPaths.dumpFilename))
 	{
-		log_fatal("File \"%s\" does not exists", specs->dumpPaths.postFilename);
+		log_fatal("File \"%s\" does not exists", specs->dumpPaths.dumpFilename);
 		return false;
 	}
 
-	if (file_exists(specs->cfPaths.done.postDataRestore))
+	if (specs->runState.schemaPostDataHasBeenRestored)
 	{
-		log_info("Skipping pg_restore --section=pre-data, "
+		log_info("Skipping pg_restore for --section=post-data, "
 				 "done on a previous run");
 		return true;
+	}
+
+	if (!summary_start_timing(sourceDB, TIMING_SECTION_FINALIZE_SCHEMA))
+	{
+		/* errors have already been logged */
+		return false;
 	}
 
 	if (!copydb_write_restore_list(specs, PG_DUMP_SECTION_POST_DATA))
@@ -411,10 +545,11 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 		return false;
 	}
 
+	specs->restoreOptions.section = PG_RESTORE_SECTION_POST_DATA;
 	if (!pg_restore_db(&(specs->pgPaths),
 					   &(specs->connStrings),
 					   &(specs->filters),
-					   specs->dumpPaths.postFilename,
+					   specs->dumpPaths.dumpFilename,
 					   specs->dumpPaths.postListFilename,
 					   specs->restoreOptions))
 	{
@@ -422,11 +557,9 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
 		return false;
 	}
 
-	/* now write the doneFile to keep track */
-	if (!write_file("", 0, specs->cfPaths.done.postDataRestore))
+	if (!summary_stop_timing(sourceDB, TIMING_SECTION_FINALIZE_SCHEMA))
 	{
-		log_error("Failed to write the tracking file \"%s\"",
-				  specs->cfPaths.done.postDataRestore);
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -439,9 +572,10 @@ copydb_target_finalize_schema(CopyDataSpec *specs)
  * list of filtered-out extensions.
  */
 static
-bool skipExtensionFromFilter(CopyDataSpec *specs,
-							 ArchiveContentItem *item,
-							 bool *skip)
+bool
+skipExtensionFromFilter(CopyDataSpec *specs,
+						ArchiveContentItem *item,
+						bool *skip)
 {
 	/*
 	 * Skip COMMENT ON EXTENSION when either of the option
@@ -479,13 +613,14 @@ bool skipExtensionFromFilter(CopyDataSpec *specs,
 	{
 		*skip = true;
 		log_notice("Skipping EXTENSION %s \"%s\"",
-				isExtensionComment ? "COMMENT ON" : "",
-				name);
+				   isExtensionComment ? "COMMENT ON" : "",
+				   name);
 		return true;
 	}
 
 	return true;
 }
+
 
 /*
  * copydb_write_restore_list fetches the pg_restore --list output, parses it,
@@ -503,7 +638,7 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 	{
 		case PG_DUMP_SECTION_PRE_DATA:
 		{
-			dumpFilename = specs->dumpPaths.preFilename;
+			dumpFilename = specs->dumpPaths.dumpFilename;
 			listFilename = specs->dumpPaths.preListFilename;
 			listOutFilename = specs->dumpPaths.preListOutFilename;
 			break;
@@ -511,7 +646,7 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 
 		case PG_DUMP_SECTION_POST_DATA:
 		{
-			dumpFilename = specs->dumpPaths.postFilename;
+			dumpFilename = specs->dumpPaths.dumpFilename;
 			listFilename = specs->dumpPaths.postListFilename;
 			listOutFilename = specs->dumpPaths.postListOutFilename;
 			break;
@@ -527,20 +662,20 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 	}
 
 	/*
-	 * The pre.dump archive file contains all the objects to create in the
+	 * The schema.dump archive file contains all the objects to create in the
 	 * target database. We want to filter out the schemas and tables excluded
 	 * from the filtering setup.
 	 *
-	 * The post.dump archive file contains all the objects to create once the
+	 * This archive file also contains all the objects to create once the
 	 * table data has been copied over. It contains in particular the
 	 * constraints and indexes that we have already built concurrently in the
 	 * previous step, so we want to filter those out.
 	 *
 	 * Here's how to filter out some objects with pg_restore:
 	 *
-	 *   1. pg_restore -f out.list --list post.dump
-	 *   2. edit post.list to comment out lines
-	 *   3. pg_restore --use-list filtered.list post.dump
+	 *   1. pg_restore -f post.list --list schema.dump
+	 *   2. edit post.list to comment out lines and save as filtered.list
+	 *   3. pg_restore --section post-data --use-list filtered.list schema.dump
 	 */
 	ArchiveContentArray contents = { 0 };
 
@@ -550,7 +685,6 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 						 &contents))
 	{
 		/* errors have already been logged */
-		FreeArchiveContentArray(&contents);
 		return false;
 	}
 
@@ -576,11 +710,21 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 
 		(void) skipExtensionFromFilter(specs, item, &skip);
 
+		/*
+		 * Always skip DATABASE objets as pgcopydb does not create the target
+		 * database.
+		 */
+		if (item->desc == ARCHIVE_TAG_DATABASE)
+		{
+			skip = true;
+			log_notice("Skipping DATABASE \"%s\"", name);
+		}
+
 		if (!skip && catOid == PG_NAMESPACE_OID)
 		{
 			bool exists = false;
 
-			if (!copydb_schema_already_exists(specs, name, &exists))
+			if (!copydb_schema_already_exists(specs, oid, &exists))
 			{
 				log_error("Failed to check if restore name \"%s\" "
 						  "already exists",
@@ -601,7 +745,7 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 			}
 		}
 
-		if (!skip && copydb_objectid_has_been_processed_already(specs, oid))
+		if (!skip && copydb_objectid_has_been_processed_already(specs, item))
 		{
 			skip = true;
 
@@ -625,6 +769,24 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		if (item->desc == ARCHIVE_TAG_SEQUENCE)
 		{
 			name = NULL;
+		}
+
+		/*
+		 * There could be a case where the materalized view is included in the
+		 * dump, but the refresh is filtered out using [exclude-table-data].
+		 * In this case, we want to skip the refresh.
+		 */
+		if (!skip &&
+			item->desc == ARCHIVE_TAG_REFRESH_MATERIALIZED_VIEW &&
+			copydb_matview_refresh_is_filtered_out(specs, oid))
+		{
+			skip = true;
+
+			log_notice("Skipping materialized view refresh dumpId %d: %s %u %s",
+					   contents.array[i].dumpId,
+					   contents.array[i].description,
+					   contents.array[i].objectOid,
+					   contents.array[i].restoreListName);
 		}
 
 		if (!skip && copydb_objectid_is_filtered_out(specs, oid, name))
@@ -653,7 +815,6 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 	{
 		log_error("Failed to create pg_restore list file: out of memory");
 		destroyPQExpBuffer(listContents);
-		FreeArchiveContentArray(&contents);
 		return false;
 	}
 
@@ -663,12 +824,10 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 	{
 		/* errors have already been logged */
 		destroyPQExpBuffer(listContents);
-		FreeArchiveContentArray(&contents);
 		return false;
 	}
 
 	destroyPQExpBuffer(listContents);
-	FreeArchiveContentArray(&contents);
 
 	return true;
 }

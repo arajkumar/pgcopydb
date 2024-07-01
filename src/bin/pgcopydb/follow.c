@@ -40,6 +40,16 @@ follow_export_snapshot(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		return false;
 	}
 
+	if (!catalog_setup_replication(streamSpecs->sourceDB,
+								   streamSpecs->slot.snapshot,
+								   OutputPluginToString(streamSpecs->slot.plugin),
+								   streamSpecs->slot.slotName))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+
 	return true;
 }
 
@@ -126,7 +136,9 @@ follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		return false;
 	}
 
-	if (!copydb_copy_all_sequences(&seqSpecs))
+	bool reset = true;
+
+	if (!copydb_copy_all_sequences(&seqSpecs, reset))
 	{
 		/* errors have already been logged */
 		return false;
@@ -143,15 +155,9 @@ follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 bool
 follow_init_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel)
 {
-	PGSQL pgsql = { 0 };
+	DatabaseCatalog *sourceDB = specs->sourceDB;
 
-	if (!pgsql_init(&pgsql, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!pgsql_begin(&pgsql))
+	if (!catalog_open(sourceDB))
 	{
 		/* errors have already been logged */
 		return false;
@@ -159,20 +165,14 @@ follow_init_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel)
 
 	if (specs->endpos != InvalidXLogRecPtr)
 	{
-		if (!pgsql_update_sentinel_endpos(&pgsql, false, specs->endpos))
+		if (!sentinel_update_endpos(sourceDB, specs->endpos))
 		{
 			/* errors have already been logged */
 			return false;
 		}
 	}
 
-	if (!pgsql_get_sentinel(&pgsql, sentinel))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!pgsql_commit(&pgsql))
+	if (!sentinel_get(sourceDB, sentinel))
 	{
 		/* errors have already been logged */
 		return false;
@@ -184,20 +184,14 @@ follow_init_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel)
 
 /*
  * follow_get_sentinel refreshes the given CopyDBSentinel with the current
- * values from the pgcopydb.sentinel table on the source database.
+ * values from the pgcopydb.sentinel table.
  */
 bool
 follow_get_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel, bool verbose)
 {
-	PGSQL pgsql = { 0 };
+	DatabaseCatalog *sourceDB = specs->sourceDB;
 
-	if (!pgsql_init(&pgsql, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	if (!pgsql_get_sentinel(&pgsql, sentinel))
+	if (!sentinel_get(sourceDB, sentinel))
 	{
 		/* errors have already been logged */
 		return false;
@@ -269,11 +263,9 @@ follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		return false;
 	}
 
-	/*
-	 * Read the catalogs from the source table from on-file disk if
-	 * the schema dump has been done already.
-	 */
-	if (copySpecs->dirState.schemaDumpIsDone && !copydb_parse_schema_json_file(copySpecs))
+	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
+
+	if (!catalog_open(sourceDB))
 	{
 		/* errors have already been logged */
 		return false;
@@ -540,6 +532,17 @@ followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 	}
 
 	/*
+	 * Before starting sub-processes, make sure to close our SQLite catalogs.
+	 * We open the SQLite catalogs again before returning from this function
+	 * (if only when reaching the end of it and returning true).
+	 */
+	if (!catalog_close(streamSpecs->sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/*
 	 * Prepare the sub-process communication mechanisms, when needed:
 	 *
 	 *   - pgcopydb stream receive --to-stdout
@@ -627,7 +630,18 @@ followDB(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 	 *
 	 * This happens when the sentinel endpos is set, typically using the
 	 * command: pgcopydb stream sentinel set endpos --current.
+	 *
+	 * When waipid() catches a subprocess termination, we need to update our
+	 * sentinel values, and for that we need to catalogs open again. The caller
+	 * to this function had the catalogs open, so we let them opened when
+	 * returning here.
 	 */
+	if (!catalog_open(streamSpecs->sourceDB))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	if (follow_wait_subprocesses(streamSpecs))
 	{
 		log_info("Subprocesses for %s, %s, and %s have now all exited",
@@ -848,12 +862,36 @@ follow_start_subprocess(StreamSpecs *specs, FollowSubProcess *subprocess)
 		case 0:
 		{
 			/* child process runs the command */
+			pid_t pid = getpid();
 			char psTitle[BUFSIZE] = { 0 };
 
 			sformat(psTitle, sizeof(psTitle), "pgcopydb: follow %s",
 					subprocess->name);
 
 			(void) set_ps_title(psTitle);
+
+			/* also track the process information in our catalogs */
+			ProcessInfo ps = {
+				.pid = pid,
+				.psTitle = ps_buffer
+			};
+
+			strlcpy(ps.psType, subprocess->name, sizeof(ps.psType));
+
+			DatabaseCatalog *sourceDB = specs->sourceDB;
+
+			if (!catalog_open(sourceDB))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			if (!catalog_upsert_process_info(sourceDB, &ps))
+			{
+				log_error("Failed to track progress in our catalogs, "
+						  "see above for details");
+				return false;
+			}
 
 			log_notice("Starting the %s sub-process", subprocess->name);
 
@@ -956,10 +994,29 @@ follow_wait_subprocesses(StreamSpecs *specs)
 			{
 				--stillRunning;
 
+				/*
+				 * First, delete the process from our tracking in the catalogs.
+				 */
+				if (!catalog_delete_process(specs->sourceDB,
+											processArray[i]->pid))
+				{
+					log_notice("Failed to delete process entry for pid %d",
+							   processArray[i]->pid);
+				}
+
 				int logLevel = LOG_NOTICE;
 				char details[BUFSIZE] = { 0 };
 
-				if (processArray[i]->returnCode == 0)
+				/*
+				 * A sub-process exit is considered a "successful" exit when
+				 * the return code is zero and the signal for termination is a
+				 * signal that pgcopydb knows to handle and expects.
+				 */
+				bool exitedSuccessfully =
+					processArray[i]->returnCode == 0 &&
+					signal_is_handled(processArray[i]->sig);
+
+				if (exitedSuccessfully)
 				{
 					if (processArray[i]->sig == 0)
 					{
@@ -976,9 +1033,17 @@ follow_wait_subprocesses(StreamSpecs *specs)
 				{
 					logLevel = LOG_ERROR;
 
-					if (processArray[i]->sig == 0)
+					if (processArray[i]->returnCode == 0)
 					{
-						sformat(details, sizeof(details), "with error code %d",
+						sformat(details, sizeof(details),
+								"with return code %d and signal %s",
+								processArray[i]->returnCode,
+								signal_to_string(processArray[i]->sig));
+					}
+					else if (processArray[i]->sig == 0)
+					{
+						sformat(details, sizeof(details),
+								"with error code %d",
 								processArray[i]->returnCode);
 					}
 					else
@@ -1016,7 +1081,7 @@ follow_wait_subprocesses(StreamSpecs *specs)
 					log_warn("Failed to get sentinel values");
 				}
 
-				if (processArray[i]->returnCode != 0 ||
+				if (!exitedSuccessfully ||
 					specs->endpos == InvalidXLogRecPtr)
 				{
 					char endposStatus[BUFSIZE] = { 0 };
@@ -1032,11 +1097,14 @@ follow_wait_subprocesses(StreamSpecs *specs)
 								LSN_FORMAT_ARGS(specs->endpos));
 					}
 
-					log_notice("Process %s has exited with return code %d, "
+					const char *exitmode =
+						exitedSuccessfully ? "successfully" : "unexpectedly";
+
+					log_notice("Process %s has exited %s, "
 							   "and endpos is %s: "
 							   "terminating other processes",
 							   processArray[i]->name,
-							   processArray[i]->returnCode,
+							   exitmode,
 							   endposStatus);
 
 					if (!follow_terminate_subprocesses(specs))
@@ -1047,7 +1115,7 @@ follow_wait_subprocesses(StreamSpecs *specs)
 					}
 				}
 
-				success = success && processArray[i]->returnCode == 0;
+				success = success && exitedSuccessfully;
 			}
 		}
 

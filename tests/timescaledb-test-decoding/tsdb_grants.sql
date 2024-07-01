@@ -1,5 +1,17 @@
 -- +migration Up
 
+ALTER SCHEMA _timescaledb_internal OWNER TO tsdbadmin ;
+
+GRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA _timescaledb_catalog TO tsdbadmin;
+
+GRANT INSERT, UPDATE ON ALL TABLES IN SCHEMA _timescaledb_config TO tsdbadmin;
+
+GRANT USAGE, UPDATE, SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_catalog TO tsdbadmin;
+
+GRANT USAGE, UPDATE, SELECT ON ALL SEQUENCES IN SCHEMA _timescaledb_config TO tsdbadmin;
+
+GRANT SET ON PARAMETER timescaledb.restoring TO tsdbadmin;
+
 -- +migration StatementBegin
 DO LANGUAGE plpgsql $$
 BEGIN
@@ -43,5 +55,7 @@ BEGIN
 END
 $$;
 -- +migration StatementEnd
+
+GRANT EXECUTE ON FUNCTION _timescaledb_functions.stop_background_workers() TO ts_logical;
 
 GRANT ts_logical TO tsdbadmin;

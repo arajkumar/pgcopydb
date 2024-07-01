@@ -8,6 +8,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 
+#include "catalog.h"
 #include "cli_common.h"
 #include "cli_root.h"
 #include "copydb.h"
@@ -38,10 +39,12 @@ static CommandLine restore_schema_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --drop-if-exists     On the target database, clean-up from a previous run first\n"
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --no-tablespaces     Do not output commands to select tablespaces\n"
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -57,10 +60,14 @@ static CommandLine restore_schema_pre_data_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --drop-if-exists     On the target database, clean-up from a previous run first\n"
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --no-tablespaces     Do not output commands to select tablespaces\n"
+		"  --skip-extensions    Skip restoring extensions\n" \
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -76,9 +83,13 @@ static CommandLine restore_schema_post_data_command =
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --no-owner           Do not set ownership of objects to match the original database\n"
 		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments        Do not output commands to restore comments\n"
+		"  --no-tablespaces     Do not output commands to select tablespaces\n"
+		"  --skip-extensions    Skip restoring extensions\n" \
+		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -93,7 +104,8 @@ static CommandLine restore_roles_command =
 		" --dir <dir> [ --source <URI> ] --target <URI> ",
 		"  --source             Postgres URI to the source database\n"
 		"  --target             Postgres URI to the target database\n"
-		"  --dir                Work directory to use\n",
+		"  --dir                Work directory to use\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n",
 		cli_restore_schema_getopts,
 		cli_restore_roles);
 
@@ -144,10 +156,10 @@ cli_restore_schema_getopts(int argc, char **argv)
 		{ "source", required_argument, NULL, 'S' },
 		{ "target", required_argument, NULL, 'T' },
 		{ "dir", required_argument, NULL, 'D' },
-		{ "schema", required_argument, NULL, 's' },
 		{ "drop-if-exists", no_argument, NULL, 'c' }, /* pg_restore -c */
 		{ "no-owner", no_argument, NULL, 'O' },       /* pg_restore -O */
 		{ "no-comments", no_argument, NULL, 'X' },
+		{ "restore-jobs", required_argument, NULL, 'j' },      /* pg_restore --jobs */
 		{ "no-acl", no_argument, NULL, 'x' }, /* pg_restore -x */
 		{ "filter", required_argument, NULL, 'F' },
 		{ "filters", required_argument, NULL, 'F' },
@@ -177,7 +189,7 @@ cli_restore_schema_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:D:s:cOxXFeErRCNVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:D:cOXj:xF:eErRCN:Vvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -226,6 +238,19 @@ cli_restore_schema_getopts(int argc, char **argv)
 			{
 				options.restoreOptions.noOwner = true;
 				log_trace("--no-owner");
+				break;
+			}
+
+			case 'j':
+			{
+				if (!stringToInt(optarg, &options.restoreOptions.jobs) ||
+					options.restoreOptions.jobs < 1 ||
+					options.restoreOptions.jobs > 128)
+				{
+					log_fatal("Failed to parse --restore-jobs count: \"%s\"", optarg);
+					++errors;
+				}
+				log_trace("--restore-jobs %d", options.restoreOptions.jobs);
 				break;
 			}
 
@@ -364,6 +389,12 @@ cli_restore_schema_getopts(int argc, char **argv)
 				exit(EXIT_CODE_QUIT);
 				break;
 			}
+
+			case '?':
+			default:
+			{
+				++errors;
+			}
 		}
 	}
 
@@ -381,7 +412,15 @@ cli_restore_schema_getopts(int argc, char **argv)
 
 	if (errors > 0)
 	{
+		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
+	}
+
+	/* if we haven't set restore-jobs, set it to index-jobs */
+	if (options.restoreOptions.jobs == DEFAULT_RESTORE_JOBS)
+	{
+		options.restoreOptions.jobs = options.indexJobs;
+		log_trace("--restore-jobs %d", options.indexJobs);
 	}
 
 	/* publish our option parsing in the global variable */
@@ -401,6 +440,13 @@ cli_restore_schema(int argc, char **argv)
 
 	(void) cli_restore_prepare_specs(&copySpecs);
 
+	/* we need access to the catalogs to filter the pg_restore --list */
+	if (!catalog_init_from_specs(&copySpecs))
+	{
+		log_error("Failed to initialize pgcopydb internal catalogs");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	if (!copydb_target_prepare_schema(&copySpecs))
 	{
 		/* errors have already been logged */
@@ -411,6 +457,12 @@ cli_restore_schema(int argc, char **argv)
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_TARGET);
+	}
+
+	if (!catalog_close_from_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
@@ -425,10 +477,23 @@ cli_restore_schema_pre_data(int argc, char **argv)
 
 	(void) cli_restore_prepare_specs(&copySpecs);
 
+	/* we need access to the catalogs to filter the pg_restore --list */
+	if (!catalog_init_from_specs(&copySpecs))
+	{
+		log_error("Failed to initialize pgcopydb internal catalogs");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	if (!copydb_target_prepare_schema(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_TARGET);
+	}
+
+	if (!catalog_close_from_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
@@ -443,10 +508,23 @@ cli_restore_schema_post_data(int argc, char **argv)
 
 	(void) cli_restore_prepare_specs(&copySpecs);
 
+	/* we need access to the catalogs to filter the pg_restore --list */
+	if (!catalog_init_from_specs(&copySpecs))
+	{
+		log_error("Failed to initialize pgcopydb internal catalogs");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	if (!copydb_target_finalize_schema(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_TARGET);
+	}
+
+	if (!catalog_close_from_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
@@ -506,8 +584,6 @@ cli_restore_schema_parse_list(int argc, char **argv)
 					item->restoreListName ? item->restoreListName : "");
 		}
 
-		FreeArchiveContentArray(&contents);
-
 		exit(EXIT_CODE_QUIT);
 	}
 
@@ -538,7 +614,7 @@ cli_restore_schema_parse_list(int argc, char **argv)
 
 	log_info("Preparing the pg_restore --use-list for the pre-data "
 			 "archive file \"%s\" at: \"%s\"",
-			 copySpecs.dumpPaths.preFilename,
+			 copySpecs.dumpPaths.dumpFilename,
 			 copySpecs.dumpPaths.preListFilename);
 
 	if (!copydb_write_restore_list(&copySpecs, PG_DUMP_SECTION_PRE_DATA))
@@ -550,7 +626,7 @@ cli_restore_schema_parse_list(int argc, char **argv)
 
 	log_info("Preparing the pg_restore --use-list for the post-data "
 			 "archive file \"%s\" at: \"%s\"",
-			 copySpecs.dumpPaths.postFilename,
+			 copySpecs.dumpPaths.dumpFilename,
 			 copySpecs.dumpPaths.postListFilename);
 
 	if (!copydb_write_restore_list(&copySpecs, PG_DUMP_SECTION_POST_DATA))
@@ -611,17 +687,6 @@ cli_restore_prepare_specs(CopyDataSpec *copySpecs)
 					  restoreDBoptions.filterFileName);
 			exit(EXIT_CODE_BAD_ARGS);
 		}
-	}
-
-	/*
-	 * First, we need to open a snapshot that we're going to re-use in all our
-	 * connections to the source database. When the --snapshot option has been
-	 * used, instead of exporting a new snapshot, we can just re-use it.
-	 */
-	if (!copydb_prepare_snapshot(copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
 	/*

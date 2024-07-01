@@ -39,11 +39,13 @@ static CommandLine copy_db_command =
 		"  --dir                 Work directory to use\n"
 		"  --table-jobs          Number of concurrent COPY jobs to run\n"
 		"  --index-jobs          Number of concurrent CREATE INDEX jobs to run\n"
+		"  --restore-jobs        Number of concurrent jobs for pg_restore\n"
 		"  --drop-if-exists      On the target database, clean-up from a previous run first\n"
 		"  --roles               Also copy roles found on source to target\n"
 		"  --no-owner            Do not set ownership of objects to match the original database\n"
 		"  --no-acl              Prevent restoration of access privileges (grant/revoke commands).\n"
 		"  --no-comments         Do not output commands to restore comments\n"
+		"  --no-tablespaces      Do not output commands to select tablespaces\n"
 		"  --skip-large-objects  Skip copying large objects (blobs)\n"
 		"  --filters <filename>  Use the filters defined in <filename>\n"
 		"  --fail-fast           Abort early in case of error\n"
@@ -108,6 +110,7 @@ static CommandLine copy_data_command =
 		"  --dir                 Work directory to use\n"
 		"  --table-jobs          Number of concurrent COPY jobs to run\n"
 		"  --index-jobs          Number of concurrent CREATE INDEX jobs to run\n"
+		"  --restore-jobs        Number of concurrent jobs for pg_restore\n"
 		"  --skip-large-objects  Skip copying large objects (blobs)\n"
 		"  --filters <filename>  Use the filters defined in <filename>\n"
 		"  --restart             Allow restarting when temp files exist already\n"
@@ -176,6 +179,7 @@ static CommandLine copy_indexes_command =
 		"  --target             Postgres URI to the target database\n"
 		"  --dir                Work directory to use\n"
 		"  --index-jobs         Number of concurrent CREATE INDEX jobs to run\n"
+		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
 		"  --filters <filename> Use the filters defined in <filename>\n"
 		"  --restart            Allow restarting when temp files exist already\n"
 		"  --resume             Allow resuming operations after a failure\n"
@@ -228,13 +232,6 @@ cli_copy_schema(int argc, char **argv)
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_SCHEMA);
 
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_SCHEMA_DUMP);
-
 	/*
 	 * First, we need to open a snapshot that we're going to re-use in all our
 	 * connections to the source database. When the --snapshot option has been
@@ -246,15 +243,6 @@ cli_copy_schema(int argc, char **argv)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!copydb_dump_source_schema(&copySpecs,
-								   copySpecs.sourceSnapshot.snapshot,
-								   PG_DUMP_SECTION_SCHEMA))
-	{
-		/* errors have already been logged */
-		(void) copydb_close_snapshot(&copySpecs);
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
 	/* fetch schema information from source catalogs, including filtering */
 	if (!copydb_fetch_schema_and_prepare_specs(&copySpecs))
 	{
@@ -263,10 +251,15 @@ cli_copy_schema(int argc, char **argv)
 		exit(EXIT_CODE_TARGET);
 	}
 
+	if (!copydb_dump_source_schema(&copySpecs, copySpecs.sourceSnapshot.snapshot))
+	{
+		/* errors have already been logged */
+		(void) copydb_close_snapshot(&copySpecs);
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
 	/* now close the snapshot we kept for the whole operation */
 	(void) copydb_close_snapshot(&copySpecs);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_PREPARE_SCHEMA);
 
 	if (!copydb_target_prepare_schema(&copySpecs))
 	{
@@ -275,20 +268,11 @@ cli_copy_schema(int argc, char **argv)
 		exit(EXIT_CODE_TARGET);
 	}
 
-	(void) summary_set_current_time(timings, TIMING_STEP_AFTER_PREPARE_SCHEMA);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_BEFORE_FINALIZE_SCHEMA);
-
 	if (!copydb_target_finalize_schema(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_TARGET);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_AFTER_FINALIZE_SCHEMA);
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -306,11 +290,6 @@ cli_copy_data(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
-
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
 
 	/*
 	 * First, we need to open a snapshot that we're going to re-use in all our
@@ -348,9 +327,6 @@ cli_copy_data(int argc, char **argv)
 				  copySpecs.sourceSnapshot.pguri);
 		exit(EXIT_CODE_SOURCE);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -365,11 +341,6 @@ cli_copy_table_data(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_TABLE_DATA);
-
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
 
 	/*
 	 * First, we need to open a snapshot that we're going to re-use in all our
@@ -392,7 +363,7 @@ cli_copy_table_data(int argc, char **argv)
 		exit(EXIT_CODE_TARGET);
 	}
 
-	if (!copydb_copy_all_table_data(&copySpecs))
+	if (!copydb_copy_supervisor(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -405,9 +376,6 @@ cli_copy_table_data(int argc, char **argv)
 				  copySpecs.sourceSnapshot.pguri);
 		exit(EXIT_CODE_SOURCE);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -424,11 +392,6 @@ cli_copy_sequences(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_SET_SEQUENCES);
-
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
 
 	/*
 	 * First, we need to open a snapshot that we're going to re-use in all our
@@ -449,7 +412,9 @@ cli_copy_sequences(int argc, char **argv)
 		exit(EXIT_CODE_TARGET);
 	}
 
-	if (!copydb_copy_all_sequences(&copySpecs))
+	bool reset = true;
+
+	if (!copydb_copy_all_sequences(&copySpecs, reset))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -462,9 +427,6 @@ cli_copy_sequences(int argc, char **argv)
 				  copySpecs.sourceSnapshot.pguri);
 		exit(EXIT_CODE_SOURCE);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -478,11 +440,6 @@ cli_copy_indexes(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_INDEXES);
-
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
 
 	/*
 	 * First, we need to open a snapshot that we're going to re-use in all our
@@ -516,9 +473,6 @@ cli_copy_indexes(int argc, char **argv)
 				  copySpecs.sourceSnapshot.pguri);
 		exit(EXIT_CODE_SOURCE);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -533,11 +487,6 @@ cli_copy_constraints(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_CONSTRAINTS);
-
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
 
 	log_info("Create constraints");
 
@@ -573,9 +522,6 @@ cli_copy_constraints(int argc, char **argv)
 				  copySpecs.sourceSnapshot.pguri);
 		exit(EXIT_CODE_SOURCE);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -592,11 +538,6 @@ cli_copy_blobs(int argc, char **argv)
 
 	/* ensure defaults */
 	copySpecs.skipLargeObjects = false;
-
-	Summary summary = { 0 };
-	TopLevelTimings *timings = &(summary.timings);
-
-	(void) summary_set_current_time(timings, TIMING_STEP_START);
 
 	log_info("Copy large objects");
 
@@ -630,9 +571,6 @@ cli_copy_blobs(int argc, char **argv)
 				  copySpecs.sourceSnapshot.pguri);
 		exit(EXIT_CODE_SOURCE);
 	}
-
-	(void) summary_set_current_time(timings, TIMING_STEP_END);
-	(void) print_summary(&summary, &copySpecs);
 }
 
 
@@ -680,7 +618,7 @@ cli_copy_extensions(int argc, char **argv)
 {
 	CopyDataSpec copySpecs = { 0 };
 
-	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_EXTENSION);
+	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_EXTENSIONS);
 
 	if (!copydb_prepare_snapshot(&copySpecs))
 	{
@@ -692,18 +630,28 @@ cli_copy_extensions(int argc, char **argv)
 	if (!copydb_fetch_schema_and_prepare_specs(&copySpecs))
 	{
 		/* errors have already been logged */
-		(void) copydb_close_snapshot(&copySpecs);
-		exit(EXIT_CODE_TARGET);
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* time to close the catalogs now */
+	if (!catalog_close_from_specs(&copySpecs))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
 	bool createExtensions = true;
 
-	if (!copydb_copy_extensions(&copySpecs, createExtensions))
+	if (!copydb_start_extension_data_process(&copySpecs, createExtensions))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_TARGET);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	/* now close the snapshot we kept for the whole operation */
-	(void) copydb_close_snapshot(&copySpecs);
+	if (!copydb_wait_for_subprocesses(copySpecs.failFast))
+	{
+		log_error("Some sub-processes have exited with error status, "
+				  "see above for details");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 }

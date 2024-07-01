@@ -81,6 +81,10 @@ def create_dirs(work_dir: Path):
     pgcopydb_dir = Path(tempfile.gettempdir()) / "pgcopydb"
     pgcopydb_dir.mkdir(parents=True, exist_ok=True)
 
+    # To store the state of the migration as marker files
+    run_dir = work_dir / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
 
 def docker_command(name, *args):
     if LIVE_MIGRATION_DOCKER:

@@ -52,24 +52,7 @@ __ https://www.postgresql.org/docs/current/logical-replication-restrictions.html
 pgcopydb follow
 ---------------
 
-::
-
-   pgcopydb follow: Replay changes from the source database to the target database
-   usage: pgcopydb follow  --source ... --target ...
-
-     --source              Postgres URI to the source database
-     --target              Postgres URI to the target database
-     --dir                 Work directory to use
-     --filters <filename>  Use the filters defined in <filename>
-     --restart             Allow restarting when temp files exist already
-     --resume              Allow resuming operations after a failure
-     --not-consistent      Allow taking a new snapshot on the source database
-     --snapshot            Use snapshot obtained with pg_export_snapshot
-     --plugin              Output plugin to use (test_decoding, wal2json)
-     --slot-name           Use this Postgres replication slot name
-     --create-slot         Create the replication slot
-     --origin              Use this Postgres replication origin node name
-     --endpos              Stop replaying changes when reaching this LSN
+.. include:: ../include/follow.rst
 
 Description
 -----------
@@ -211,7 +194,7 @@ Logical Decoding Pre-Fetching
 
 When using ``pgcopydb clone --follow`` a logical replication slot is created
 on the source database before the initial COPY, using the same Postgres
-snapshot. This ensure data consistency.
+snapshot. This ensures data consistency.
 
 Within the ``pgcopydb clone --follow`` approach, it is only possible to
 start applying the changes from the source database after the initial COPY
@@ -242,8 +225,7 @@ The sentinel table, or the Remote Control
 -----------------------------------------
 
 To track progress and allow resuming of operations, pgcopydb uses a sentinel
-table on the source database. The sentinel table consists of a single row
-with the following fields:
+table. The sentinel table consists of a single row with the following fields:
 
 ::
 
@@ -373,9 +355,9 @@ The following options are available to ``pgcopydb follow``:
 
   During its normal operations pgcopydb creates a lot of temporary files to
   track sub-processes progress. Temporary files are created in the directory
-  location given by this option, or defaults to
+  specified by this option, or defaults to
   ``${TMPDIR}/pgcopydb`` when the environment variable is set, or
-  then to ``/tmp/pgcopydb``.
+  otherwise to ``/tmp/pgcopydb``.
 
 --restart
 
@@ -448,6 +430,19 @@ The following options are available to ``pgcopydb follow``:
   __ https://www.postgresql.org/docs/current/test-decoding.html
   __ https://github.com/eulerto/wal2json/
 
+--wal2json-numeric-as-string
+
+  When using the wal2json output plugin, it is possible to use the
+  ``--wal2json-numeric-as-string`` option to instruct wal2json to output
+  numeric values as strings and thus prevent some precision loss.
+
+  You need to have a wal2json plugin version on source database that supports
+  ``--numeric-data-types-as-string`` option to use this option.
+
+  See also the documentation for `wal2json`__ regarding this option for details.
+
+  __ https://github.com/eulerto/wal2json/pull/255
+
 --slot-name
 
   Logical decoding slot name to use. Defaults to ``pgcopydb``. which is
@@ -518,6 +513,20 @@ PGCOPYDB_TARGET_PGURI
 
   Connection string to the target Postgres instance. When ``--target`` is
   ommitted from the command line, then this environment variable is used.
+
+PGCOPYDB_OUTPUT_PLUGIN
+
+  Logical decoding output plugin to use. When ``--plugin`` is omitted from the
+  command line, then this environment variable is used.
+
+PGCOPYDB_WAL2JSON_NUMERIC_AS_STRING
+
+  When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
+  then pgcopydb uses the wal2json option ``--numeric-data-types-as-string``
+  when using the wal2json output plugin.
+
+  When ``--wal2json-numeric-as-string`` is ommitted from the command line
+  then this environment variable is used.
 
 PGCOPYDB_SNAPSHOT
 

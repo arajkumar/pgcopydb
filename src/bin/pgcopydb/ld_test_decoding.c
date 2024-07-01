@@ -16,6 +16,7 @@
 
 #include "parson.h"
 
+#include "catalog.h"
 #include "cli_common.h"
 #include "cli_root.h"
 #include "copydb.h"
@@ -110,7 +111,6 @@ prepareTestDecodingMessage(LogicalStreamContext *context)
 		return false;
 	}
 
-	json_value_free(js);
 	json_free_serialized_string(jsonstr);
 
 	return true;
@@ -198,8 +198,6 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 		}
 
 		metadata->action = header.action;
-
-		FreeLogicalMessageRelation(&(header.table));
 	}
 	else
 	{
@@ -372,7 +370,6 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	 */
 	header->table.nspname = strndup(idp, dot - idp);
 	header->table.relname = strndup(dot + 1, sep - dot - 1);
-	header->table.pqMemory = false;
 
 	/* now grab the action */
 	char action[BUFSIZE] = { 0 };
@@ -407,37 +404,21 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	if (timescale_is_chunk(header->table.nspname, header->table.relname) &&
 		header->action != STREAM_ACTION_TRUNCATE)
 	{
-		char chunk_schema[PG_NAMEDATALEN] = { 0 };
-		char chunk_table[PG_NAMEDATALEN] = { 0 };
+		char nspname[PG_NAMEDATALEN] = { 0 };
+		char relname[PG_NAMEDATALEN] = { 0 };
 
 		if (!timescale_chunk_to_hypertable(header->table.nspname,
 										   header->table.relname,
-										   chunk_schema,
-										   chunk_table))
+										   nspname,
+										   relname))
 		{
 			log_error("Failed to map chunk %s.%s to hypertable",
 					  header->table.nspname, header->table.relname);
 			return false;
 		}
 
-		free(header->table.nspname);
-		free(header->table.relname);
-
-		header->table.nspname = strndup(chunk_schema, strlen(chunk_schema));
-
-		if (header->table.nspname == NULL)
-		{
-			log_error(ALLOCATION_FAILED_ERROR);
-			return false;
-		}
-
-		header->table.relname = strndup(chunk_table, strlen(chunk_table));
-
-		if (header->table.relname == NULL)
-		{
-			log_error(ALLOCATION_FAILED_ERROR);
-			return false;
-		}
+		strlcpy(header->table.nspname, nspname, sizeof(nspname));
+		strlcpy(header->table.relname, relname, sizeof(relname));
 	}
 
 	sformat(header->qname, sizeof(header->qname), "%s.%s",
@@ -684,21 +665,6 @@ SetColumnNamesAndValues(LogicalMessageTuple *tuple, TestDecodingHeader *header)
 		return false;
 	}
 
-	/*
-	 * Free the TestDecodingColumns memory that we allocated: only the
-	 * structure itself, the rest is just a bunch of pointers to parts of the
-	 * messages.
-	 */
-	TestDecodingColumns *c = cols;
-
-	for (; c != NULL;)
-	{
-		TestDecodingColumns *next = c->next;
-
-		free(c);
-		c = next;
-	}
-
 	return true;
 }
 
@@ -776,7 +742,7 @@ parseNextColumn(TestDecodingColumns *cols,
 	cols->colnameStart = ptr;
 	cols->colnameLen = typA - ptr;
 
-	log_trace("parseNextColumn[%s]: %.*s",
+	log_trace("parseNextColumn[%s]: \"%.*s\"",
 			  typname,
 			  cols->colnameLen,
 			  cols->colnameStart);
@@ -855,7 +821,7 @@ parseNextColumn(TestDecodingColumns *cols,
 
 		/* advance to past the value, skip the next space */
 		ptr = end + 1;
-		header->pos = ptr - header->message;
+		header->pos = ptr - header->message + 1;
 
 		log_trace("parseNextColumn: bit string value: %.*s",
 				  cols->valueLen,
@@ -964,10 +930,10 @@ listToTuple(LogicalMessageTuple *tuple, TestDecodingColumns *cols, int count)
 			}
 
 			/* copy the string contents without the surrounding quotes */
-			for (int i = 0, j = 0; i < cur->valueLen; i++)
+			for (int pidx = 0, vidx = 0; pidx < cur->valueLen; pidx++)
 			{
-				char *ptr = cur->valueStart + i;
-				char *nxt = cur->valueStart + i + 1;
+				char *ptr = cur->valueStart + pidx;
+				char *nxt = cur->valueStart + pidx + 1;
 
 				/* unescape the single-quotes */
 				if (*ptr == '\'' && *nxt == '\'')
@@ -975,7 +941,7 @@ listToTuple(LogicalMessageTuple *tuple, TestDecodingColumns *cols, int count)
 					continue;
 				}
 
-				valueColumn->val.str[j++] = *ptr;
+				valueColumn->val.str[vidx++] = *ptr;
 			}
 		}
 		else
@@ -1025,65 +991,89 @@ prepareUpdateTuppleArrays(StreamContext *privateContext,
 	 * Now lookup our internal catalogs to find out for every column if it is
 	 * part of the pkey definition (WHERE clause) or not (SET clause).
 	 */
-	SourceCatalog *catalog = privateContext->catalog;
-	SourceTable *sourceTableHashByQName = catalog->sourceTableHashByQName;
+	DatabaseCatalog *sourceDB = privateContext->sourceDB;
 
-	SourceTable *table = NULL;
-
-	char *qname = header->qname;
-	size_t len = strlen(qname);
-
-	HASH_FIND(hhQName, sourceTableHashByQName, qname, len, table);
+	SourceTable *table = (SourceTable *) calloc(1, sizeof(SourceTable));
 
 	if (table == NULL)
 	{
-		log_error("Failed to parse decoding message for UPDATE on "
-				  "table %s which is not in our catalogs",
-				  qname);
+		log_error(ALLOCATION_FAILED_ERROR);
 		return false;
 	}
 
-	SourceTableAttributeArray *attributes = &(table->attributes);
+	if (!catalog_lookup_s_table_by_name(sourceDB,
+										header->table.nspname,
+										header->table.relname,
+										table))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (table->oid == 0)
+	{
+		log_error("Failed to parse decoding message for UPDATE on "
+				  "table %s which is not in our catalogs",
+				  table->qname);
+		return false;
+	}
+
+	/* FIXME: lookup for the attribute in the SQLite database directly */
+	if (!catalog_s_table_fetch_attrs(sourceDB, table))
+	{
+		log_error("Failed to fetch table %s attribute list, "
+				  "see above for details",
+				  table->qname);
+		return false;
+	}
 
 	int columnCount = cols->values.array[0].cols;
-	bool *pkeyArray = (bool *) calloc(columnCount, sizeof(bool));
+	bool *pkeyArray = NULL;
 
 	int oldCount = 0;
 	int newCount = 0;
 
-	for (int c = 0; c < columnCount; c++)
+	if (0 < columnCount)
 	{
-		const char *colname = cols->columns[c];
+		pkeyArray = (bool *) calloc(columnCount, sizeof(bool));
 
-		bool found = false;
-
-		/* loop over table attributes to find current column name */
-		for (int i = 0; i < attributes->count; i++)
+		if (pkeyArray == NULL)
 		{
-			if (streq(attributes->array[i].attname, colname))
-			{
-				pkeyArray[c] = attributes->array[i].attisprimary;
-				found = true;
-				break;
-			}
-		}
-
-		if (!found)
-		{
-			log_error("Failed to parse decoding message for UPDATE on "
-					  "table %s: column %s not found",
-					  table->qname,
-					  colname);
+			log_error(ALLOCATION_FAILED_ERROR);
 			return false;
 		}
 
-		if (pkeyArray[c])
+		for (int c = 0; c < columnCount; c++)
 		{
-			++oldCount;
-		}
-		else
-		{
-			++newCount;
+			const char *colname = cols->columns[c];
+
+			SourceTableAttribute attribute = { 0 };
+
+			if (!catalog_lookup_s_attr_by_name(sourceDB,
+											   table->oid,
+											   colname,
+											   &attribute))
+			{
+				log_error("Failed to lookup for table %s attribute %s in our "
+						  "internal catalogs, see above for details",
+						  table->qname,
+						  colname);
+				return false;
+			}
+
+			if (attribute.attnum > 0)
+			{
+				pkeyArray[c] = attribute.attisprimary;
+			}
+
+			if (pkeyArray[c])
+			{
+				++oldCount;
+			}
+			else
+			{
+				++newCount;
+			}
 		}
 	}
 
@@ -1152,8 +1142,6 @@ prepareUpdateTuppleArrays(StreamContext *privateContext,
 		/* avoid double-free now */
 		cols->values.array[0].array[c].val.str = NULL;
 	}
-
-	(void) FreeLogicalMessageTuple(cols);
 
 	return true;
 }

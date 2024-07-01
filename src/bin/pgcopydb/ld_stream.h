@@ -14,6 +14,7 @@
 #include "queue_utils.h"
 #include "pgsql.h"
 #include "schema.h"
+#include "string_utils.h"
 
 #define OUTPUT_BEGIN "BEGIN; -- "
 #define OUTPUT_COMMIT "COMMIT; -- "
@@ -139,7 +140,6 @@ typedef struct LogicalMessageRelation
 {
 	char *nspname;  /* malloc'ed area */
 	char *relname;  /* malloc'ed area */
-	bool pqMemory;
 } LogicalMessageRelation;
 
 typedef struct LogicalMessageInsert
@@ -287,7 +287,6 @@ typedef char FQColumnName[(PG_NAMEDATALEN * 3) + 2];
  */
 typedef struct GeneratedColumnsCache
 {
-
 	/* This is a char [] type */
 	FQColumnName qColumnName;
 
@@ -327,7 +326,7 @@ typedef struct StreamContext
 	uint64_t lastWriteTime;
 
 	/* transform needs some catalog lookups (pkey, type oid) */
-	SourceCatalog *catalog;
+	DatabaseCatalog *sourceDB;
 
 	/* hash table acts as a cache for tables with generated columns */
 	GeneratedColumnsCache *generatedColumnsCache;
@@ -389,9 +388,8 @@ typedef struct StreamApplyContext
 	/* target connection created in pipeline mode responsible for apply */
 	PGSQL applyPgConn;
 
-	/* source connection to publish sentinel updates */
-	PGSQL src;
-	bool sentinelQueryInProgress;
+	/* apply needs access to the catalogs to register sentinel replay_lsn */
+	DatabaseCatalog *sourceDB;
 	uint64_t sentinelSyncTime;
 
 	ConnStrings *connStrings;
@@ -427,9 +425,7 @@ typedef struct StreamApplyContext
 typedef struct StreamContent
 {
 	char filename[MAXPGPATH];
-	int count;
-	char *buffer;
-	char **lines;                     /* malloc'ed area */
+	LinesBuffer lbuf;
 	LogicalMessageMetadata *messages; /* malloc'ed area */
 } StreamContent;
 
@@ -486,7 +482,7 @@ struct StreamSpecs
 	FollowSubProcess catchup;
 
 	/* transform needs some catalog lookups (pkey, type oid) */
-	SourceCatalog *catalog;
+	DatabaseCatalog *sourceDB;
 
 	/* receive push json filenames to a queue for transform */
 	Queue transformQueue;
@@ -515,7 +511,7 @@ bool stream_init_specs(StreamSpecs *specs,
 					   char *origin,
 					   uint64_t endpos,
 					   LogicalStreamMode mode,
-					   SourceCatalog *catalog,
+					   DatabaseCatalog *sourceDB,
 					   bool stdIn,
 					   bool stdOut,
 					   bool logSQL);
@@ -563,6 +559,8 @@ bool stream_read_latest(StreamSpecs *specs, StreamContent *content);
 bool stream_update_latest_symlink(StreamContext *privateContext,
 								  const char *filename);
 
+bool stream_sync_sentinel(LogicalStreamContext *context);
+
 bool buildReplicationURI(const char *pguri, char **repl_pguri);
 
 bool stream_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
@@ -577,6 +575,10 @@ bool stream_create_origin(CopyDataSpec *copySpecs,
 bool stream_create_sentinel(CopyDataSpec *copySpecs,
 							uint64_t startpos,
 							uint64_t endpos);
+
+bool stream_fetch_current_lsn(uint64_t *lsn,
+							  const char *pguri,
+							  ConnectionType connectionType);
 
 bool stream_write_context(StreamSpecs *specs, LogicalStreamClient *stream);
 bool stream_cleanup_context(StreamSpecs *specs);
@@ -645,13 +647,6 @@ bool parseMessage(StreamContext *privateContext, char *message, JSON_Value *json
 bool streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 											 LogicalTransactionStatement *stmt);
 
-
-void FreeLogicalMessage(LogicalMessage *msg);
-void FreeLogicalTransactionStatement(LogicalTransactionStatement *stmt);
-void FreeLogicalTransaction(LogicalTransaction *tx);
-void FreeLogicalMessageTupleArray(LogicalMessageTupleArray *tupleArray);
-void FreeLogicalMessageRelation(LogicalMessageRelation *table);
-void FreeLogicalMessageTuple(LogicalMessageTuple *tuple);
 bool AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count);
 
 /* ld_test_decoding.c */
@@ -685,9 +680,6 @@ bool stream_apply_wait_for_sentinel(StreamSpecs *specs,
 bool stream_apply_sync_sentinel(StreamApplyContext *context,
 								bool findDurableLSN);
 
-bool stream_apply_send_sync_sentinel(StreamApplyContext *context);
-bool stream_apply_fetch_sync_sentinel(StreamApplyContext *context);
-
 bool stream_apply_file(StreamApplyContext *context);
 
 bool stream_apply_sql(StreamApplyContext *context,
@@ -695,6 +687,7 @@ bool stream_apply_sql(StreamApplyContext *context,
 					  const char *sql);
 
 bool stream_apply_init_context(StreamApplyContext *context,
+							   DatabaseCatalog *sourceDB,
 							   CDCPaths *paths,
 							   ConnStrings *connStrings,
 							   char *origin,
@@ -706,14 +699,9 @@ bool computeSQLFileName(StreamApplyContext *context);
 
 bool parseSQLAction(const char *query, LogicalMessageMetadata *metadata);
 
-bool stream_apply_track_insert_lsn(StreamApplyContext *context,
-								   uint64_t sourceLSN);
-
 bool stream_apply_find_durable_lsn(StreamApplyContext *context,
 								   uint64_t *durableLSN);
 
-bool stream_apply_write_lsn_tracking(StreamApplyContext *context);
-bool stream_apply_read_lsn_tracking(StreamApplyContext *context);
 
 /* ld_replay */
 bool stream_replay(StreamSpecs *specs);

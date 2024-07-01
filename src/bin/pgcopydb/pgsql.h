@@ -186,6 +186,7 @@ typedef struct PGSQL
 	bool notificationReceived;
 
 	bool logSQL;
+	bool singleRowMode;
 
 	/*
 	 * Keeps track of the last sync time for the pipeline. This is relevant
@@ -284,6 +285,11 @@ bool pgsql_has_sequence_privilege(PGSQL *pgsql,
 								  const char *privilege,
 								  bool *granted);
 
+bool pgsql_has_table_privilege(PGSQL *pgsql,
+							   const char *tablename,
+							   const char *privilege,
+							   bool *granted);
+
 bool pgsql_get_search_path(PGSQL *pgsql, char *search_path, size_t size);
 bool pgsql_set_search_path(PGSQL *pgsql, char *search_path, bool local);
 bool pgsql_prepend_search_path(PGSQL *pgsql, const char *namespace);
@@ -302,11 +308,11 @@ bool pgsql_send_with_params(PGSQL *pgsql, const char *sql, int paramCount,
 bool pgsql_fetch_results(PGSQL *pgsql, bool *done,
 						 void *context, ParsePostgresResultCB *parseFun);
 
-bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
-				   int paramCount, const Oid *paramTypes);
-
 bool pgsql_enable_pipeline_mode(PGSQL *pgsql);
 bool pgsql_sync_pipeline(PGSQL *pgsql);
+
+bool pgsql_prepare(PGSQL *pgsql, const char *name, const char *sql,
+				   int paramCount, const Oid *paramTypes);
 
 bool pgsql_execute_prepared(PGSQL *pgsql, const char *name,
 							int paramCount, const char **paramValues,
@@ -316,11 +322,31 @@ void pgAutoCtlDebugNoticeProcessor(void *arg, const char *message);
 
 bool validate_connection_string(const char *connectionString);
 
-bool pgsql_truncate(PGSQL *pgsql, const char *qname);
+bool pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode);
 
-bool pg_copy(PGSQL *src, PGSQL *dst,
-			 const char *srcQname, const char *dstQname,
-			 bool truncate, uint64_t *bytesTransmitted);
+bool pgsql_truncate(PGSQL *pgsql, const char *qname, bool only);
+
+bool pgsql_is_table_partition_root(PGSQL *pgsql,
+								   const char *nspname,
+								   const char *relname,
+								   bool *isRoot);
+typedef struct CopyArgs
+{
+	char *srcQname;
+	char *srcAttrList;
+	char *srcWhereClause;
+	char *dstQname;
+	char *dstAttrList;
+	char *logCommand;
+	bool truncate;
+
+	/* By default TRUNCATE ONLY is used, but we can also truncate descendants */
+	bool truncateDescendants;
+	bool freeze;
+	uint64_t bytesTransmitted;
+} CopyArgs;
+
+bool pg_copy(PGSQL *src, PGSQL *dst, CopyArgs *args);
 
 bool pg_copy_from_stdin(PGSQL *pgsql, const char *qname);
 bool pg_copy_row_from_stdin(PGSQL *pgsql, char *fmt, ...);
@@ -335,7 +361,8 @@ bool pgsql_set_gucs(PGSQL *pgsql, GUC *settings);
 bool pg_copy_large_object(PGSQL *src,
 						  PGSQL *dst,
 						  bool dropIfExists,
-						  uint32_t oid);
+						  uint32_t oid,
+						  uint64_t *bytesTransmitted);
 
 /*
  * Maximum length of serialized pg_lsn value
@@ -495,6 +522,7 @@ typedef struct ReplicationSlot
 	uint64_t lsn;
 	char snapshot[BUFSIZE];
 	StreamOutputPlugin plugin;
+	bool wal2jsonNumericAsString;
 } ReplicationSlot;
 
 bool pgsql_create_logical_replication_slot(LogicalStreamClient *client,
@@ -510,6 +538,8 @@ bool pgsql_stream_logical(LogicalStreamClient *client,
 #define MINIMUM_VERSION_FOR_SHOW_CMD 100000
 
 bool RetrieveWalSegSize(LogicalStreamClient *client);
+
+bool pgsql_get_block_size(PGSQL *pgsql, int *blockSize);
 
 bool pgsql_replication_origin_oid(PGSQL *pgsql, char *nodeName, uint32_t *oid);
 bool pgsql_replication_origin_create(PGSQL *pgsql, char *nodeName);
@@ -541,48 +571,16 @@ bool pgsql_drop_replication_slot(PGSQL *pgsql, const char *slotName);
 
 bool pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists);
 
+bool pgsql_configuration_exists(PGSQL *pgsql, const char *setconfig, bool *exists);
+
 bool pgsql_table_exists(PGSQL *pgsql,
+						uint32_t oid,
 						const char *relname,
 						const char *nspname,
 						bool *exists);
 
 bool pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn);
 bool pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn);
-
-/*
- * pgcopydb sentinel is a table that's created on the source database and
- * allows communicating elements from the outside, and in between the receive
- * and apply processes.
- */
-typedef struct CopyDBSentinel
-{
-	bool apply;
-	uint64_t startpos;
-	uint64_t endpos;
-	uint64_t write_lsn;
-	uint64_t flush_lsn;
-	uint64_t replay_lsn;
-} CopyDBSentinel;
-
-bool pgsql_update_sentinel_startpos(PGSQL *pgsql, uint64_t startpos);
-bool pgsql_update_sentinel_endpos(PGSQL *pgsql, bool current, uint64_t endpos);
-bool pgsql_update_sentinel_apply(PGSQL *pgsql, bool apply);
-
-bool pgsql_get_sentinel(PGSQL *pgsql, CopyDBSentinel *sentinel);
-
-bool pgsql_sync_sentinel_recv(PGSQL *pgsql,
-							  uint64_t write_lsn,
-							  uint64_t flush_lsn,
-							  CopyDBSentinel *sentinel);
-
-bool pgsql_sync_sentinel_apply(PGSQL *pgsql,
-							   uint64_t replay_lsn,
-							   CopyDBSentinel *sentinel);
-
-bool pgsql_send_sync_sentinel_apply(PGSQL *pgsql, uint64_t replay_lsn);
-bool pgsql_fetch_sync_sentinel_apply(PGSQL *pgsql,
-									 bool *retry,
-									 CopyDBSentinel *sentinel);
 
 char * pgsql_escape_identifier(PGSQL *pgsql, char *src);
 #endif /* PGSQL_H */

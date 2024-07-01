@@ -43,6 +43,12 @@ psql -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/multi-wal-txn.sql
 # check the replication slot file contents
 cat /var/lib/postgres/.local/share/pgcopydb/slot
 
+# check the sqlite setup contents too
+sqlite3 ${TMPDIR}/pgcopydb/schema/source.db <<EOF
+.mode line
+select * from setup;
+EOF
+
 # copy the data
 pgcopydb copy table-data
 
@@ -67,6 +73,12 @@ psql -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}" > /tmp/t.out
 diff /tmp/s.out /tmp/t.out
 
 sql="select f1, length(f2) from table_a where f2 is not null order by f1"
+psql -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}" > /tmp/s.out
+psql -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}" > /tmp/t.out
+
+diff /tmp/s.out /tmp/t.out
+
+sql="select * from update_test"
 psql -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}" > /tmp/s.out
 psql -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}" > /tmp/t.out
 

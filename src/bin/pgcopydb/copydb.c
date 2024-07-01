@@ -95,7 +95,6 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 					bool createWorkDir)
 {
 	CopyFilePaths *cfPaths = &(copySpecs->cfPaths);
-	DirectoryState *dirState = &(copySpecs->dirState);
 
 	if (!copydb_prepare_filepaths(cfPaths, dir, serviceName))
 	{
@@ -103,7 +102,7 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 		return false;
 	}
 
-	log_notice("Using work dir \"%s\"", cfPaths->topdir);
+	log_info("Using work dir \"%s\"", cfPaths->topdir);
 
 	/*
 	 * Some inspection commands piggy-back on the work directory that has been
@@ -121,56 +120,6 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 	if (restart)
 	{
 		removeDir = true;
-	}
-	else
-	{
-		if (!copydb_inspect_workdir(cfPaths, dirState))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		if (dirState->directoryExists)
-		{
-			/* if we did nothing yet, just act as if --resume was used */
-			if (!dirState->schemaDumpIsDone)
-			{
-				log_notice("Schema dump has not been done yet, just continue");
-			}
-
-			/* if --resume has been used, we just continue */
-			else if (resume)
-			{
-				/* no-op */
-				(void) 0;
-			}
-			else if (dirState->allDone)
-			{
-				log_fatal("Please use --restart to allow for removing files "
-						  "that belong to a completed previous run.");
-				return false;
-			}
-			else if (!resume)
-			{
-				log_fatal("Please use --resume --not-consistent to allow "
-						  "for resuming from the previous run, "
-						  "which failed before completion.");
-				return false;
-			}
-
-			/*
-			 * Here we should have restart true or resume true or we didn't even do
-			 * the schema dump on the previous run.
-			 */
-		}
-	}
-
-	/* warn about trashing data from a previous run */
-	if (removeDir && !restart)
-	{
-		log_notice("Inspection of \"%s\" shows that it is safe "
-				   "to remove it and continue",
-				   cfPaths->topdir);
 	}
 
 	if (removeDir)
@@ -198,9 +147,6 @@ copydb_init_workdir(CopyDataSpec *copySpecs,
 	/* and now for the other sub-directories */
 	const char *dirs[] = {
 		cfPaths->schemadir,
-		cfPaths->rundir,
-		cfPaths->tbldir,
-		cfPaths->idxdir,
 		cfPaths->cdc.dir,
 		cfPaths->compare.dir,
 		NULL
@@ -313,117 +259,6 @@ copydb_create_pidfile(const char *pidfile, pid_t pid, bool createPidFile)
 
 
 /*
- * copydb_inspect_workdir inspects the given target directory to see what work
- * has been tracked in there. From the doneFile(s) and the lockFile(s) that we
- * can list in the directory, we can have a good idea of why the command is
- * attempted to be run again.
- */
-bool
-copydb_inspect_workdir(CopyFilePaths *cfPaths, DirectoryState *dirState)
-{
-	dirState->directoryExists = directory_exists(cfPaths->topdir);
-
-	if (!dirState->directoryExists)
-	{
-		return true;
-	}
-
-	/* the directory exists, checks if our expected components are there */
-	bool foundAllComponents = true;
-
-	const char *dirs[] = {
-		cfPaths->schemadir,
-		cfPaths->rundir,
-		cfPaths->tbldir,
-		cfPaths->idxdir,
-		NULL
-	};
-
-	for (int i = 0; dirs[i] != NULL; i++)
-	{
-		foundAllComponents = foundAllComponents && directory_exists(dirs[i]);
-	}
-
-	if (!foundAllComponents)
-	{
-		log_debug("copydb_inspect_workdir: not all components found");
-		dirState->directoryIsReady = false;
-		return true;
-	}
-
-	dirState->schemaDumpIsDone =
-		file_exists(cfPaths->done.preDataDump) &&
-		file_exists(cfPaths->done.postDataDump);
-
-	dirState->schemaPreDataHasBeenRestored =
-		file_exists(cfPaths->done.preDataRestore);
-
-	dirState->schemaPostDataHasBeenRestored =
-		file_exists(cfPaths->done.postDataRestore);
-
-	dirState->tableCopyIsDone = file_exists(cfPaths->done.tables);
-	dirState->indexCopyIsDone = file_exists(cfPaths->done.indexes);
-	dirState->sequenceCopyIsDone = file_exists(cfPaths->done.sequences);
-	dirState->blobsCopyIsDone = file_exists(cfPaths->done.blobs);
-
-	dirState->allDone =
-		dirState->schemaDumpIsDone &&
-		dirState->schemaPreDataHasBeenRestored &&
-		dirState->schemaPostDataHasBeenRestored &&
-		dirState->tableCopyIsDone &&
-		dirState->indexCopyIsDone &&
-		dirState->sequenceCopyIsDone &&
-		dirState->blobsCopyIsDone;
-
-	/* let's be verbose about our inspection results */
-	log_notice("Work directory \"%s\" already exists", cfPaths->topdir);
-
-	if (dirState->allDone)
-	{
-		log_info("A previous run has run through completion");
-		return true;
-	}
-
-	if (dirState->schemaDumpIsDone)
-	{
-		log_info("Schema dump for pre-data and post-data section have been done");
-	}
-
-	if (dirState->schemaPreDataHasBeenRestored)
-	{
-		log_info("Pre-data schema has been restored on the target instance");
-	}
-
-	if (dirState->tableCopyIsDone)
-	{
-		log_info("All the table data has been copied to the target instance");
-	}
-
-	if (dirState->indexCopyIsDone)
-	{
-		log_info("All the indexes have been copied to the target instance");
-	}
-
-	if (dirState->sequenceCopyIsDone)
-	{
-		log_info("All the sequences have been copied to the target instance");
-	}
-
-	if (dirState->blobsCopyIsDone)
-	{
-		log_info("All the large objects have been copied to the target instance");
-	}
-
-	if (dirState->schemaPostDataHasBeenRestored)
-	{
-		log_info("Post-data schema has been restored on the target instance");
-	}
-
-	return true;
-}
-
-
-/*
  * copydb_prepare_filepaths computes all the path components that are needed
  * for top-level operations.
  */
@@ -468,41 +303,18 @@ copydb_prepare_filepaths(CopyFilePaths *cfPaths,
 
 	/* now that we have our topdir, prepare all the others from there */
 	sformat(cfPaths->snfile, MAXPGPATH, "%s/snapshot", cfPaths->topdir);
+
+	/* internal catalogs db files are in the schemadir */
 	sformat(cfPaths->schemadir, MAXPGPATH, "%s/schema", cfPaths->topdir);
-	sformat(cfPaths->rundir, MAXPGPATH, "%s/run", cfPaths->topdir);
-	sformat(cfPaths->tbldir, MAXPGPATH, "%s/run/tables", cfPaths->topdir);
-	sformat(cfPaths->idxdir, MAXPGPATH, "%s/run/indexes", cfPaths->topdir);
+	sformat(cfPaths->sdbfile, MAXPGPATH, "%s/source.db", cfPaths->schemadir);
+	sformat(cfPaths->fdbfile, MAXPGPATH, "%s/filter.db", cfPaths->schemadir);
+	sformat(cfPaths->tdbfile, MAXPGPATH, "%s/target.db", cfPaths->schemadir);
 
 	/* prepare also the name of the schema file (JSON) */
 	sformat(cfPaths->schemafile, MAXPGPATH, "%s/schema.json", cfPaths->topdir);
 
 	/* prepare also the name of the summary file (JSON) */
 	sformat(cfPaths->summaryfile, MAXPGPATH, "%s/summary.json", cfPaths->topdir);
-
-	/* now prepare the done files */
-	struct pair
-	{
-		char *dst;
-		char *fmt;
-	};
-
-	struct pair donePaths[] = {
-		{ (char *) &(cfPaths->done.preDataDump), "%s/run/dump-pre.done" },
-		{ (char *) &(cfPaths->done.postDataDump), "%s/run/dump-post.done" },
-		{ (char *) &(cfPaths->done.preDataRestore), "%s/run/restore-pre.done" },
-		{ (char *) &(cfPaths->done.postDataRestore), "%s/run/restore-post.done" },
-
-		{ (char *) &(cfPaths->done.tables), "%s/run/tables.done" },
-		{ (char *) &(cfPaths->done.indexes), "%s/run/indexes.done" },
-		{ (char *) &(cfPaths->done.sequences), "%s/run/sequences.done" },
-		{ (char *) &(cfPaths->done.blobs), "%s/run/blobs.done" },
-		{ NULL, NULL }
-	};
-
-	for (int i = 0; donePaths[i].dst != NULL; i++)
-	{
-		sformat(donePaths[i].dst, MAXPGPATH, donePaths[i].fmt, cfPaths->topdir);
-	}
 
 	/*
 	 * Now prepare the Change Data Capture (logical decoding) intermediate
@@ -611,17 +423,14 @@ copydb_prepare_dump_paths(CopyFilePaths *cfPaths, DumpPaths *dumpPaths)
 	sformat(dumpPaths->extnspFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "extnamespaces.dump");
 
-	sformat(dumpPaths->preFilename, MAXPGPATH, "%s/%s",
-			cfPaths->schemadir, "pre.dump");
+	sformat(dumpPaths->dumpFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "schema.dump");
 
 	sformat(dumpPaths->preListOutFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "pre-out.list");
 
 	sformat(dumpPaths->preListFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "pre-filtered.list");
-
-	sformat(dumpPaths->postFilename, MAXPGPATH, "%s/%s",
-			cfPaths->schemadir, "post.dump");
 
 	sformat(dumpPaths->postListOutFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "post-out.list");
@@ -694,8 +503,6 @@ copydb_init_specs(CopyDataSpec *specs,
 			.snapshot = { 0 }
 		},
 
-		.catalog = specs->catalog,
-
 		.section = section,
 		.restoreOptions = options->restoreOptions,
 		.roles = options->roles,
@@ -704,12 +511,20 @@ copydb_init_specs(CopyDataSpec *specs,
 		.skipCommentOnExtension = options->skipCommentOnExtension,
 		.skipCollations = options->skipCollations,
 		.skipVacuum = options->skipVacuum,
+		.skipAnalyze = options->skipAnalyze,
+		.skipDBproperties = options->skipDBproperties,
+		.skipCtidSplit = options->skipCtidSplit,
 		.noRolesPasswords = options->noRolesPasswords,
 		.failFast = options->failFast,
 
 		.restart = options->restart,
 		.resume = options->resume,
 		.consistent = !options->notConsistent,
+
+		.fetchCatalogs = specs->fetchCatalogs,
+
+		/* internal option only, not exposed */
+		.fetchFilteredOids = true,
 
 		.tableJobs = options->tableJobs,
 		.indexJobs = options->indexJobs,
@@ -719,14 +534,13 @@ copydb_init_specs(CopyDataSpec *specs,
 		.vacuumJobs = options->tableJobs,
 
 		.splitTablesLargerThan = options->splitTablesLargerThan,
+		.splitMaxParts = options->splitMaxParts,
+		.estimateTableSizes = options->estimateTableSizes,
 
-		.tableSemaphore = { 0 },
-		.indexSemaphore = { 0 },
+		.vacuumQueue = { NULL, -1 },
+		.indexQueue = { NULL, -1 },
 
-		.vacuumQueue = { 0 },
-		.indexQueue = { 0 },
-
-		.tableSpecsArray = { 0, NULL }
+		.catalogs = { 0 }
 	};
 
 	if (!IS_EMPTY_STRING_BUFFER(options->snapshot))
@@ -746,41 +560,39 @@ copydb_init_specs(CopyDataSpec *specs,
 		return false;
 	}
 
-	/* create the table semaphore (critical section, one at a time please) */
-	specs->tableSemaphore.initValue = 1;
+	/* Initialize the internal catalogs */
+	DatabaseCatalog *source = &(specs->catalogs.source);
+	DatabaseCatalog *filter = &(specs->catalogs.filter);
+	DatabaseCatalog *target = &(specs->catalogs.target);
 
-	if (!semaphore_create(&(specs->tableSemaphore)))
+	/* init the catalog type */
+	source->type = DATABASE_CATALOG_TYPE_SOURCE;
+	filter->type = DATABASE_CATALOG_TYPE_FILTER;
+	target->type = DATABASE_CATALOG_TYPE_TARGET;
+
+	/* pick the dbfile from the specs */
+	strlcpy(source->dbfile, specs->cfPaths.sdbfile, sizeof(source->dbfile));
+	strlcpy(filter->dbfile, specs->cfPaths.fdbfile, sizeof(filter->dbfile));
+	strlcpy(target->dbfile, specs->cfPaths.tdbfile, sizeof(target->dbfile));
+
+	bool shouldCreateVacuumQueue = (specs->section == DATA_SECTION_ALL ||
+									specs->section == DATA_SECTION_INDEXES ||
+									specs->section == DATA_SECTION_TABLE_DATA) &&
+								   !specs->skipVacuum;
+	if (shouldCreateVacuumQueue)
 	{
-		log_error("Failed to create the table concurrency semaphore "
-				  "to orchestrate %d TABLE DATA COPY jobs",
-				  options->tableJobs);
-		return false;
-	}
-
-	/* create the index semaphore (critical section, one at a time please) */
-	specs->indexSemaphore.initValue = 1;
-
-	if (!semaphore_create(&(specs->indexSemaphore)))
-	{
-		log_error("Failed to create the index concurrency semaphore "
-				  "to orchestrate %d CREATE INDEX jobs",
-				  options->indexJobs);
-		return false;
+		if (!queue_create(&(specs->vacuumQueue), "vacuum"))
+		{
+			log_error("Failed to create the VACUUM process queue");
+			return false;
+		}
 	}
 
 	if (specs->section == DATA_SECTION_ALL ||
+		specs->section == DATA_SECTION_INDEXES ||
+		specs->section == DATA_SECTION_CONSTRAINTS ||
 		specs->section == DATA_SECTION_TABLE_DATA)
 	{
-		/* create the VACUUM process queue */
-		if (!specs->skipVacuum)
-		{
-			if (!queue_create(&(specs->vacuumQueue), "vacuum"))
-			{
-				log_error("Failed to create the VACUUM process queue");
-				return false;
-			}
-		}
-
 		/* create the CREATE INDEX process queue */
 		if (!queue_create(&(specs->indexQueue), "create index"))
 		{
@@ -789,7 +601,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		}
 	}
 
-	/* we only respect the --skip-blobs option in pgcopydb copy-db command */
+	/* we only respect the --skip-blobs option in pgcopydb clone command */
 	if (specs->section != DATA_SECTION_ALL)
 	{
 		specs->skipLargeObjects = true;
@@ -821,57 +633,32 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 		.resume = specs->resume,
 
 		.sourceTable = source,
-		.indexArray = NULL,
-		.summary = NULL,
+		.summary = { 0 },
 
 		.tableJobs = specs->tableJobs,
-		.indexJobs = specs->indexJobs,
-
-		.indexSemaphore = &(specs->indexSemaphore)
+		.indexJobs = specs->indexJobs
 	};
 
 	/* copy the structure as a whole memory area to the target place */
 	*tableSpecs = tmpTableSpecs;
 
 	/* This CopyTableDataSpec might be for a partial COPY */
-	if (source->partsArray.count >= 1)
+	if (source->partition.partCount >= 1)
 	{
-		CopyTableDataPartSpec part = {
-			.partNumber = partNumber,
-			.partCount = source->partsArray.array[partNumber].partCount,
-			.min = source->partsArray.array[partNumber].min,
-			.max = source->partsArray.array[partNumber].max
-		};
+		tableSpecs->part.partNumber = source->partition.partNumber;
+		tableSpecs->part.partCount = source->partition.partCount;
+		tableSpecs->part.min = source->partition.min;
+		tableSpecs->part.max = source->partition.max;
 
-		tableSpecs->part = part;
-
-		strlcpy(tableSpecs->part.partKey, source->partKey, NAMEDATALEN);
-
-		/* now compute the table-specific paths we are using in copydb */
-		if (!copydb_init_tablepaths_for_part(tableSpecs->cfPaths,
-											 &(tableSpecs->tablePaths),
-											 tableSpecs->sourceTable->oid,
-											 partNumber))
+		/* tables that are partitioned without a partKey are using CTID */
+		if (!IS_EMPTY_STRING_BUFFER(source->partKey))
 		{
-			log_error("Failed to prepare pathnames for partition %d of table %s",
-					  partNumber,
-					  tableSpecs->sourceTable->qname);
-			return false;
+			strlcpy(tableSpecs->part.partKey, source->partKey, NAMEDATALEN);
 		}
-
-		/* used only by one process, the one finishing a partial COPY last */
-		sformat(tableSpecs->tablePaths.idxListFile, MAXPGPATH, "%s/%u.idx",
-				tableSpecs->cfPaths->tbldir,
-				source->oid);
-
-		/*
-		 * And now the truncateLockFile and truncateDoneFile, which are used to
-		 * provide a critical section to the same-table concurrent processes.
-		 */
-		sformat(tableSpecs->tablePaths.truncateDoneFile, MAXPGPATH,
-				"%s/%u.truncate",
-				tableSpecs->cfPaths->tbldir,
-				source->oid);
+		else
+		{
+			strlcpy(tableSpecs->part.partKey, "ctid", NAMEDATALEN);
+		}
 	}
 	else
 	{
@@ -881,73 +668,10 @@ copydb_init_table_specs(CopyTableDataSpec *tableSpecs,
 			log_error("BUG: copydb_init_table_specs partNumber is %d and "
 					  "source table partArray.count is %d",
 					  partNumber,
-					  source->partsArray.count);
-			return false;
-		}
-
-		/* now compute the table-specific paths we are using in copydb */
-		if (!copydb_init_tablepaths(tableSpecs->cfPaths,
-									&(tableSpecs->tablePaths),
-									tableSpecs->sourceTable->oid))
-		{
-			log_error("Failed to prepare pathnames for table %u",
-					  tableSpecs->sourceTable->oid);
+					  source->partition.partCount);
 			return false;
 		}
 	}
-
-	return true;
-}
-
-
-/*
- * copydb_init_tablepaths computes the lockFile, doneFile, and idxListFile
- * pathnames for a given table oid and global cfPaths setup.
- */
-bool
-copydb_init_tablepaths(CopyFilePaths *cfPaths,
-					   TableFilePaths *tablePaths,
-					   uint32_t oid)
-{
-	sformat(tablePaths->lockFile, MAXPGPATH, "%s/%d",
-			cfPaths->rundir,
-			oid);
-
-	sformat(tablePaths->doneFile, MAXPGPATH, "%s/%d.done",
-			cfPaths->tbldir,
-			oid);
-
-	sformat(tablePaths->idxListFile, MAXPGPATH, "%s/%u.idx",
-			cfPaths->tbldir,
-			oid);
-
-	sformat(tablePaths->chksumFile, MAXPGPATH, "%s/%u.sum.json",
-			cfPaths->tbldir,
-			oid);
-
-	return true;
-}
-
-
-/*
- * copydb_init_tablepaths_for_part computes the lockFile and doneFile pathnames
- * for a given COPY partition of a table.
- */
-bool
-copydb_init_tablepaths_for_part(CopyFilePaths *cfPaths,
-								TableFilePaths *tablePaths,
-								uint32_t oid,
-								int partNumber)
-{
-	sformat(tablePaths->lockFile, MAXPGPATH, "%s/%d.%d",
-			cfPaths->rundir,
-			oid,
-			partNumber);
-
-	sformat(tablePaths->doneFile, MAXPGPATH, "%s/%d.%d.done",
-			cfPaths->tbldir,
-			oid,
-			partNumber);
 
 	return true;
 }
@@ -1025,8 +749,14 @@ copydb_wait_for_subprocesses(bool failFast)
 			default:
 			{
 				int returnCode = WEXITSTATUS(status);
+				int sig = 0;
 
-				if (returnCode == 0)
+				if (WIFSIGNALED(status))
+				{
+					sig = WTERMSIG(status);
+				}
+
+				if (returnCode == 0 && signal_is_handled(sig))
 				{
 					log_debug("Sub-process %d exited with code %d",
 							  pid, returnCode);
@@ -1035,8 +765,17 @@ copydb_wait_for_subprocesses(bool failFast)
 				{
 					allReturnCodeAreZero = false;
 
-					log_error("Sub-process %d exited with code %d",
-							  pid, returnCode);
+					if (sig == 0)
+					{
+						log_error("Sub-process %d exited with code %d",
+								  pid, returnCode);
+					}
+					else
+					{
+						log_error("Sub-process %d exited with code %d "
+								  "and signal %s",
+								  pid, returnCode, signal_to_string(sig));
+					}
 
 					if (failFast)
 					{

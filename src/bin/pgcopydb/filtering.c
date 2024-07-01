@@ -8,6 +8,8 @@
 #include <getopt.h>
 #include <inttypes.h>
 
+#include "parson.h"
+
 #include "env_utils.h"
 #include "file_utils.h"
 #include "ini.h"
@@ -135,7 +137,6 @@ parse_filters(const char *filename, SourceFilters *filters)
 	}
 
 	ini_t *ini = ini_load(fileContents, NULL);
-	free(fileContents);
 
 	/*
 	 * The index in the sections array matches the SourceFilterSection enum
@@ -151,6 +152,7 @@ parse_filters(const char *filename, SourceFilters *filters)
 	{
 		{ "include-only-schema", SOURCE_FILTER_INCLUDE_ONLY_SCHEMA, NULL },
 		{ "exclude-schema", SOURCE_FILTER_EXCLUDE_SCHEMA, NULL },
+		{ "exclude-extension", SOURCE_FILTER_EXCLUDE_EXTENSION, NULL },
 		{
 			"exclude-table",
 			SOURCE_FILTER_EXCLUDE_TABLE,
@@ -165,11 +167,6 @@ parse_filters(const char *filename, SourceFilters *filters)
 			"exclude-index",
 			SOURCE_FILTER_EXCLUDE_INDEX,
 			&(filters->excludeIndexList)
-		},
-		{
-			"exclude-extension",
-			SOURCE_FILTER_EXCLUDE_EXTENSION,
-			&(filters->excludeExtensionList)
 		},
 		{
 			"include-only-table",
@@ -193,7 +190,7 @@ parse_filters(const char *filename, SourceFilters *filters)
 
 		if (strcmp(ini_section_name(ini, sectionIndex), sectionName) != 0)
 		{
-			/* skip prefix match, only accept full lenght match */
+			/* skip prefix match, only accept full length match */
 			continue;
 		}
 
@@ -218,6 +215,12 @@ parse_filters(const char *filename, SourceFilters *filters)
 					(SourceFilterSchema *) calloc(optionCount,
 												  sizeof(SourceFilterSchema));
 
+				if (filters->includeOnlySchemaList.array == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
+
 				for (int o = 0; o < optionCount; o++)
 				{
 					SourceFilterSchema *schema =
@@ -239,6 +242,12 @@ parse_filters(const char *filename, SourceFilters *filters)
 				filters->excludeSchemaList.array =
 					(SourceFilterSchema *) calloc(optionCount,
 												  sizeof(SourceFilterSchema));
+
+				if (filters->excludeSchemaList.array == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
 
 				for (int o = 0; o < optionCount; o++)
 				{
@@ -263,8 +272,15 @@ parse_filters(const char *filename, SourceFilters *filters)
 				SourceFilterTableList *list = sections[i].list;
 
 				list->count = optionCount;
-				list->array = (SourceFilterTable *)
-							  malloc(optionCount * sizeof(SourceFilterTable));
+				list->array =
+					(SourceFilterTable *) calloc(optionCount,
+												 sizeof(SourceFilterTable));
+
+				if (list->array == NULL)
+				{
+					log_error(ALLOCATION_FAILED_ERROR);
+					return false;
+				}
 
 				for (int o = 0; o < optionCount; o++)
 				{
@@ -294,7 +310,7 @@ parse_filters(const char *filename, SourceFilters *filters)
 				filters->excludeExtensionList.count = optionCount;
 				filters->excludeExtensionList.array =
 					(SourceFilterExtension *) calloc(optionCount,
-													  sizeof(SourceFilterExtension));
+													 sizeof(SourceFilterExtension));
 
 				for (int o = 0; o < optionCount; o++)
 				{
@@ -464,7 +480,7 @@ parse_filter_quoted_table_name(SourceFilterTable *table, const char *qname)
 	if (nspbytes >= sizeof(table->nspname))
 	{
 		log_error("Failed to parse schema name \"%s\" (%d bytes long), "
-				  "pgcopydb and Postgres only support names up to %lu bytes",
+				  "pgcopydb and Postgres only support names up to %zu bytes",
 				  table->nspname,
 				  nsplen,
 				  sizeof(table->nspname));
@@ -499,11 +515,102 @@ parse_filter_quoted_table_name(SourceFilterTable *table, const char *qname)
 	if (relbytes >= sizeof(table->relname))
 	{
 		log_error("Failed to parse relation name \"%s\" (%d bytes long), "
-				  "pgcopydb and Postgres only support names up to %lu bytes",
+				  "pgcopydb and Postgres only support names up to %zu bytes",
 				  table->relname,
 				  rellen,
 				  sizeof(table->relname));
 		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_filtering_as_json prepares the filtering setup of the CopyDataSpecs
+ * as a JSON object within the given JSON_Value.
+ */
+bool
+filters_as_json(SourceFilters *filters, JSON_Value *jsFilter)
+{
+	JSON_Object *jsFilterObj = json_value_get_object(jsFilter);
+
+	json_object_set_string(jsFilterObj,
+						   "type",
+						   filterTypeToString(filters->type));
+
+	/* include-only-schema */
+	if (filters->includeOnlySchemaList.count > 0)
+	{
+		JSON_Value *jsSchema = json_value_init_array();
+		JSON_Array *jsSchemaArray = json_value_get_array(jsSchema);
+
+		for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
+		{
+			char *nspname = filters->includeOnlySchemaList.array[i].nspname;
+
+			json_array_append_string(jsSchemaArray, nspname);
+		}
+
+		json_object_set_value(jsFilterObj, "include-only-schema", jsSchema);
+	}
+
+	/* exclude-schema */
+	if (filters->excludeSchemaList.count > 0)
+	{
+		JSON_Value *jsSchema = json_value_init_array();
+		JSON_Array *jsSchemaArray = json_value_get_array(jsSchema);
+
+		for (int i = 0; i < filters->excludeSchemaList.count; i++)
+		{
+			char *nspname = filters->excludeSchemaList.array[i].nspname;
+
+			json_array_append_string(jsSchemaArray, nspname);
+		}
+
+		json_object_set_value(jsFilterObj, "exclude-schema", jsSchema);
+	}
+
+	/* exclude table lists */
+	struct section
+	{
+		char name[PG_NAMEDATALEN];
+		SourceFilterTableList *list;
+	};
+
+	struct section sections[] = {
+		{ "exclude-table", &(filters->excludeTableList) },
+		{ "exclude-table-data", &(filters->excludeTableDataList) },
+		{ "exclude-index", &(filters->excludeIndexList) },
+		{ "include-only-table", &(filters->includeOnlyTableList) },
+		{ "", NULL },
+	};
+
+	for (int i = 0; sections[i].list != NULL; i++)
+	{
+		char *sectionName = sections[i].name;
+		SourceFilterTableList *list = sections[i].list;
+
+		if (list->count > 0)
+		{
+			JSON_Value *jsList = json_value_init_array();
+			JSON_Array *jsListArray = json_value_get_array(jsList);
+
+			for (int j = 0; j < list->count; j++)
+			{
+				SourceFilterTable *table = &(list->array[j]);
+
+				JSON_Value *jsTable = json_value_init_object();
+				JSON_Object *jsTableObj = json_value_get_object(jsTable);
+
+				json_object_set_string(jsTableObj, "schema", table->nspname);
+				json_object_set_string(jsTableObj, "name", table->relname);
+
+				json_array_append_value(jsListArray, jsTable);
+			}
+
+			json_object_set_value(jsFilterObj, sectionName, jsList);
+		}
 	}
 
 	return true;

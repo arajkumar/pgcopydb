@@ -1,5 +1,5 @@
 /*
- * src/bin/pg_autoctl/pgcmd.h
+ * src/bin/pgcopydb/pgcmd.h
  *   API for running PostgreSQL commands such as pg_dump and pg_restore.
  *
  */
@@ -16,6 +16,7 @@
 #include "defaults.h"
 #include "file_utils.h"
 #include "filtering.h"
+#include "log.h"
 #include "parsing_utils.h"
 #include "pgsql.h"
 #include "schema.h"
@@ -30,6 +31,7 @@ typedef struct PostgresPaths
 	char pg_dump[MAXPGPATH];
 	char pg_dumpall[MAXPGPATH];
 	char pg_restore[MAXPGPATH];
+	char vacuumdb[MAXPGPATH];
 	char pg_version[PG_VERSION_STRING_MAX];
 } PostgresPaths;
 
@@ -48,6 +50,7 @@ typedef enum
 	ARCHIVE_TAG_COMMENT,
 	ARCHIVE_TAG_CONSTRAINT,
 	ARCHIVE_TAG_CONVERSION,
+	ARCHIVE_TAG_DATABASE,
 	ARCHIVE_TAG_DEFAULT_ACL,
 	ARCHIVE_TAG_DEFAULT,
 	ARCHIVE_TAG_DOMAIN,
@@ -180,6 +183,54 @@ typedef struct ArchiveContentArray
 	ArchiveContentItem *array;  /* malloc'ed area */
 } ArchiveContentArray;
 
+/* specify section of a dump: pre-data, post-data, data, schema */
+typedef enum
+{
+	PG_DUMP_SECTION_ALL = 0,
+	PG_DUMP_SECTION_SCHEMA,
+	PG_DUMP_SECTION_PRE_DATA,
+	PG_DUMP_SECTION_POST_DATA,
+	PG_DUMP_SECTION_DATA,
+	PG_DUMP_SECTION_ROLES       /* pg_dumpall --roles-only */
+} PostgresDumpSection;
+
+
+/*
+ * Enumeration representing the different section options of
+ * a Postgres restore operation.
+ */
+typedef enum
+{
+	PG_RESTORE_SECTION_PRE_DATA = 0,
+	PG_RESTORE_SECTION_POST_DATA,
+} PostgresRestoreSection;
+
+/*
+ * Convert PostgresDumpSection to string.
+ */
+static inline const char *
+postgresRestoreSectionToString(PostgresRestoreSection section)
+{
+	switch (section)
+	{
+		case PG_RESTORE_SECTION_PRE_DATA:
+		{
+			return "pre-data";
+		}
+
+		case PG_RESTORE_SECTION_POST_DATA:
+		{
+			return "post-data";
+		}
+
+		default:
+		{
+			log_error("unknown PostgresRestoreSection value %d", section);
+			return NULL;
+		}
+	}
+}
+
 
 typedef struct RestoreOptions
 {
@@ -187,6 +238,9 @@ typedef struct RestoreOptions
 	bool noOwner;
 	bool noComments;
 	bool noACL;
+	bool noTableSpaces;
+	int jobs;
+	PostgresRestoreSection section;
 } RestoreOptions;
 
 bool psql_version(PostgresPaths *pgPaths);
@@ -200,10 +254,11 @@ bool set_psql_from_pg_config(PostgresPaths *pgPaths);
 bool pg_dump_db(PostgresPaths *pgPaths,
 				ConnStrings *connStrings,
 				const char *snapshot,
-				const char *section,
 				SourceFilters *filters,
-				SourceExtensionArray *extensionArray,
+				DatabaseCatalog *filtersDB,
 				const char *filename);
+
+bool pg_vacuumdb_analyze_only(PostgresPaths *pgPaths, ConnStrings *connStrings, int jobs);
 
 bool pg_dumpall_roles(PostgresPaths *pgPaths,
 					  ConnStrings *connStrings,
@@ -238,7 +293,5 @@ bool parse_archive_extension(char *ptr, ArchiveContentItem *item);
 
 bool parse_archive_list_entry(ArchiveContentItem *item, const char *line);
 bool tokenize_archive_list_entry(ArchiveToken *token);
-
-bool FreeArchiveContentArray(ArchiveContentArray *contents);
 
 #endif /* PGCMD_H */

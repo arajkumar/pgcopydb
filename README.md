@@ -49,7 +49,6 @@ $ pgcopydb help
     clone     Clone an entire database from source to target
     fork      Clone an entire database from source to target
     follow    Replay changes from the source database to the target database
-    copy-db   Clone an entire database from source to target
     snapshot  Create and export a snapshot on the source database
   + compare   Compare source and target databases
   + copy      Implement the data section of the database copy
@@ -79,8 +78,6 @@ $ pgcopydb help
 
   pgcopydb dump
     schema     Dump source database schema as custom files in work directory
-    pre-data   Dump source database pre-data schema as custom files in work directory
-    post-data  Dump source database post-data schema as custom files in work directory
     roles      Dump source database roles as custom file in work directory
 
   pgcopydb restore
@@ -108,22 +105,21 @@ $ pgcopydb help
     prefetch   Stream JSON changes from the source database and transform them to SQL
     catchup    Apply prefetched changes from SQL files to the target database
     replay     Replay changes from the source to the target database, live
-  + sentinel   Maintain a sentinel table on the source database
+  + sentinel   Maintain a sentinel table
     receive    Stream changes from the source database
     transform  Transform changes from the source database into SQL commands
     apply      Apply changes from the source database into the target database
 
   pgcopydb stream sentinel
-    create  Create the sentinel table on the source database
-    drop    Drop the sentinel table on the source database
-    get     Get the sentinel table values on the source database
-  + set     Maintain a sentinel table on the source database
+    setup   Setup the sentinel table
+    get     Get the sentinel table values
+  + set     Set the sentinel table values
 
   pgcopydb stream sentinel set
-    startpos  Set the sentinel start position LSN on the source database
-    endpos    Set the sentinel end position LSN on the source database
-    apply     Set the sentinel apply mode on the source database
-    prefetch  Set the sentinel prefetch mode on the source database
+    startpos  Set the sentinel start position LSN
+    endpos    Set the sentinel end position LSN
+    apply     Set the sentinel apply mode
+    prefetch  Set the sentinel prefetch mode
 ```
 
 ## Example
@@ -144,96 +140,63 @@ the table COPY, cumulative timing for the CREATE INDEX commands), and then
 an overall summary that looks like the following:
 
 ```
-18:26:35 77615 INFO  [SOURCE] Copying database from "port=54311 host=localhost dbname=pgloader"
-18:26:35 77615 INFO  [TARGET] Copying database into "port=54311 dbname=plop"
-18:26:35 77615 INFO  STEP 1: dump the source database schema (pre/post data)
-18:26:35 77615 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section pre-data --file /tmp/pgcopydb/schema/pre.dump 'port=54311 host=localhost dbname=pgloader'
-18:26:35 77615 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section post-data --file /tmp/pgcopydb/schema/post.dump 'port=54311 host=localhost dbname=pgloader'
-18:26:36 77615 INFO  STEP 2: restore the pre-data section to the target database
-18:26:36 77615 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_restore --dbname 'port=54311 dbname=plop' /tmp/pgcopydb/schema/pre.dump
-18:26:36 77615 INFO  STEP 3: copy data from source to target in sub-processes
-18:26:36 77615 INFO  STEP 4: create indexes and constraints in parallel
-18:26:36 77615 INFO  STEP 5: vacuum analyze each table
-18:26:36 77615 INFO  Listing ordinary tables in "port=54311 host=localhost dbname=pgloader"
-18:26:36 77615 INFO  Fetched information for 56 tables
-...
-18:26:37 77615 INFO  STEP 6: restore the post-data section to the target database
-18:26:37 77615 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_restore --dbname 'port=54311 dbname=plop' --use-list /tmp/pgcopydb/schema/post.list /tmp/pgcopydb/schema/post.dump
+19:18:24.447 76974 INFO   Running pgcopydb version 0.15.74.gc74047a from "/usr/bin/pgcopydb"
+19:18:24.451 76974 INFO   [SOURCE] Copying database from "postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+19:18:24.451 76974 INFO   [TARGET] Copying database into "postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+19:18:24.506 76974 INFO   Using work dir "/tmp/pgcopydb"
+19:18:24.519 76974 INFO   Exported snapshot "00000003-00000023-1" from the source database
+19:18:24.522 76985 INFO   STEP 1: fetch source database tables, indexes, and sequences
+19:18:24.886 76985 INFO   Fetched information for 5 tables (including 0 tables split in 0 partitions total), with an estimated total of 1000 thousands tuples and 128 MB on-disk
+19:18:24.892 76985 INFO   Fetched information for 4 indexes (supporting 4 constraints)
+19:18:24.894 76985 INFO   Fetching information for 1 sequences
+19:18:24.909 76985 INFO   Fetched information for 1 extensions
+19:18:25.030 76985 INFO   Found 0 indexes (supporting 0 constraints) in the target database
+19:18:25.042 76985 INFO   STEP 2: dump the source database schema (pre/post data)
+19:18:25.046 76985 INFO    /usr/bin/pg_dump -Fc --snapshot 00000003-00000023-1 --section=pre-data --section=post-data --file /tmp/pgcopydb/schema/schema.dump 'postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
+19:18:25.182 76985 INFO   STEP 3: restore the pre-data section to the target database
+19:18:25.202 76985 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 2 --use-list /tmp/pgcopydb/schema/pre-filtered.list /tmp/pgcopydb/schema/schema.dump
+19:18:25.354 77000 INFO   STEP 4: starting 8 table-data COPY processes
+19:18:25.428 77002 INFO   STEP 8: starting 8 VACUUM processes
+19:18:25.451 76985 INFO   Skipping large objects: none found.
+2024-06-10 19:18:25.462 +03 [77031] LOG:  unexpected EOF on client connection with an open transaction
+19:18:25.471 77001 INFO   STEP 6: starting 2 CREATE INDEX processes
+19:18:25.471 77001 INFO   STEP 7: constraints are built by the CREATE INDEX processes
+19:18:25.482 76985 INFO   STEP 9: reset sequences values
+19:18:25.483 77040 INFO   Set sequences values on the target database
+19:18:33.807 76985 INFO   STEP 10: restore the post-data section to the target database
+19:18:33.821 76985 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 2 --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/schema.dump
+19:18:33.879 76985 INFO   All step are now done,  9s352 elapsed
+19:18:33.880 76985 INFO   Printing summary for 5 tables and 4 indexes
 
-  OID |   Schema |            Name | copy duration | indexes | create index duration
-------+----------+-----------------+---------------+---------+----------------------
-17085 |      csv |           track |          62ms |       1 |                  24ms
-  ...
-  ...
+  OID | Schema |             Name | Parts | copy duration | transmitted bytes | indexes | create index duration
+------+--------+------------------+-------+---------------+-------------------+---------+----------------------
+16398 | public | pgbench_accounts |     1 |         7s130 |             91 MB |       1 |                 878ms
+16395 | public |  pgbench_tellers |     1 |          69ms |            1002 B |       1 |                  44ms
+16401 | public | pgbench_branches |     1 |          46ms |              71 B |       1 |                  37ms
+16386 | public |           table1 |     1 |          56ms |               0 B |       1 |                  40ms
+16392 | public |  pgbench_history |     1 |          67ms |               0 B |       0 |                   0ms
 
-                                          Step   Connection    Duration   Concurrency
- ---------------------------------------------   ----------  ----------  ------------
-                                   Dump Schema       source       884ms             1
-                                Prepare Schema       target       405ms             1
- COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       1s281         8 + 2
-                             COPY (cumulative)         both       2s040             8
-                     CREATE INDEX (cumulative)       target       381ms             2
-                               Finalize Schema       target        29ms             1
- ---------------------------------------------   ----------  ----------  ------------
-                     Total Wall Clock Duration         both       2s639         8 + 2
- ---------------------------------------------   ----------  ----------  ------------
+
+                                               Step   Connection    Duration    Transfer   Concurrency
+ --------------------------------------------------   ----------  ----------  ----------  ------------
+   Catalog Queries (table ordering, filtering, etc)       source       183ms                         1
+                                        Dump Schema       source       134ms                         1
+                                     Prepare Schema       target       128ms                         1
+      COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       8s483                        18
+                                  COPY (cumulative)         both       7s368      128 MB             8
+                          CREATE INDEX (cumulative)       target       965ms                         2
+                           CONSTRAINTS (cumulative)       target        34ms                         2
+                                VACUUM (cumulative)       target       120ms                         8
+                                    Reset Sequences         both        38ms                         1
+                         Large Objects (cumulative)       (null)         0ms                         0
+                                    Finalize Schema         both        61ms                         2
+ --------------------------------------------------   ----------  ----------  ----------  ------------
+                          Total Wall Clock Duration         both       9s352                        24
 ```
 
 ## Installing pgcopydb
 
-Several distributions are available for pgcopydb:
-
-  1. Install from either debian sid or testing (see [debian package for
-     pgcopydb](https://packages.debian.org/search?keywords=pgcopydb), or
-     from [apt.postgresql.org](https://wiki.postgresql.org/wiki/Apt)
-     packages by following the linked documentation and then:
-
-	 ```
-	 $ sudo apt-get install pgcopydb
-	 ```
-
-  2. Install from [yum.postgresql.org](https://yum.postgresql.org) is not
-     available at this time.
-
-  3. Use a docker image.
-
-     Either use
-     [dimitri/pgcopydb](https://hub.docker.com/r/dimitri/pgcopydb#!) from
-     DockerHub, where the latest release is made available with the Postgres
-     version currently in debian stable.
-
-	 ```
-	 $ docker run --rm -it dimitri/pgcopydb:v0.14 pgcopydb --version
-	 ```
-
-	 Or you can use the CI/CD integration that publishes packages from the
-     main branch to the GitHub docker repository:
-
-	 ```
-	 $ docker pull ghcr.io/dimitri/pgcopydb:latest
-	 $ docker run --rm -it ghcr.io/dimitri/pgcopydb:latest pgcopydb --version
-	 $ docker run --rm -it ghcr.io/dimitri/pgcopydb:latest pgcopydb --help
-	 ```
-
-  4. Build from sources
-
-     Building from source requires a list of build-dependencies that's
-     comparable to that of Postgres itself. The pgcopydb source code is
-     written in C and the build process uses a GNU Makefile.
-
-	 See our main
-     [Dockerfile](https://github.com/dimitri/pgcopydb/blob/main/Dockerfile)
-     for a complete recipe to build pgcopydb when using a debian environment.
-
-	 Then the build process is pretty simple, in its simplest form you can
-     just use `make clean install`, if you want to be more fancy consider
-     also:
-
-	 ```
-	 $ make -s clean
-	 $ make -s -j12 install
-	 ```
-
+See our [documentation](https://pgcopydb.readthedocs.io/en/latest/install.html).
 
 ## Design Considerations (why oh why)
 
@@ -342,9 +305,8 @@ implementing any step on its own.
   6. `pgcopydb copy sequences`
   7. `pgcopydb copy indexes`
   8. `pgcopydb copy constraints`
-  9. `pgcopydb vacuumdb`
- 10. `pgcopydb restore post-data`
- 11. `kill %1`
+  9. `pgcopydb restore post-data`
+ 10. `kill %1`
 
 Using individual commands fails to provide the advanced concurrency
 capabilities of the main `pgcopydb clone` command, so it is strongly

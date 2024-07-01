@@ -15,6 +15,7 @@
 #include "postgres_fe.h"
 #include "pqexpbuffer.h"
 
+#include "catalog.h"
 #include "cli_root.h"
 #include "defaults.h"
 #include "env_utils.h"
@@ -27,8 +28,17 @@
 #include "signals.h"
 #include "string_utils.h"
 
+/*
+ * Because we did include defaults.h previously in the same compilation unit (a
+ * .c file), then the runprogram.h code is linked to the Garbage-Collector:
+ * calls to malloc() in there are replaced by calls to GC_malloc() as per
+ * defaults.h #define instructions.
+ *
+ * As a result we never call free_program().
+ */
 #define RUN_PROGRAM_IMPLEMENTATION
 #include "runprogram.h"
+
 
 /*
  * Get psql --version output in pgPaths->pg_version.
@@ -36,29 +46,32 @@
 bool
 psql_version(PostgresPaths *pgPaths)
 {
-	Program prog = run_program(pgPaths->psql, "--version", NULL);
+	Program *prog = run_program(pgPaths->psql, "--version", NULL);
 	char pg_version_string[PG_VERSION_STRING_MAX] = { 0 };
 	int pg_version = 0;
 
-	if (prog.returnCode != 0)
+	if (prog == NULL)
 	{
-		errno = prog.error;
-		log_error("Failed to run \"psql --version\" using program \"%s\": %m",
-				  pgPaths->psql);
-		free_program(&prog);
+		log_error(ALLOCATION_FAILED_ERROR);
 		return false;
 	}
 
-	if (!parse_version_number(prog.stdOut,
+	if (prog->returnCode != 0)
+	{
+		errno = prog->error;
+		log_error("Failed to run \"psql --version\" using program \"%s\": %m",
+				  pgPaths->psql);
+		return false;
+	}
+
+	if (!parse_version_number(prog->stdOut,
 							  pg_version_string,
 							  PG_VERSION_STRING_MAX,
 							  &pg_version))
 	{
 		/* errors have already been logged */
-		free_program(&prog);
 		return false;
 	}
-	free_program(&prog);
 
 	strlcpy(pgPaths->pg_version, pg_version_string, PG_VERSION_STRING_MAX);
 
@@ -107,7 +120,7 @@ find_pg_commands(PostgresPaths *pgPaths)
 
 
 /*
- * set_postgres_commands sets the rest of the Postgres commands that pgcyopdb
+ * set_postgres_commands sets the rest of the Postgres commands that pgcopydb
  * needs from knowing the pgPaths->psql absolute location already.
  */
 void
@@ -116,6 +129,7 @@ set_postgres_commands(PostgresPaths *pgPaths)
 	path_in_same_directory(pgPaths->psql, "pg_dump", pgPaths->pg_dump);
 	path_in_same_directory(pgPaths->psql, "pg_dumpall", pgPaths->pg_dumpall);
 	path_in_same_directory(pgPaths->psql, "pg_restore", pgPaths->pg_restore);
+	path_in_same_directory(pgPaths->psql, "vacuumdb", pgPaths->vacuumdb);
 }
 
 
@@ -189,31 +203,32 @@ set_psql_from_config_bindir(PostgresPaths *pgPaths, const char *pg_config)
 		return false;
 	}
 
-	Program prog = run_program(pg_config, "--bindir", NULL);
+	Program *prog = run_program(pg_config, "--bindir", NULL);
 
-	char *lines[1];
-
-	if (prog.returnCode != 0)
+	if (prog == NULL)
 	{
-		errno = prog.error;
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	if (prog->returnCode != 0)
+	{
+		errno = prog->error;
 		log_error("Failed to run \"pg_config --bindir\" using program \"%s\": %m",
 				  pg_config);
-		free_program(&prog);
 		return false;
 	}
 
-	if (splitLines(prog.stdOut, lines, 1) != 1)
+	LinesBuffer lbuf = { 0 };
+
+	if (!splitLines(&lbuf, prog->stdOut) || lbuf.count != 1)
 	{
 		log_error("Unable to parse output from pg_config --bindir");
-		free_program(&prog);
 		return false;
 	}
 
-	char *bindir = lines[0];
+	char *bindir = lbuf.lines[0];
 	join_path_components(psql, bindir, "psql");
-
-	/* we're now done with the Program and its output */
-	free_program(&prog);
 
 	if (!file_exists(psql))
 	{
@@ -335,16 +350,23 @@ set_psql_from_pg_config(PostgresPaths *pgPaths)
 }
 
 
+typedef struct DumpExtensionNamespaceContext
+{
+	char **extNamespaces;
+	int *extNamespaceCount;
+} DumpExtensionNamespaceContext;
+
+
 /*
- * Call pg_dump and get the given section of the dump into the target file.
+ * Call pg_dump and get the given pre-data and post-data sections of
+ * the dump into the target file.
  */
 bool
 pg_dump_db(PostgresPaths *pgPaths,
 		   ConnStrings *connStrings,
 		   const char *snapshot,
-		   const char *section,
 		   SourceFilters *filters,
-		   SourceExtensionArray *extensionArray,
+		   DatabaseCatalog *filtersDB,
 		   const char *filename)
 {
 	char *args[PG_CMD_MAX_ARG];
@@ -380,8 +402,14 @@ pg_dump_db(PostgresPaths *pgPaths,
 		args[argsIndex++] = (char *) snapshot;
 	}
 
-	args[argsIndex++] = "--section";
-	args[argsIndex++] = (char *) section;
+	/*
+	 * To address a migration issue (https://github.com/dimitri/pgcopydb/issues/760),
+	 * we need to dump the pre-data and post-data sections together in a single file.
+	 * Using --schema-only instead is not an option because it does not include
+	 * the necessary large object metadata.
+	 */
+	args[argsIndex++] = "--section=pre-data";
+	args[argsIndex++] = "--section=post-data";
 
 	/* apply [include-only-schema] filtering */
 	for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
@@ -418,32 +446,6 @@ pg_dump_db(PostgresPaths *pgPaths,
 
 		args[argsIndex++] = "--exclude-schema";
 		args[argsIndex++] = nspname;
-	}
-
-	/* now --exclude-schema for extension's own schemas */
-	if (extensionArray != NULL)
-	{
-		for (int i = 0; i < extensionArray->count; i++)
-		{
-			char *nspname = extensionArray->array[i].extnamespace;
-
-			if (!streq(nspname, "public") && !streq(nspname, "pg_catalog"))
-			{
-				/* check that we still have room for --exclude-schema args */
-				if (PG_CMD_MAX_ARG < (argsIndex + 2))
-				{
-					log_error("Failed to call pg_dump, "
-							  "too many schema are excluded: "
-							  "argsIndex %d > %d",
-							  argsIndex + 2,
-							  PG_CMD_MAX_ARG);
-					return false;
-				}
-
-				args[argsIndex++] = "--exclude-schema";
-				args[argsIndex++] = nspname;
-			}
-		}
 	}
 
 	args[argsIndex++] = "--file";
@@ -485,12 +487,90 @@ pg_dump_db(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_dump: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
 
-	free_program(&program);
+	return true;
+}
+
+
+/*
+ * Call `vacuumdb --analyze-only --jobs ${table-jobs}`
+ */
+bool
+pg_vacuumdb_analyze_only(PostgresPaths *pgPaths, ConnStrings *connStrings, int jobs)
+{
+	char *args[16];
+	int argsIndex = 0;
+
+	char command[BUFSIZE] = { 0 };
+
+	char *PGPASSWORD = NULL;
+	bool pgpassword_found_in_env = env_exists("PGPASSWORD");
+
+	if (!env_exists("PGCONNECT_TIMEOUT"))
+	{
+		setenv("PGCONNECT_TIMEOUT", POSTGRES_CONNECT_TIMEOUT, 1);
+	}
+
+	/* override PGPASSWORD environment variable if the pguri contains one */
+	if (connStrings->safeSourcePGURI.password != NULL)
+	{
+		if (pgpassword_found_in_env && !get_env_dup("PGPASSWORD", &PGPASSWORD))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+		setenv("PGPASSWORD", connStrings->safeSourcePGURI.password, 1);
+	}
+
+	args[argsIndex++] = (char *) pgPaths->vacuumdb;
+	args[argsIndex++] = "--analyze-only";
+	args[argsIndex++] = "--jobs";
+	args[argsIndex++] = intToString(jobs).strValue;
+	args[argsIndex++] = "--dbname";
+	args[argsIndex++] = (char *) connStrings->safeSourcePGURI.pguri;
+
+	args[argsIndex] = NULL;
+
+	/*
+	 * We do not want to call setsid() when running vacuumdb.
+	 */
+	Program program = { 0 };
+
+	(void) initialize_program(&program, args, false);
+	program.processBuffer = &processBufferCallback;
+
+	/* log the exact command line we're using */
+	int commandSize = snprintf_program_command_line(&program, command, BUFSIZE);
+
+	if (commandSize >= BUFSIZE)
+	{
+		/* we only display the first BUFSIZE bytes of the real command */
+		log_info("%s...", command);
+	}
+	else
+	{
+		log_info("%s", command);
+	}
+
+	(void) execute_subprogram(&program);
+
+	/* make sure to reset the environment PGPASSWORD if we edited it */
+	if (pgpassword_found_in_env &&
+		connStrings->safeSourcePGURI.password != NULL)
+	{
+		setenv("PGPASSWORD", PGPASSWORD, 1);
+	}
+
+	if (program.returnCode != 0)
+	{
+		log_error("Failed to run vacuumdb: exit code %d", program.returnCode);
+
+		return false;
+	}
+
 	return true;
 }
 
@@ -577,12 +657,10 @@ pg_dumpall_roles(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_dump: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -627,8 +705,13 @@ pg_restore_roles(PostgresPaths *pgPaths,
 		return false;
 	}
 
-	char *lines[BUFSIZE] = { 0 };
-	int lineCount = splitLines(content, lines, BUFSIZE);
+	LinesBuffer lbuf = { 0 };
+
+	if (!splitLines(&lbuf, content))
+	{
+		/* errors have already been logged */
+		return false;
+	}
 
 	PGSQL pgsql = { 0 };
 
@@ -654,9 +737,9 @@ pg_restore_roles(PostgresPaths *pgPaths,
 	 */
 	bool skipNextLine = false;
 
-	for (int l = 0; l < lineCount; l++)
+	for (uint64_t l = 0; l < lbuf.count; l++)
 	{
-		char *currentLine = lines[l];
+		char *currentLine = lbuf.lines[l];
 
 		if (skipNextLine)
 		{
@@ -819,7 +902,26 @@ pg_restore_db(PostgresPaths *pgPaths,
 	args[argsIndex++] = (char *) pgPaths->pg_restore;
 	args[argsIndex++] = "--dbname";
 	args[argsIndex++] = (char *) connStrings->safeTargetPGURI.pguri;
-	args[argsIndex++] = "--single-transaction";
+
+	const char *sectionOption = postgresRestoreSectionToString(options.section);
+	if (sectionOption == NULL)
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	args[argsIndex++] = "--section";
+	args[argsIndex++] = (char *) sectionOption;
+
+	if (options.jobs == 1)
+	{
+		args[argsIndex++] = "--single-transaction";
+	}
+	else
+	{
+		args[argsIndex++] = "--jobs";
+		args[argsIndex++] = intToString(options.jobs).strValue;
+	}
 
 	if (options.dropIfExists)
 	{
@@ -840,6 +942,11 @@ pg_restore_db(PostgresPaths *pgPaths,
 	if (options.noACL)
 	{
 		args[argsIndex++] = "--no-acl";
+	}
+
+	if (options.noTableSpaces)
+	{
+		args[argsIndex++] = "--no-tablespaces";
 	}
 
 	/*
@@ -913,12 +1020,10 @@ pg_restore_db(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_restore: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -965,7 +1070,6 @@ pg_restore_list(PostgresPaths *pgPaths,
 	if (program.returnCode != 0)
 	{
 		log_error("Failed to run pg_restore: exit code %d", program.returnCode);
-		free_program(&program);
 
 		return false;
 	}
@@ -973,11 +1077,9 @@ pg_restore_list(PostgresPaths *pgPaths,
 	if (!parse_archive_list(listFilename, archive))
 	{
 		/* errors have already been logged */
-		free_program(&program);
 		return false;
 	}
 
-	free_program(&program);
 	return true;
 }
 
@@ -1023,6 +1125,7 @@ struct ArchiveItemDescMapping pgRestoreDescriptionArray[] = {
 	INSERT_MAPPING(ARCHIVE_TAG_COMMENT, "COMMENT"),
 	INSERT_MAPPING(ARCHIVE_TAG_CONSTRAINT, "CONSTRAINT"),
 	INSERT_MAPPING(ARCHIVE_TAG_CONVERSION, "CONVERSION"),
+	INSERT_MAPPING(ARCHIVE_TAG_DATABASE, "DATABASE"),
 	INSERT_MAPPING(ARCHIVE_TAG_DEFAULT_ACL, "DEFAULT ACL"),
 	INSERT_MAPPING(ARCHIVE_TAG_DEFAULT, "DEFAULT"),
 	INSERT_MAPPING(ARCHIVE_TAG_DOMAIN, "DOMAIN"),
@@ -1038,6 +1141,13 @@ struct ArchiveItemDescMapping pgRestoreDescriptionArray[] = {
 	INSERT_MAPPING(ARCHIVE_TAG_INDEX, "INDEX"),
 	INSERT_MAPPING(ARCHIVE_TAG_LANGUAGE, "LANGUAGE"),
 	INSERT_MAPPING(ARCHIVE_TAG_LARGE_OBJECT, "LARGE OBJECT"),
+
+	/*
+	 * MATERIALIZED VIEW DATA should come before MATERIALIZED VIEW, otherwise
+	 * the strncmp will match the first part of the string and misidentify the
+	 * MATERIALIZED VIEW DATA as MATERIALIZED VIEW.
+	 */
+	INSERT_MAPPING(ARCHIVE_TAG_REFRESH_MATERIALIZED_VIEW, "MATERIALIZED VIEW DATA"),
 	INSERT_MAPPING(ARCHIVE_TAG_MATERIALIZED_VIEW, "MATERIALIZED VIEW"),
 	INSERT_MAPPING(ARCHIVE_TAG_OPERATOR_CLASS, "OPERATOR CLASS"),
 	INSERT_MAPPING(ARCHIVE_TAG_OPERATOR_FAMILY, "OPERATOR FAMILY"),
@@ -1049,7 +1159,6 @@ struct ArchiveItemDescMapping pgRestoreDescriptionArray[] = {
 				   "PUBLICATION TABLES IN SCHEMA"),
 	INSERT_MAPPING(ARCHIVE_TAG_PUBLICATION_TABLE, "PUBLICATION TABLE"),
 	INSERT_MAPPING(ARCHIVE_TAG_PUBLICATION, "PUBLICATION"),
-	INSERT_MAPPING(ARCHIVE_TAG_REFRESH_MATERIALIZED_VIEW, "REFRESH MATERIALIZED VIEW"),
 	INSERT_MAPPING(ARCHIVE_TAG_ROW_SECURITY, "ROW SECURITY"),
 	INSERT_MAPPING(ARCHIVE_TAG_RULE, "RULE"),
 	INSERT_MAPPING(ARCHIVE_TAG_SCHEMA, "SCHEMA"),
@@ -1091,28 +1200,32 @@ parse_archive_list(const char *filename, ArchiveContentArray *contents)
 		return false;
 	}
 
-	int lineCount = countLines(buffer);
-	char **lines = (char **) calloc(lineCount, sizeof(char *));
-	int splitCount = splitLines(buffer, lines, lineCount);
+	LinesBuffer lbuf = { 0 };
 
-	if (splitCount != lineCount)
+	if (!splitLines(&lbuf, buffer))
 	{
-		log_error("BUG: parse_archive_list counted %d lines "
-				  "and got %d after split",
-				  lineCount,
-				  splitCount);
+		/* errors have already been logged */
 		return false;
+	}
+
+	/*
+	 * If the file contains zero lines, we're done already, Also malloc(zero)
+	 * leads to "corrupted size vs. prev_size" run-time errors.
+	 */
+	if (lbuf.count == 0)
+	{
+		return true;
 	}
 
 	contents->count = 0;
 	contents->array =
-		(ArchiveContentItem *) calloc(lineCount, sizeof(ArchiveContentItem));
+		(ArchiveContentItem *) calloc(lbuf.count, sizeof(ArchiveContentItem));
 
-	for (int lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
 	{
 		ArchiveContentItem *item = &(contents->array[contents->count]);
 
-		char *line = lines[lineNumber];
+		char *line = lbuf.lines[lineNumber];
 
 		/* skip empty lines and lines that start with a semi-colon (comment) */
 		if (line == NULL || *line == '\0' || *line == ';')
@@ -1122,9 +1235,9 @@ parse_archive_list(const char *filename, ArchiveContentArray *contents)
 
 		if (!parse_archive_list_entry(item, line))
 		{
-			log_error("Failed to parse line %d of \"%s\", "
+			log_error("Failed to parse line %lld of \"%s\", "
 					  "see above for details",
-					  lineNumber,
+					  (long long) lineNumber,
 					  filename);
 			return false;
 		}
@@ -1153,8 +1266,7 @@ parse_archive_list(const char *filename, ArchiveContentArray *contents)
 /*
  * parse_archive_list_entry parses a pg_restore archive TOC line such as the
  * following:
- * 5; 3079 80839 EXTENSION - aiven_extras
- * 6762; 0 0 COMMENT aiven_extras
+ *
  * 20; 2615 680978 SCHEMA - pgcopydb dim
  * 662; 1247 466596 DOMAIN public bıgınt postgres
  * 665; 1247 466598 TYPE public mpaa_rating postgres
@@ -1238,6 +1350,14 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 	}
 
 	item->desc = token.desc;
+	int itemDescLen = token.ptr - start + 1;
+
+	if (itemDescLen == 0)
+	{
+		log_error("Failed to parse Archive TOC: %s", line);
+		return false;
+	}
+
 	item->description = (char *) calloc(token.ptr - start + 1, sizeof(char));
 
 	if (item->description == NULL)
@@ -1257,7 +1377,8 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 	}
 
 	/*
-	 * 6762; 0 0 COMMENT aiven_extras
+	 * 9. ACL and COMMENT tags are "composite"
+	 *
 	 * 4837; 0 0 ACL - SCHEMA public postgres
 	 * 4838; 0 0 COMMENT - SCHEMA topology dim
 	 * 4839; 0 0 COMMENT - EXTENSION intarray
@@ -1291,6 +1412,13 @@ parse_archive_list_entry(ArchiveContentItem *item, const char *line)
 		/* 10. restore list name */
 		size_t len = strlen(token.ptr) + 1;
 		item->restoreListName = (char *) calloc(len, sizeof(char));
+
+		if (item->restoreListName == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
 		strlcpy(item->restoreListName, token.ptr, len);
 	}
 
@@ -1366,6 +1494,13 @@ tokenize_archive_list_entry(ArchiveToken *token)
 		int len = ptr - line + 1;
 		size_t size = len + 1;
 		char *buf = (char *) calloc(size, sizeof(char));
+
+		if (buf == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
 		strlcpy(buf, line, len);
 
 		if (!stringToUInt32(buf, &(token->oid)))
@@ -1411,7 +1546,8 @@ tokenize_archive_list_entry(ArchiveToken *token)
  *
  * The ptr argument is positioned after the space following EXTENSION tag.
  */
-bool parse_archive_extension(char *ptr, ArchiveContentItem *item)
+bool
+parse_archive_extension(char *ptr, ArchiveContentItem *item)
 {
 	log_trace("parse_archive_extension: \"%s\"", ptr);
 
@@ -1448,6 +1584,7 @@ bool parse_archive_extension(char *ptr, ArchiveContentItem *item)
 
 	return true;
 }
+
 
 /*
  * parse_archive_acl_or_comment parses the ACL or COMMENT entry of the
@@ -1571,30 +1708,6 @@ parse_archive_acl_or_comment(char *ptr, ArchiveContentItem *item)
 	log_trace("parse_archive_acl_or_comment: %s [%s]",
 			  item->description,
 			  item->restoreListName);
-
-	return true;
-}
-
-
-/*
- * FreeArchiveContentArray frees the memory allocated in the given
- * ArchiveContentArray.
- */
-bool
-FreeArchiveContentArray(ArchiveContentArray *contents)
-{
-	for (int i = 0; i < contents->count; i++)
-	{
-		ArchiveContentItem *item = &(contents->array[i]);
-
-		free(item->description);
-		free(item->restoreListName);
-	}
-
-	free(contents->array);
-
-	contents->count = 0;
-	contents->array = NULL;
 
 	return true;
 }

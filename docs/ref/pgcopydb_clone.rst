@@ -2,7 +2,7 @@ pgcopydb clone
 ==============
 
 The main pgcopydb operation is the clone operation, and for historical and
-user friendlyness reasons three aliases are available that implement the
+user friendliness reasons two aliases are available that implement the
 same operation:
 
 ::
@@ -10,7 +10,6 @@ same operation:
   pgcopydb
     clone     Clone an entire database from source to target
     fork      Clone an entire database from source to target
-    copy-db   Copy an entire database from source to target
 
 .. _pgcopydb_clone:
 
@@ -20,42 +19,7 @@ pgcopydb clone
 The command ``pgcopydb clone`` copies a database from the given source
 Postgres instance to the target Postgres instance.
 
-::
-
-   pgcopydb clone: Clone an entire database from source to target
-   usage: pgcopydb clone  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source                   Postgres URI to the source database
-     --target                   Postgres URI to the target database
-     --dir                      Work directory to use
-     --table-jobs               Number of concurrent COPY jobs to run
-     --index-jobs               Number of concurrent CREATE INDEX jobs to run
-     --large-objects-jobs       Number of concurrent Large Objects jobs to run
-     --split-tables-larger-than Same-table concurrency size threshold
-     --drop-if-exists           On the target database, clean-up from a previous run first
-     --roles                    Also copy roles found on source to target
-     --no-role-passwords        Do not dump passwords for roles
-     --no-owner                 Do not set ownership of objects to match the original database
-     --no-acl                   Prevent restoration of access privileges (grant/revoke commands).
-     --no-comments              Do not output commands to restore comments
-     --skip-large-objects       Skip copying large objects (blobs)
-     --skip-extensions          Skip restoring extensions
-     --skip-ext-comments        Skip restoring COMMENT ON EXTENSION
-     --skip-collations          Skip restoring collations
-     --skip-vacuum              Skip running VACUUM ANALYZE
-     --requirements <filename>  List extensions requirements
-     --filters <filename>       Use the filters defined in <filename>
-     --fail-fast                Abort early in case of error
-     --restart                  Allow restarting when temp files exist already
-     --resume                   Allow resuming operations after a failure
-     --not-consistent           Allow taking a new snapshot on the source database
-     --snapshot                 Use snapshot obtained with pg_export_snapshot
-     --follow                   Implement logical decoding to replay changes
-     --plugin                   Output plugin to use (test_decoding, wal2json)
-     --slot-name                Use this Postgres replication slot name
-     --create-slot              Create the replication slot
-     --origin                   Use this Postgres replication origin node name
-     --endpos                   Stop replaying changes when reaching this LSN
+.. include:: ../include/clone.rst
 
 .. _pgcopydb_fork:
 
@@ -65,22 +29,6 @@ pgcopydb fork
 The command ``pgcopydb fork`` copies a database from the given source
 Postgres instance to the target Postgres instance. This command is an alias
 to the command ``pgcopydb clone`` seen above.
-
-.. _pgcopydb_copy__db:
-
-pgcopydb copy-db
-----------------
-
-The command ``pgcopydb copy-db`` copies a database from the given source
-Postgres instance to the target Postgres instance. This command is an alias
-to the command ``pgcopydb clone`` seen above, and available for backward
-compatibility only.
-
-.. warning::
-
-   The ``pgcopydb copy-db`` command is now deprecated and will get removed
-   from pgcopydb when hitting version 1.0, please upgrade your scripts and
-   integrations.
 
 Description
 -----------
@@ -115,6 +63,9 @@ The ``pgcopydb clone`` command implements the following steps:
      When filtering is used, the ``pg_restore --use-list`` feature is used
      to filter the list of objects to restore in this step.
 
+     This step uses as many as ``--restore-jobs`` jobs for ``pg_restore`` to
+     share the workload and restore the objects in parallel.
+
   4. Then as many as ``--table-jobs`` COPY sub-processes are started to
      share the workload and COPY the data from the source to the target
      database one table at a time, in a loop.
@@ -146,14 +97,14 @@ The ``pgcopydb clone`` command implements the following steps:
      be created in parallel with other indexes on the same table, avoiding
      an EXCLUSIVE LOCK while creating the index.
 
-  8. As many as ``-table-jobs`` VACUUM ANALYZE sub-processes are started to
+  8. As many as ``--table-jobs`` VACUUM ANALYZE sub-processes are started to
      share the workload. As soon as a table data COPY has completed, the
      table is queued for processing by the VACUUM ANALYZE sub-processes.
 
-  9. An auxilliary process is loops over the sequences on the source
-     database and for each of them runs a separate query on the source to
-     fetch the ``last_value`` and the ``is_called`` metadata the same way
-     that pg_dump does.
+  9. An auxilliary process loops over the sequences on the source database and
+     for each of them runs a separate query on the source to fetch the
+     ``last_value`` and the ``is_called`` metadata the same way that pg_dump
+     does.
 
      For each sequence, pgcopydb then calls ``pg_catalog.setval()`` on the
      target database with the information obtained on the source database.
@@ -165,6 +116,9 @@ The ``pgcopydb clone`` command implements the following steps:
       The *post-data* script is filtered out using the ``pg_restore
       --use-list`` option so that indexes and primary key constraints
       already created in steps 6 and 7 are properly skipped now.
+
+      This step uses as many as ``--restore-jobs`` jobs for ``pg_restore`` to
+      share the workload and restore the objects in parallel.
 
 .. _superuser:
 
@@ -318,7 +272,6 @@ following steps:
      The following SQL objects are then created:
 
        - a replication slot on the source database,
-       - a ``pgcopydb.sentinel`` table on the source database,
        - a replication origin on the target database.
 
      This step is also implemented when using ``pgcopydb clone --follow``.
@@ -344,9 +297,8 @@ following steps:
         consuming changes and before the process terminates.
 
   6. Clean-up the specific resources created for supporting resumability of
-     the whole process (replication slot on the source database, pgcopydb
-     sentinel table on the source database, replication origin on the target
-     database).
+     the whole process (replication slot on the source database, replication
+     origin on the target database).
 
   7. Stop holding a snaphot on the source database by stopping the
      ``pgcopydb snapshot`` process left running in the background.
@@ -403,9 +355,9 @@ The following options are available to ``pgcopydb clone``:
 
   During its normal operations pgcopydb creates a lot of temporary files to
   track sub-processes progress. Temporary files are created in the directory
-  location given by this option, or defaults to
+  specified by this option, or defaults to
   ``${TMPDIR}/pgcopydb`` when the environment variable is set, or
-  then to ``/tmp/pgcopydb``.
+  otherwise to ``/tmp/pgcopydb``.
 
 --table-jobs
 
@@ -423,6 +375,15 @@ The following options are available to ``pgcopydb clone``:
   Postgres target system, minus some cores that are going to be used for
   handling the COPY operations.
 
+--restore-jobs
+
+  How many threads or processes can be used during pg_restore. A good option is
+  to set this option to the count of CPU cores that are available on the
+  Postgres target system.
+
+  If this value is not set, we reuse the ``--index-jobs`` value. If that value
+  is not set either, we use the the default value for ``--index-jobs``.
+
 --large-object-jobs
 
   How many worker processes to start to copy Large Objects concurrently.
@@ -432,6 +393,20 @@ The following options are available to ``pgcopydb clone``:
    Allow :ref:`same_table_concurrency` when processing the source database.
    This environment variable value is expected to be a byte size, and bytes
    units B, kB, MB, GB, TB, PB, and EB are known.
+
+--estimate-table-sizes
+
+   Use estimates on table sizes to decide how to split tables when using
+   :ref:`same_table_concurrency`.
+
+   When this option is used, we run ``vacuumdb --analyze-only --jobs=<table-jobs>``
+   command on the source database that updates the statistics for the number of
+   pages for each relation. Later, we use the number of pages, and the size for
+   each page to estimate the actual size of the tables.
+
+   If you wish to run the ANALYZE command manually before running pgcopydb, you
+   can use the ``--skip-analyze`` option. This way, you can decrease the time
+   spent on the migration.
 
 --drop-if-exists
 
@@ -509,11 +484,11 @@ The following options are available to ``pgcopydb clone``:
   the JSON contents must be an array of objects with the keys ``"name"`` and
   ``"version"``.
 
-  The command ``pgcopydb list extension --requirements --json`` produces
+  The command ``pgcopydb list extensions --requirements --json`` produces
   such a JSON file and can be used on the target database instance to get
   started.
 
-  See also the command ``pgcopydb list extension --available-versions``.
+  See also the command ``pgcopydb list extensions --available-versions``.
 
   See also :ref:`pgcopydb_list_extensions`.
 
@@ -534,6 +509,31 @@ The following options are available to ``pgcopydb clone``:
 
   Skip running VACUUM ANALYZE on the target database once a table has been
   copied, its indexes have been created, and constraints installed.
+
+--skip-analyze
+
+  Skip running ``vacuumdb --analyze-only`` on the source database to update
+  statistics that are required when estimating table sizes.
+
+  This option is useful only when using ``--estimate-table-sizes`` and the user
+  runs the relevant ANALYZE command manually before running pgcopydb.
+
+--skip-db-properties
+
+  Skip fetching database properties and copying them using the SQL command
+  ``ALTER DATABASE ... SET name = value``. This is useful when the source
+  and target database have a different set of properties, or when the target
+  database is hosted in a way that disabled setting some of the properties
+  that have been set on the source database, or also when copying these
+  settings is not wanted.
+
+--skip-split-by-ctid
+
+  Skip splitting tables based on CTID during the copy operation. By default,
+  pgcopydb splits large tables into smaller chunks based on the CTID column
+  if there isn't a unique integer column in the table. However, in some cases
+  you may want to skip this splitting process if the CTID range scan is slow
+  in the underlying system.
 
 --filters <filename>
 
@@ -632,6 +632,19 @@ The following options are available to ``pgcopydb clone``:
   __ https://www.postgresql.org/docs/current/test-decoding.html
   __ https://github.com/eulerto/wal2json/
 
+--wal2json-numeric-as-string
+
+  When using the wal2json output plugin, it is possible to use the
+  ``--wal2json-numeric-as-string`` option to instruct wal2json to output
+  numeric values as strings and thus prevent some precision loss.
+
+  You need to have a wal2json plugin version on source database that supports
+  ``--numeric-data-types-as-string`` option to use this option.
+
+  See also the documentation for `wal2json`__ regarding this option for details.
+
+  __ https://github.com/eulerto/wal2json/pull/255
+
 --slot-name
 
   Logical decoding slot name to use. Defaults to ``pgcopydb``. which is
@@ -715,6 +728,12 @@ PGCOPYDB_INDEX_JOBS
    parallel. When ``--index-jobs`` is ommitted from the command line, then
    this environment variable is used.
 
+PGCOPYDB_RESTORE_JOBS
+
+   Number of concurrent jobs allowed to run `pg_restore` operations in
+   parallel. When ``--restore-jobs`` is ommitted from the command line, then
+   this environment variable is used.
+
 PGCOPYDB_LARGE_OBJECTS_JOBS
 
    Number of concurrent jobs allowed to copy Large Objects data in parallel.
@@ -728,6 +747,45 @@ PGCOPYDB_SPLIT_TABLES_LARGER_THAN
    units B, kB, MB, GB, TB, PB, and EB are known.
 
    When ``--split-tables-larger-than`` is ommitted from the command line,
+   then this environment variable is used.
+
+PGCOPYDB_SPLIT_MAX_PARTS
+
+   Limit the maximum number of parts when :ref:`same_table_concurrency` is
+   used. When ``--split-max-parts`` is ommitted from the command line, then this
+   environment variable is used.
+
+PGCOPYDB_ESTIMATE_TABLE_SIZES
+
+   When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
+   then pgcopydb estimates the size of tables to determine whether or not to
+   split tables. This option is only useful when querying the relation sizes on
+   source database is costly.
+
+   When ``--estimate-table-sizes`` is ommitted from the command line, then
+   this environment variable is used.
+
+   When this option is used, we run ``vacuumdb --analyze-only --jobs=<table-jobs>``
+   command on the source database that updates the statistics for the number of
+   pages for each relation. Later, we use the number of pages, and the size for
+   each page to estimate the actual size of the tables.
+
+   If you wish to run the ANALYZE command manually before running pgcopydb, you
+   can use the ``--skip-analyze`` option or `PGCOPYDB_SKIP_ANALYZE` environment
+   variable. This way, you can decrease the time spent on the migration.
+
+PGCOPYDB_OUTPUT_PLUGIN
+
+   Logical decoding output plugin to use. When ``--plugin`` is omitted from the
+   command line, then this environment variable is used.
+
+PGCOPYDB_WAL2JSON_NUMERIC_AS_STRING
+
+   When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
+   then pgcopydb uses the wal2json option ``--numeric-data-types-as-string``
+   when using the wal2json output plugin.
+
+   When ``--wal2json-numeric-as-string`` is ommitted from the command line
    then this environment variable is used.
 
 PGCOPYDB_DROP_IF_EXISTS
@@ -753,6 +811,25 @@ PGCOPYDB_SKIP_VACUUM
    When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
    then pgcopydb skips the VACUUM ANALYZE jobs entirely, same as when using
    the ``--skip-vacuum`` option.
+
+PGCOPYDB_SKIP_ANALYZE
+
+   When true (or *yes*, or *on*, or 1, same input as a Postgres boolean) then
+   pgcopydb skips the ``vacuumdb --analyze-only`` commands entirely, same as
+   when using the ``--skip-analyze`` option.
+
+PGCOPYDB_SKIP_DB_PROPERTIES
+
+   When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
+   then pgcopydb skips the ALTER DATABASET SET properties commands that copy
+   the setting from the source to the target database, same as when using
+   the ``--skip-db-properties`` option.
+
+PGCOPYDB_SKIP_CTID_SPLIT
+
+  When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
+  then pgcopydb skips the CTID split operation during the clone process,
+  same as when using the ``--skip-split-by-ctid`` option.
 
 PGCOPYDB_SNAPSHOT
 
@@ -848,82 +925,53 @@ Examples
    $ export PGCOPYDB_DROP_IF_EXISTS=on
 
    $ pgcopydb clone --table-jobs 8 --index-jobs 12
-   14:49:01 22 INFO   Running pgcopydb version 0.13.38.g22e6544.dirty from "/usr/local/bin/pgcopydb"
-   14:49:01 22 INFO   [SOURCE] Copying database from "postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-   14:49:01 22 INFO   [TARGET] Copying database into "postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-   14:49:01 22 INFO   Exported snapshot "00000003-00000022-1" from the source database
-   14:49:01 24 INFO   STEP 1: fetch source database tables, indexes, and sequences
-   14:49:01 24 INFO   Fetched information for 3 extensions
-   14:49:01 24 INFO   Splitting source candidate tables larger than 200 kB
-   14:49:01 24 INFO   Table public.rental is 1224 kB large, 7 COPY processes will be used, partitioning on rental_id.
-   14:49:01 24 INFO   Table public.film is 472 kB large, 3 COPY processes will be used, partitioning on film_id.
-   14:49:01 24 INFO   Table public.film_actor is 264 kB large which is larger than --split-tables-larger-than 200 kB, and does not have a unique column of type integer: splitting by CTID
-   14:49:01 24 INFO   Table public.film_actor is 264 kB large, 2 COPY processes will be used, partitioning on ctid.
-   14:49:01 24 INFO   Table public.inventory is 264 kB large, 2 COPY processes will be used, partitioning on inventory_id.
-   14:49:01 24 INFO   Fetched information for 21 tables, with an estimated total of 0 tuples and 3816 kB
-   14:49:01 24 INFO   Fetched information for 54 indexes
-   14:49:01 24 INFO   Fetching information for 13 sequences
-   14:49:01 24 INFO   STEP 2: dump the source database schema (pre/post data)
-   14:49:01 24 INFO    /usr/bin/pg_dump -Fc --snapshot 00000003-00000022-1 --section pre-data --file /tmp/pgcopydb/schema/pre.dump 'postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
-   14:49:01 24 INFO    /usr/bin/pg_dump -Fc --snapshot 00000003-00000022-1 --section post-data --file /tmp/pgcopydb/schema/post.dump 'postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
-   14:49:02 24 INFO   STEP 3: restore the pre-data section to the target database
-   14:49:02 24 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --single-transaction --use-list /tmp/pgcopydb/schema/pre-filtered.list /tmp/pgcopydb/schema/pre.dump
-   14:49:02 24 INFO   STEP 6: starting 12 CREATE INDEX processes
-   14:49:02 24 INFO   STEP 7: constraints are built by the CREATE INDEX processes
-   14:49:02 24 INFO   STEP 8: starting 8 VACUUM processes
-   14:49:02 24 INFO   STEP 9: reset sequences values
-   14:49:02 51 INFO   STEP 5: starting 4 Large Objects workers
-   14:49:02 30 INFO   STEP 4: starting 8 table data COPY processes
-   14:49:02 52 INFO   Reset sequences values on the target database
-   14:49:02 51 INFO   Added 0 large objects to the queue
-   14:49:04 24 INFO   STEP 10: restore the post-data section to the target database
-   14:49:04 24 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --single-transaction --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/post.dump
+   08:13:13.961 42893 INFO   [SOURCE] Copying database from "postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   08:13:13.961 42893 INFO   [TARGET] Copying database into "postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   08:13:14.009 42893 INFO   Using work dir "/tmp/pgcopydb"
+   08:13:14.017 42893 INFO   Exported snapshot "00000003-000000EB-1" from the source database
+   08:13:14.019 42904 INFO   STEP 1: fetch source database tables, indexes, and sequences
+   08:13:14.339 42904 INFO   Fetched information for 5 tables (including 0 tables split in 0 partitions total), with an estimated total of 1000 thousands tuples and 128 MB on-disk
+   08:13:14.342 42904 INFO   Fetched information for 4 indexes (supporting 4 constraints)
+   08:13:14.343 42904 INFO   Fetching information for 1 sequences
+   08:13:14.353 42904 INFO   Fetched information for 1 extensions
+   08:13:14.436 42904 INFO   Found 1 indexes (supporting 1 constraints) in the target database
+   08:13:14.443 42904 INFO   STEP 2: dump the source database schema (pre/post data)
+   08:13:14.448 42904 INFO    /usr/bin/pg_dump -Fc --snapshot 00000003-000000EB-1 --section=pre-data --section=post-data --file /tmp/pgcopydb/schema/schema.dump 'postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
+   08:13:14.513 42904 INFO   STEP 3: restore the pre-data section to the target database
+   08:13:14.524 42904 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 2 --use-list /tmp/pgcopydb/schema/pre-filtered.list /tmp/pgcopydb/schema/schema.dump
+   08:13:14.608 42919 INFO   STEP 4: starting 8 table-data COPY processes
+   08:13:14.678 42921 INFO   STEP 8: starting 8 VACUUM processes
+   08:13:14.678 42904 INFO   Skipping large objects: none found.
+   08:13:14.693 42920 INFO   STEP 6: starting 2 CREATE INDEX processes
+   08:13:14.693 42920 INFO   STEP 7: constraints are built by the CREATE INDEX processes
+   08:13:14.699 42904 INFO   STEP 9: reset sequences values
+   08:13:14.700 42959 INFO   Set sequences values on the target database
+   08:13:16.716 42904 INFO   STEP 10: restore the post-data section to the target database
+   08:13:16.726 42904 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 2 --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/schema.dump
+   08:13:16.751 42904 INFO   All step are now done,  2s728 elapsed
+   08:13:16.752 42904 INFO   Printing summary for 5 tables and 4 indexes
 
-     OID | Schema |             Name | copy duration | transmitted bytes | indexes | create index duration
-   ------+--------+------------------+---------------+-------------------+---------+----------------------
-   16880 | public |           rental |         160ms |            188 kB |       3 |                 230ms
-   16880 | public |           rental |          77ms |            189 kB |       0 |                   0ms
-   16880 | public |           rental |         105ms |            189 kB |       0 |                   0ms
-   16880 | public |           rental |         107ms |            189 kB |       0 |                   0ms
-   16880 | public |           rental |          97ms |            190 kB |       0 |                   0ms
-   16880 | public |           rental |          82ms |            189 kB |       0 |                   0ms
-   16880 | public |           rental |          81ms |            189 kB |       0 |                   0ms
-   16758 | public |             film |         136ms |            112 kB |       5 |                 462ms
-   16758 | public |             film |          52ms |            110 kB |       0 |                   0ms
-   16758 | public |             film |          74ms |            111 kB |       0 |                   0ms
-   16770 | public |       film_actor |          74ms |            5334 B |       0 |                   0ms
-   16770 | public |       film_actor |          77ms |            156 kB |       0 |                   0ms
-   16825 | public |        inventory |         106ms |             74 kB |       2 |                 586ms
-   16825 | public |        inventory |         107ms |             76 kB |       0 |                   0ms
-   16858 | public | payment_p2022_03 |          86ms |            137 kB |       4 |                 468ms
-   16866 | public | payment_p2022_05 |          98ms |            136 kB |       4 |                 663ms
-   16870 | public | payment_p2022_06 |         106ms |            134 kB |       4 |                 571ms
-   16862 | public | payment_p2022_04 |         125ms |            129 kB |       4 |                 775ms
-   16854 | public | payment_p2022_02 |         117ms |            121 kB |       4 |                 684ms
-   16874 | public | payment_p2022_07 |         255ms |            118 kB |       1 |                 270ms
-   16724 | public |         customer |         247ms |             55 kB |       4 |                 1s091
-   16785 | public |          address |         128ms |             47 kB |       2 |                 132ms
-   16795 | public |             city |         163ms |             23 kB |       2 |                 270ms
-   16774 | public |    film_category |         172ms |             28 kB |       1 |                  47ms
-   16850 | public | payment_p2022_01 |         166ms |             36 kB |       4 |                 679ms
-   16738 | public |            actor |         399ms |            7999 B |       2 |                 116ms
-   16748 | public |         category |         170ms |             526 B |       1 |                 200ms
-   16805 | public |          country |          63ms |            3918 B |       1 |                 226ms
-   16900 | public |            staff |         170ms |             272 B |       1 |                 114ms
-   16832 | public |         language |         115ms |             276 B |       1 |                  68ms
-   16911 | public |            store |          88ms |              58 B |       2 |                 185ms
+     OID | Schema |             Name | Parts | copy duration | transmitted bytes | indexes | create index duration
+   ------+--------+------------------+-------+---------------+-------------------+---------+----------------------
+   16398 | public | pgbench_accounts |     1 |         1s496 |             91 MB |       1 |                 302ms
+   16395 | public |  pgbench_tellers |     1 |          37ms |            1002 B |       1 |                  15ms
+   16401 | public | pgbench_branches |     1 |          45ms |              71 B |       1 |                  18ms
+   16386 | public |           table1 |     1 |          36ms |             984 B |       1 |                  21ms
+   16392 | public |  pgbench_history |     1 |          41ms |               0 B |       0 |                   0ms
 
 
                                                   Step   Connection    Duration    Transfer   Concurrency
     --------------------------------------------------   ----------  ----------  ----------  ------------
-                                           Dump Schema       source        98ms                         1
-      Catalog Queries (table ordering, filtering, etc)       source       687ms                         1
-                                        Prepare Schema       target       667ms                         1
-         COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       1s256                    8 + 20
-                                     COPY (cumulative)         both       4s003     2955 kB             8
-                            Large Objects (cumulative)         both       877ms                         4
-                CREATE INDEX, CONSTRAINTS (cumulative)       target       7s837                        12
-                                       Finalize Schema       target       487ms                         1
+      Catalog Queries (table ordering, filtering, etc)       source       119ms                         1
+                                           Dump Schema       source        66ms                         1
+                                        Prepare Schema       target        59ms                         1
+         COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both       2s125                        18
+                                     COPY (cumulative)         both       1s655      128 MB             8
+                             CREATE INDEX (cumulative)       target       343ms                         2
+                              CONSTRAINTS (cumulative)       target        13ms                         2
+                                   VACUUM (cumulative)       target       144ms                         8
+                                       Reset Sequences         both        15ms                         1
+                            Large Objects (cumulative)       (null)         0ms                         0
+                                       Finalize Schema         both        27ms                         2
     --------------------------------------------------   ----------  ----------  ----------  ------------
-                             Total Wall Clock Duration         both       3s208                    8 + 20
-    --------------------------------------------------   ----------  ----------  ----------  ------------
+                             Total Wall Clock Duration         both       2s728                        24

@@ -23,8 +23,6 @@ CopyDBOptions dumpDBoptions = { 0 };
 
 static int cli_dump_schema_getopts(int argc, char **argv);
 static void cli_dump_schema(int argc, char **argv);
-static void cli_dump_schema_pre_data(int argc, char **argv);
-static void cli_dump_schema_post_data(int argc, char **argv);
 static void cli_dump_roles(int argc, char **argv);
 
 static void cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
@@ -43,31 +41,6 @@ static CommandLine dump_schema_command =
 		cli_dump_schema_getopts,
 		cli_dump_schema);
 
-static CommandLine dump_schema_pre_data_command =
-	make_command(
-		"pre-data",
-		"Dump source database pre-data schema as custom files in work directory",
-		" --source <URI> ",
-		"  --source          Postgres URI to the source database\n"
-		"  --target          Directory where to save the dump files\n"
-		"  --dir             Work directory to use\n"
-		"  --skip-extensions Skip restoring extensions\n" \
-		"  --snapshot        Use snapshot obtained with pg_export_snapshot\n",
-		cli_dump_schema_getopts,
-		cli_dump_schema_pre_data);
-
-static CommandLine dump_schema_post_data_command =
-	make_command(
-		"post-data",
-		"Dump source database post-data schema as custom files in work directory",
-		" --source <URI>",
-		"  --source          Postgres URI to the source database\n"
-		"  --target          Directory where to save the dump files\n"
-		"  --dir             Work directory to use\n"
-		"  --snapshot        Use snapshot obtained with pg_export_snapshot\n",
-		cli_dump_schema_getopts,
-		cli_dump_schema_post_data);
-
 static CommandLine dump_roles_command =
 	make_command(
 		"roles",
@@ -82,8 +55,6 @@ static CommandLine dump_roles_command =
 
 static CommandLine *dump_subcommands[] = {
 	&dump_schema_command,
-	&dump_schema_pre_data_command,
-	&dump_schema_post_data_command,
 	&dump_roles_command,
 	NULL
 };
@@ -133,7 +104,7 @@ cli_dump_schema_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:T:D:PrRCNVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:T:D:PrReCNVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -317,26 +288,6 @@ cli_dump_schema(int argc, char **argv)
 
 
 /*
- * cli_dump_schema implements the command: pgcopydb dump pre-data
- */
-static void
-cli_dump_schema_pre_data(int argc, char **argv)
-{
-	(void) cli_dump_schema_section(&dumpDBoptions, PG_DUMP_SECTION_PRE_DATA);
-}
-
-
-/*
- * cli_dump_schema implements the command: pgcopydb dump post-data
- */
-static void
-cli_dump_schema_post_data(int argc, char **argv)
-{
-	(void) cli_dump_schema_section(&dumpDBoptions, PG_DUMP_SECTION_POST_DATA);
-}
-
-
-/*
  * cli_dump_roles implements the command: pgcopydb dump roles
  */
 static void
@@ -401,24 +352,13 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 	{
 		log_info("Using pg_dumpall for Postgres \"%s\" at \"%s\"",
 				 pgPaths->pg_version,
-				 pgPaths->pg_dump);
+				 pgPaths->pg_dumpall);
 	}
 	else
 	{
 		log_info("Using pg_dump for Postgres \"%s\" at \"%s\"",
 				 pgPaths->pg_version,
-				 pgPaths->pg_dumpall);
-	}
-
-	/*
-	 * First, we need to open a snapshot that we're going to re-use in all our
-	 * connections to the source database. When the --snapshot option has been
-	 * used, instead of exporting a new snapshot, we can just re-use it.
-	 */
-	if (!copydb_prepare_snapshot(&copySpecs))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
+				 pgPaths->pg_dump);
 	}
 
 	/*
@@ -448,20 +388,10 @@ cli_dump_schema_section(CopyDBOptions *dumpDBoptions,
 	}
 	else
 	{
-		if (!copydb_dump_source_schema(&copySpecs,
-									   copySpecs.sourceSnapshot.snapshot,
-									   section))
+		if (!copydb_dump_source_schema(&copySpecs, copySpecs.sourceSnapshot.snapshot))
 		{
 			/* errors have already been logged */
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
-	}
-
-	if (!copydb_close_snapshot(&copySpecs))
-	{
-		log_fatal("Failed to close snapshot \"%s\" on \"%s\"",
-				  copySpecs.sourceSnapshot.snapshot,
-				  copySpecs.sourceSnapshot.pguri);
-		exit(EXIT_CODE_SOURCE);
 	}
 }

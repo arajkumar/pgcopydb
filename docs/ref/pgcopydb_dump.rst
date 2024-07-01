@@ -7,14 +7,7 @@ pgcopydb dump - Dump database objects from a Postgres instance
 
 This command prefixes the following sub-commands:
 
-::
-
-   pgcopydb dump
-     schema     Dump source database schema as custom files in target directory
-     pre-data   Dump source database pre-data schema as custom files in target directory
-     post-data  Dump source database post-data schema as custom files in target directory
-     roles      Dump source database roles as custome file in work directory
-
+.. include:: ../include/dump.rst
 
 .. _pgcopydb_dump_schema:
 
@@ -26,56 +19,7 @@ pgcopydb dump schema - Dump source database schema as custom files in target dir
 The command ``pgcopydb dump schema`` uses pg_dump to export SQL schema
 definitions from the given source Postgres instance.
 
-::
-
-   pgcopydb dump schema: Dump source database schema as custom files in target directory
-   usage: pgcopydb dump schema  --source <URI> --target <dir>
-
-     --source          Postgres URI to the source database
-     --target          Directory where to save the dump files
-     --dir             Work directory to use
-     --snapshot        Use snapshot obtained with pg_export_snapshot
-
-.. _pgcopydb_dump_pre_data:
-
-pgcopydb dump pre-data
-----------------------
-
-pgcopydb dump pre-data - Dump source database pre-data schema as custom files in target directory
-
-The command ``pgcopydb dump pre-data`` uses pg_dump to export SQL schema
-*pre-data* definitions from the given source Postgres instance.
-
-::
-
-   pgcopydb dump pre-data: Dump source database pre-data schema as custom files in target directory
-   usage: pgcopydb dump schema  --source <URI> --target <dir>
-
-     --source          Postgres URI to the source database
-     --target          Directory where to save the dump files
-     --dir             Work directory to use
-     --snapshot        Use snapshot obtained with pg_export_snapshot
-
-.. _pgcopydb_dump_post_data:
-
-pgcopydb dump post-data
------------------------
-
-pgcopydb dump post-data - Dump source database post-data schema as custom files in target directory
-
-The command ``pgcopydb dump post-data`` uses pg_dump to export SQL schema
-*post-data* definitions from the given source Postgres instance.
-
-::
-
-   pgcopydb dump post-data: Dump source database post-data schema as custom files in target directory
-   usage: pgcopydb dump schema  --source <URI> --target <dir>
-
-     --source          Postgres URI to the source database
-     --target          Directory where to save the dump files
-     --dir             Work directory to use
-     --snapshot        Use snapshot obtained with pg_export_snapshot
-
+.. include:: ../include/dump-schema.rst
 
 .. _pgcopydb_dump_roles:
 
@@ -87,15 +31,7 @@ pgcopydb dump roles - Dump source database roles as custome file in work directo
 The command ``pgcopydb dump roles`` uses pg_dumpall --roles-only to export
 SQL definitions of the roles found on the source Postgres instance.
 
-::
-
-   pgcopydb dump roles: Dump source database roles as custome file in work directory
-   usage: pgcopydb dump roles  --source <URI>
-
-     --source            Postgres URI to the source database
-     --target            Directory where to save the dump files
-     --dir               Work directory to use
-     --no-role-passwords Do not dump passwords for roles
+.. include:: ../include/dump-roles.rst
 
 The ``pg_dumpall --roles-only`` is used to fetch the list of roles from the
 source database, and this command includes support for passwords. As a
@@ -113,22 +49,16 @@ The ``pgcopydb dump schema`` command implements the first step of the full
 database migration and fetches the schema definitions from the source
 database.
 
-When the command runs, it calls ``pg_dump`` to get first the pre-data schema
-output in a Postgres custom file, and then again to get the post-data schema
-output in another Postgres custom file.
+When the command runs, it calls ``pg_dump`` to get the pre-data schema and
+the post-data schema output in a Postgres custom file called ``schema.dump``.
 
 The output files are written to the ``schema`` sub-directory of the
 ``--target`` directory.
 
-The ``pgcopydb dump pre-data`` and ``pgcopydb dump post-data`` are limiting
-their action to respectively the pre-data and the post-data sections of the
-pg_dump.
-
 Options
 -------
 
-The following options are available to ``pgcopydb dump schema``, ``pgcopydb dump pre-data``
-and ``pgcopydb dump post-data`` subcommands:
+The following options are available to ``pgcopydb dump schema`` subcommand:
 
 --source
 
@@ -147,9 +77,9 @@ and ``pgcopydb dump post-data`` subcommands:
 
   During its normal operations pgcopydb creates a lot of temporary files to
   track sub-processes progress. Temporary files are created in the directory
-  location given by this option, or defaults to
+  specified by this option, or defaults to
   ``${TMPDIR}/pgcopydb`` when the environment variable is set, or
-  then to ``/tmp/pgcopydb``.
+  otherwise to ``/tmp/pgcopydb``.
 
 
 --no-role-passwords
@@ -206,13 +136,12 @@ First, using ``pgcopydb dump schema``
    09:35:21 3926 INFO  Found a stale pidfile at "/tmp/target/pgcopydb.pid"
    09:35:21 3926 WARN  Removing the stale pid file "/tmp/target/pgcopydb.pid"
    09:35:21 3926 INFO  Using pg_dump for Postgres "12.9" at "/Applications/Postgres.app/Contents/Versions/12/bin/pg_dump"
-   09:35:21 3926 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section pre-data --file /tmp/target/schema/pre.dump 'port=5501 dbname=demo'
-   09:35:22 3926 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section post-data --file /tmp/target/schema/post.dump 'port=5501 dbname=demo'
+   09:35:21 3926 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section pre-data --section post-data --file /tmp/target/schema/schema.dump 'port=5501 dbname=demo'
 
 
-Once the previous command is finished, the pg_dump output files can be found
-in ``/tmp/target/schema`` and are named ``pre.dump`` and ``post.dump``.
-Other files and directories have been created.
+Once the previous command is finished, the pg_dump output file can be found
+in ``/tmp/target/schema`` and is named ``schema.dump``. Additionally, other files
+and directories have been created.
 
 ::
 
@@ -220,36 +149,7 @@ Other files and directories have been created.
    /tmp/target
    /tmp/target/pgcopydb.pid
    /tmp/target/schema
-   /tmp/target/schema/post.dump
-   /tmp/target/schema/pre.dump
+   /tmp/target/schema/schema.dump
    /tmp/target/run
    /tmp/target/run/tables
    /tmp/target/run/indexes
-
-Then we have almost the same thing when using the other forms.
-
-We can see that ``pgcopydb dump pre-data`` only does the pre-data section of
-the dump.
-
-::
-
-   $ pgcopydb dump pre-data --source "port=5501 dbname=demo" --target /tmp/target
-   09:35:21 3926 INFO  Dumping database from "port=5501 dbname=demo"
-   09:35:21 3926 INFO  Dumping database into directory "/tmp/target"
-   09:35:21 3926 INFO  Found a stale pidfile at "/tmp/target/pgcopydb.pid"
-   09:35:21 3926 WARN  Removing the stale pid file "/tmp/target/pgcopydb.pid"
-   09:35:21 3926 INFO  Using pg_dump for Postgres "12.9" at "/Applications/Postgres.app/Contents/Versions/12/bin/pg_dump"
-   09:35:21 3926 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section pre-data --file /tmp/target/schema/pre.dump 'port=5501 dbname=demo'
-
-And then ``pgcopydb dump post-data`` only does the post-data section of the
-dump.
-
-::
-
-   $ pgcopydb dump post-data --source "port=5501 dbname=demo" --target /tmp/target
-   09:35:21 3926 INFO  Dumping database from "port=5501 dbname=demo"
-   09:35:21 3926 INFO  Dumping database into directory "/tmp/target"
-   09:35:21 3926 INFO  Found a stale pidfile at "/tmp/target/pgcopydb.pid"
-   09:35:21 3926 WARN  Removing the stale pid file "/tmp/target/pgcopydb.pid"
-   09:35:21 3926 INFO  Using pg_dump for Postgres "12.9" at "/Applications/Postgres.app/Contents/Versions/12/bin/pg_dump"
-   09:35:21 3926 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_dump -Fc --section post-data --file /tmp/target/schema/post.dump 'port=5501 dbname=demo'

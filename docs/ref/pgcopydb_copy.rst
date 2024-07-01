@@ -7,19 +7,7 @@ pgcopydb copy - Implement the data section of the database copy
 
 This command prefixes the following sub-commands:
 
-::
-
-  pgcopydb copy
-    db           Copy an entire database from source to target
-    roles        Copy the roles from the source instance to the target instance
-    extensions   Copy the extensions from the source instance to the target instance
-    schema       Copy the database schema from source to target
-    data         Copy the data section from source to target
-    table-data   Copy the data from all tables in database from source to target
-    blobs        Copy the blob data from the source database to the target
-    sequences    Copy the current value from all sequences in database from source to target
-    indexes      Create all the indexes found in the source database in the target
-    constraints  Create all the constraints found in the source database in the target
+.. include:: ../include/copy.rst
 
 Those commands implement a part of the whole database copy operation as
 detailed in section :ref:`pgcopydb_clone`. Only use those commands to debug
@@ -42,27 +30,7 @@ pgcopydb copy db - Copy an entire database from source to target
 The command ``pgcopydb copy db`` is an alias for ``pgcopydb clone``. See
 also :ref:`pgcopydb_clone`.
 
-::
-
-   pgcopydb copy db: Copy an entire database from source to target
-   usage: pgcopydb copy db  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source              Postgres URI to the source database
-     --target              Postgres URI to the target database
-     --dir                 Work directory to use
-     --table-jobs          Number of concurrent COPY jobs to run
-     --index-jobs          Number of concurrent CREATE INDEX jobs to run
-     --drop-if-exists      On the target database, clean-up from a previous run first
-     --roles               Also copy roles found on source to target
-     --no-owner            Do not set ownership of objects to match the original database
-     --no-acl              Prevent restoration of access privileges (grant/revoke commands).
-     --no-comments         Do not output commands to restore comments
-     --skip-large-objects  Skip copying large objects (blobs)
-     --filters <filename>  Use the filters defined in <filename>
-     --restart             Allow restarting when temp files exist already
-     --resume              Allow resuming operations after a failure
-     --not-consistent      Allow taking a new snapshot on the source database
-     --snapshot            Use snapshot obtained with pg_export_snapshot
+.. include:: ../include/copy-db.rst
 
 .. _pgcopydb_copy_roles:
 
@@ -74,15 +42,7 @@ pgcopydb copy roles - Copy the roles from the source instance to the target inst
 The command ``pgcopydb copy roles`` implements both
 :ref:`pgcopydb_dump_roles` and then :ref:`pgcopydb_restore_roles`.
 
-::
-
-   pgcopydb copy roles: Copy the roles from the source instance to the target instance
-   usage: pgcopydb copy roles  --source ... --target ...
-
-     --source              Postgres URI to the source database
-     --target              Postgres URI to the target database
-     --dir                 Work directory to use
-     --no-role-passwords   Do not dump passwords for roles
+.. include:: ../include/copy-roles.rst
 
 .. note::
 
@@ -110,14 +70,7 @@ The command ``pgcopydb copy extensions`` gets a list of the extensions
 installed on the source database, and for each of them run the SQL command
 CREATE EXTENSION IF NOT EXISTS.
 
-::
-
-   pgcopydb copy extensions: Copy the extensions from the source instance to the target instance
-   usage: pgcopydb copy extensions  --source ... --target ...
-
-     --source              Postgres URI to the source database
-     --target              Postgres URI to the target database
-     --dir                 Work directory to use
+.. include:: ../include/copy-extensions.rst
 
 When copying extensions, this command also takes care of copying any
 `Extension Configuration Tables`__ user-data to the target database.
@@ -134,20 +87,7 @@ pgcopydb copy schema - Copy the database schema from source to target
 The command ``pgcopydb copy schema`` implements the schema only section of
 the clone steps.
 
-::
-
-   pgcopydb copy schema: Copy the database schema from source to target
-   usage: pgcopydb copy schema  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source              Postgres URI to the source database
-     --target              Postgres URI to the target database
-     --dir                 Work directory to use
-     --filters <filename>  Use the filters defined in <filename>
-     --restart             Allow restarting when temp files exist already
-     --resume              Allow resuming operations after a failure
-     --not-consistent      Allow taking a new snapshot on the source database
-     --snapshot            Use snapshot obtained with pg_export_snapshot
-
+.. include:: ../include/copy-schema.rst
 
 .. _pgcopydb_copy_data:
 
@@ -159,23 +99,7 @@ pgcopydb copy data - Copy the data section from source to target
 The command ``pgcopydb copy data`` implements the data section of the clone
 steps.
 
-::
-
-   pgcopydb copy data: Copy the data section from source to target
-   usage: pgcopydb copy data  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source              Postgres URI to the source database
-     --target              Postgres URI to the target database
-     --dir                 Work directory to use
-     --table-jobs          Number of concurrent COPY jobs to run
-     --index-jobs          Number of concurrent CREATE INDEX jobs to run
-     --drop-if-exists      On the target database, clean-up from a previous run first
-     --no-owner            Do not set ownership of objects to match the original database
-     --skip-large-objects  Skip copying large objects (blobs)
-     --restart             Allow restarting when temp files exist already
-     --resume              Allow resuming operations after a failure
-     --not-consistent      Allow taking a new snapshot on the source database
-     --snapshot            Use snapshot obtained with pg_export_snapshot
+.. include:: ../include/copy-data.rst
 
 .. note::
 
@@ -211,19 +135,7 @@ source database and runs a COPY TO command on the source database and sends
 the result to the target database using a COPY FROM command directly,
 avoiding disks entirely.
 
-::
-
-   pgcopydb copy table-data: Copy the data from all tables in database from source to target
-   usage: pgcopydb copy table-data  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source          Postgres URI to the source database
-     --target          Postgres URI to the target database
-     --dir             Work directory to use
-     --table-jobs      Number of concurrent COPY jobs to run
-     --restart         Allow restarting when temp files exist already
-     --resume          Allow resuming operations after a failure
-     --not-consistent  Allow taking a new snapshot on the source database
-     --snapshot        Use snapshot obtained with pg_export_snapshot
+.. include:: ../include/copy-table-data.rst
 
 .. _pgcopydb_copy_blobs:
 
@@ -238,20 +150,7 @@ database. By default the command assumes that the large objects metadata
 have already been taken care of, because of the behaviour of
 ``pg_dump --section=pre-data``.
 
-::
-
-   pgcopydb copy blobs: Copy the blob data from the source database to the target
-   usage: pgcopydb copy blobs  --source ... --target ...
-
-     --source             Postgres URI to the source database
-     --target             Postgres URI to the target database
-     --dir                Work directory to use
-     --large-objects-jobs Number of concurrent Large Objects jobs to run
-     --drop-if-exists     On the target database, drop and create large objects
-     --restart            Allow restarting when temp files exist already
-     --resume             Allow resuming operations after a failure
-     --not-consistent     Allow taking a new snapshot on the source database
-     --snapshot           Use snapshot obtained with pg_export_snapshot
+.. include:: ../include/copy-blobs.rst
 
 .. _pgcopydb_copy_sequences:
 
@@ -266,17 +165,7 @@ the source database, then for each sequence fetches the ``last_value`` and
 and then for each sequence call ``pg_catalog.setval()`` on the target
 database.
 
-::
-
-   pgcopydb copy sequences: Copy the current value from all sequences in database from source to target
-   usage: pgcopydb copy sequences  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source          Postgres URI to the source database
-     --target          Postgres URI to the target database
-     --dir             Work directory to use
-     --restart         Allow restarting when temp files exist already
-     --resume          Allow resuming operations after a failure
-     --not-consistent  Allow taking a new snapshot on the source database
+.. include:: ../include/copy-sequences.rst
 
 .. _pgcopydb_copy_indexes:
 
@@ -291,18 +180,7 @@ database. The statements for the index definitions are modified to include
 IF NOT EXISTS and allow for skipping indexes that already exist on the
 target database.
 
-::
-
-   pgcopydb copy indexes: Create all the indexes found in the source database in the target
-   usage: pgcopydb copy indexes  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source          Postgres URI to the source database
-     --target          Postgres URI to the target database
-     --dir             Work directory to use
-	 --index-jobs      Number of concurrent CREATE INDEX jobs to run
-     --restart         Allow restarting when temp files exist already
-     --resume          Allow resuming operations after a failure
-     --not-consistent  Allow taking a new snapshot on the source database
+.. include:: ../include/copy-indexes.rst
 
 .. _pgcopydb_copy_constraints:
 
@@ -318,17 +196,7 @@ USING INDEX statement on the target database.
 The indexes must already exist, and the command will fail if any constraint
 is found existing already on the target database.
 
-::
-
-   pgcopydb copy indexes: Create all the indexes found in the source database in the target
-   usage: pgcopydb copy indexes  --source ... --target ... [ --table-jobs ... --index-jobs ... ]
-
-     --source          Postgres URI to the source database
-     --target          Postgres URI to the target database
-     --dir             Work directory to use
-     --restart         Allow restarting when temp files exist already
-     --resume          Allow resuming operations after a failure
-     --not-consistent  Allow taking a new snapshot on the source data
+.. include:: ../include/copy-constraints.rst
 
 Description
 -----------
@@ -386,9 +254,9 @@ The following options are available to ``pgcopydb copy`` sub-commands:
 
   During its normal operations pgcopydb creates a lot of temporary files to
   track sub-processes progress. Temporary files are created in the directory
-  location given by this option, or defaults to
+  specified by this option, or defaults to
   ``${TMPDIR}/pgcopydb`` when the environment variable is set, or
-  then to ``/tmp/pgcopydb``.
+  otherwise to ``/tmp/pgcopydb``.
 
 --no-role-passwords
 
@@ -532,6 +400,12 @@ PGCOPYDB_INDEX_JOBS
    parallel. When ``--index-jobs`` is ommitted from the command line, then
    this environment variable is used.
 
+PGCOPYDB_RESTORE_JOBS
+
+   Number of concurrent jobs allowed to run `pg_restore` operations in
+   parallel. When ``--restore-jobs`` is ommitted from the command line, then
+   this environment variable is used.
+
 PGCOPYDB_LARGE_OBJECTS_JOBS
 
    Number of concurrent jobs allowed to copy Large Objects data in parallel.
@@ -546,6 +420,22 @@ PGCOPYDB_SPLIT_TABLES_LARGER_THAN
 
    When ``--split-tables-larger-than`` is ommitted from the command line,
    then this environment variable is used.
+
+PGCOPYDB_SPLIT_MAX_PARTS
+
+   Limit the maximum number of parts when :ref:`same_table_concurrency` is
+   used. When ``--split-max-parts`` is ommitted from the command line, then this
+   environment variable is used.
+
+PGCOPYDB_ESTIMATE_TABLE_SIZES
+
+   When true (or *yes*, or *on*, or 1, same input as a Postgres boolean)
+   then pgcopydb estimates the size of tables to determine whether or not to
+   split tables. This option is only useful when querying the relation sizes on
+   source database is costly.
+
+   When ``--estimate-table-sizes`` is ommitted from the command line, then
+   this environment variable is used.
 
 PGCOPYDB_DROP_IF_EXISTS
 
@@ -578,13 +468,16 @@ Now, first dump the schema:
 ::
 
    $ pgcopydb dump schema
-   14:28:50 22 INFO   Running pgcopydb version 0.13.38.g22e6544.dirty from "/usr/local/bin/pgcopydb"
-   14:28:50 22 INFO   Dumping database from "postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-   14:28:50 22 INFO   Dumping database into directory "/tmp/pgcopydb"
-   14:28:50 22 INFO   Using pg_dump for Postgres "16.1" at "/usr/bin/pg_dumpall"
-   14:28:50 22 INFO   Exported snapshot "00000003-00000022-1" from the source database
-   14:28:50 22 INFO    /usr/bin/pg_dump -Fc --snapshot 00000003-00000022-1 --section pre-data --file /tmp/pgcopydb/schema/pre.dump 'postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
-   14:28:51 22 INFO    /usr/bin/pg_dump -Fc --snapshot 00000003-00000022-1 --section post-data --file /tmp/pgcopydb/schema/post.dump 'postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
+   08:27:48.633 44371 INFO   Using work dir "/tmp/pgcopydb"
+   08:27:48.634 44371 INFO   Dumping database from "postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   08:27:48.634 44371 INFO   Dumping database into directory "/tmp/pgcopydb"
+   08:27:48.634 44371 INFO   Using pg_dump for Postgres "16.2" at "/usr/bin/pg_dump"
+   08:27:48.971 44371 INFO   Fetched information for 5 tables (including 0 tables split in 0 partitions total), with an estimated total of 1000 thousands tuples and 128 MB on-disk
+   08:27:48.978 44371 INFO   Fetched information for 4 indexes (supporting 4 constraints)
+   08:27:48.983 44371 INFO   Fetching information for 1 sequences
+   08:27:48.996 44371 INFO   Fetched information for 1 extensions
+   08:27:49.072 44371 INFO   Found 5 indexes (supporting 5 constraints) in the target database
+   08:27:49.078 44371 INFO    /usr/bin/pg_dump -Fc --section=pre-data --section=post-data --file /tmp/pgcopydb/schema/schema.dump 'postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60'
 
 Now restore the pre-data schema on the target database, cleaning up the
 already existing objects if any, which allows running this test scenario
@@ -594,42 +487,25 @@ target instance though!
 ::
 
    $ PGCOPYDB_DROP_IF_EXISTS=on pgcopydb restore pre-data --no-owner --resume --not-consistent
-   14:28:51 26 INFO   Running pgcopydb version 0.13.38.g22e6544.dirty from "/usr/local/bin/pgcopydb"
-   14:28:51 26 INFO   Schema dump for pre-data and post-data section have been done
-   14:28:51 26 INFO   Restoring database from existing files at "/tmp/pgcopydb"
-   14:28:51 26 INFO   Using pg_restore for Postgres "16.1" at "/usr/bin/pg_restore"
-   14:28:51 26 INFO   [TARGET] Restoring database into "postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-   14:28:51 26 INFO   Drop tables on the target database, per --drop-if-exists
-   14:28:51 26 INFO   No tables to migrate, skipping drop tables on the target database
-   14:28:51 26 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --single-transaction --clean --
-
+   08:30:13.621 44597 INFO   Using work dir "/tmp/pgcopydb"
+   08:30:13.621 44597 INFO   Restoring database from existing files at "/tmp/pgcopydb"
+   08:30:13.706 44597 INFO   Found 5 indexes (supporting 5 constraints) in the target database
+   08:30:13.710 44597 INFO   Using pg_restore for Postgres "16.2" at "/usr/bin/pg_restore"
+   08:30:13.711 44597 INFO   [TARGET] Restoring database into "postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   08:30:13.730 44597 INFO   Drop tables on the target database, per --drop-if-exists
+   08:30:13.774 44597 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 4 --clean --if-exists --no-owner --use-list /tmp/pgcopydb/schema/pre-filtered.list /tmp/pgcopydb/schema/schema.dump
 
 Then copy the data over:
 
 ::
 
    $ pgcopydb copy table-data --resume --not-consistent
-    14:28:52 30 INFO   Running pgcopydb version 0.13.38.g22e6544.dirty from "/usr/local/bin/pgcopydb"
-    14:28:52 30 INFO   [SOURCE] Copying database from "postgres://pagila@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-    14:28:52 30 INFO   [TARGET] Copying database into "postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-    14:28:52 30 INFO   Schema dump for pre-data and post-data section have been done
-    14:28:52 30 INFO   Pre-data schema has been restored on the target instance
-    14:28:52 30 INFO   Copy data from source to target in sub-processes
-   ...
-                                                  Step   Connection    Duration    Transfer   Concurrency
-    --------------------------------------------------   ----------  ----------  ----------  ------------
-                                           Dump Schema       source         0ms                         1
-      Catalog Queries (table ordering, filtering, etc)       source         0ms                         1
-                                        Prepare Schema       target         0ms                         1
-         COPY, INDEX, CONSTRAINTS, VACUUM (wall clock)         both         0ms                     4 + 8
-                                     COPY (cumulative)         both       1s671     2955 kB             4
-                            Large Objects (cumulative)         both                                     4
-                CREATE INDEX, CONSTRAINTS (cumulative)       target         0ms                         4
-                                       Finalize Schema       target         0ms                         1
-    --------------------------------------------------   ----------  ----------  ----------  ------------
-                             Total Wall Clock Duration         both       753ms                     4 + 8
-    --------------------------------------------------   ----------  ----------  ----------  ------------
-
+   08:34:02.813 44834 INFO   [SOURCE] Copying database from "postgres://pagila:0wn3d@source/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   08:34:02.813 44834 INFO   [TARGET] Copying database into "postgres://pagila:0wn3d@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   08:34:02.861 44834 INFO   Using work dir "/tmp/pgcopydb"
+   08:34:02.862 44834 INFO   Copy data from source to target in sub-processes
+   08:34:02.863 44834 INFO   Re-using catalog caches
+   08:34:02.863 44834 INFO   STEP 4: starting 4 table-data COPY processes
 
 And now create the indexes on the target database, using the index
 definitions from the source database:
@@ -718,4 +594,4 @@ Finally we can restore the post-data section of the schema:
    14:28:54 60 INFO   Restoring database from existing files at "/tmp/pgcopydb"
    14:28:54 60 INFO   Using pg_restore for Postgres "16.1" at "/usr/bin/pg_restore"
    14:28:54 60 INFO   [TARGET] Restoring database into "postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
-   14:28:55 60 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --single-transaction --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/post.dump
+   14:28:55 60 INFO    /usr/bin/pg_restore --dbname 'postgres://pagila@target/pagila?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --single-transaction --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/schema.dump

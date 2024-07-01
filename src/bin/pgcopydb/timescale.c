@@ -15,6 +15,10 @@ typedef struct ChunkHypertableMap
 } ChunkHypertableMap;
 
 
+static bool tableExists(PGSQL *pgsql, const char *nspname,
+						const char *relname,
+						bool *exists);
+
 static ChunkHypertableMap *chunkHypertableMap = NULL;
 
 /*
@@ -66,6 +70,54 @@ parseHypertableDetails(void *ctx, PGresult *res)
 }
 
 
+/*
+ * tableExists checks that a role with the given table exists on the
+ * Postgres server.
+ */
+static bool
+tableExists(PGSQL *pgsql,
+			const char *nspname,
+			const char *relname,
+			bool *exists)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	char *existsQuery =
+		"select exists( "
+		"         select 1 "
+		"           from pg_class c "
+		"                join pg_namespace n on n.oid = c.relnamespace "
+		"          where format('%I', n.nspname) = $1 "
+		"            and format('%I', c.relname) = $2"
+		"       )";
+
+	int paramCount = 2;
+	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { 0 };
+
+	paramValues[0] = nspname;
+	paramValues[1] = relname;
+
+	if (!pgsql_execute_with_params(pgsql, existsQuery,
+								   paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check if \"%s\".\"%s\" exists", nspname, relname);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to check if \"%s\".\"%s\" exists", nspname, relname);
+		return false;
+	}
+
+	*exists = context.boolVal;
+
+	return true;
+}
+
+
 static bool isTimescale = false;
 
 bool
@@ -77,7 +129,7 @@ timescale_init(PGSQL *pgsql, char *pguri)
 		return false;
 	}
 
-	if (!pgsql_table_exists(pgsql, "_timescaledb_catalog", "hypertable", &isTimescale))
+	if (!tableExists(pgsql, "_timescaledb_catalog", "hypertable", &isTimescale))
 	{
 		/* errors have already been logged */
 		return false;
@@ -148,6 +200,7 @@ timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
 	}
 
 	uint32_t targetHypertableID;
+
 	if (!extract_hypertable_id(relname_in, &targetHypertableID))
 	{
 		log_error("BUG: Failed to find hypertable id from %s.%s", nspname_in, relname_in);
@@ -155,8 +208,10 @@ timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
 	}
 
 	ChunkHypertableMap *foundMapEntry;
+
 	HASH_FIND_INT(chunkHypertableMap, &targetHypertableID, foundMapEntry);
-	if (!foundMapEntry)
+
+	if (foundMapEntry == NULL)
 	{
 		log_error("Failed to find hypertable from map for %s.%s", nspname_in, relname_in);
 		return false;
@@ -223,4 +278,72 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 	}
 
 	return true; /* Not found in denylist, allowed */
+}
+
+
+bool
+timescale_is_hypertable_root(PGSQL *pgsql,
+							 const char *nspname,
+							 const char *relname,
+							 bool *isRoot)
+{
+	bool exists = false;
+
+	if (!tableExists(pgsql, "_timescaledb_catalog", "hypertable", &exists))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!exists)
+	{
+		/* The table does not exist, so it cannot be a hypertable root */
+		*isRoot = false;
+		return true;
+	}
+
+	const char *sql =
+		" select exists( "
+		"   select 1 from timescaledb_information.hypertables"
+
+		/*
+		 * We need to check if the restoring mode is off, otherwise the
+		 * hypertable is not considered a root hypertable.
+		 *
+		 * When restoring mode is on, the migration is for Postgres to
+		 * TimescaleDB, and the hypertable is not yet fully migrated.
+		 */
+		"   where "
+		"     current_setting('timescaledb.restoring') = 'off' "
+		"     and hypertable_schema=$1 "
+		"     and hypertable_name=$2 "
+		"   ) ";
+
+	int paramCount = 2;
+	const Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { 0 };
+
+	paramValues[0] = nspname;
+	paramValues[1] = relname;
+
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	if (!pgsql_execute_with_params(pgsql, sql, paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check if \"%s\".\"%s\" is a hypertable root", nspname,
+				  relname);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to check if \"%s\".\"%s\" is a hypertable root", nspname,
+				  relname);
+		return false;
+	}
+
+	*isRoot = context.boolVal;
+
+	return true;
 }

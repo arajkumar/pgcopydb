@@ -1,7 +1,7 @@
 version: "3.9"  # optional since v1.27.0
 services:
   source:
-    image: timescale/timescaledb:latest-pg15
+    image: timescale/timescaledb:latest-pg16
     expose:
       - 5432
     environment:
@@ -11,7 +11,7 @@ services:
     command: >
       -c wal_level=logical
   target:
-    image: timescale/timescaledb:latest-pg15
+    image: timescale/timescaledb:latest-pg16
     expose:
       - 5432
     environment:

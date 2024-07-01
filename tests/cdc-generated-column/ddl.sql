@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS generated_column_test
     email text not null,
     -- tests identifier escaping
     "table" text generated always as ('identifier 2' || name) stored,
-    """table""" text generated always as ('identifier 3' || name) stored
+    """table""" text generated always as ('identifier 3' || name) stored,
+    """hel""lo""" text generated always as ('identifier 4' || name) stored
 );
 
 commit;

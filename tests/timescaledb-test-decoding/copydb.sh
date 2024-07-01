@@ -29,6 +29,13 @@ coproc ( pgcopydb snapshot --follow --plugin test_decoding )
 # wait for snapshot to be created
 while [ ! -f /tmp/pgcopydb/snapshot ]; do sleep 1; done
 
+dbf=/tmp/pgcopydb/schema/source.db
+
+while [ ! -s ${dbf} ]
+do
+    sleep 1
+done
+
 # copying roles needs superuser
 # and we use the postgres database here still
 pgcopydb copy roles --source ${POSTGRES_SOURCE} --target ${POSTGRES_TARGET} --resume
@@ -43,15 +50,12 @@ psql ${PGCOPYDB_TARGET_PGURI_SU} -f /usr/src/pgcopydb/tsdb_grants.sql
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
     -c 'select public.timescaledb_pre_restore();'
 
-pgcopydb copy extensions --source ${PGCOPYDB_SOURCE_PGURI_SU} --target ${PGCOPYDB_TARGET_PGURI_SU} --resume
+pgcopydb copy extensions --resume
 
 pgcopydb stream setup
 
 # now clone with superuser privileges, seems to be required for timescaledb
-pgcopydb clone --resume \
-         --skip-extensions \
-         --source ${PGCOPYDB_SOURCE_PGURI_SU} \
-         --target ${PGCOPYDB_TARGET_PGURI_SU}
+pgcopydb clone --skip-extensions --no-acl --no-owner
 
 psql -d "$PGCOPYDB_TARGET_PGURI_SU" \
     -f - <<'EOF'

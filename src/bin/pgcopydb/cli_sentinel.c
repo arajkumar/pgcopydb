@@ -22,38 +22,29 @@
 CopyDBOptions sentinelDBoptions = { 0 };
 
 static int cli_sentinel_getopts(int argc, char **argv);
-static void cli_sentinel_create(int argc, char **argv);
-static void cli_sentinel_drop(int argc, char **argv);
+static void cli_sentinel_setup(int argc, char **argv);
 static void cli_sentinel_set_startpos(int argc, char **argv);
 static void cli_sentinel_set_endpos(int argc, char **argv);
 static void cli_sentinel_set_apply(int argc, char **argv);
 static void cli_sentinel_set_prefetch(int argc, char **argv);
 static void cli_sentinel_get(int argc, char **argv);
 
-CommandLine sentinel_create_command =
+static bool cli_sentinel_init_specs(CopyDataSpec *copySpecs);
+
+CommandLine sentinel_setup_command =
 	make_command(
-		"create",
-		"Create the sentinel table on the source database",
-		" --source ... ",
-		"  --source      Postgres URI to the source database\n"
+		"setup",
+		"Setup the sentinel table",
+		"",
 		"  --startpos    Start replaying changes when reaching this LSN\n"
 		"  --endpos      Stop replaying changes when reaching this LSN\n",
 		cli_sentinel_getopts,
-		cli_sentinel_create);
-
-CommandLine sentinel_drop_command =
-	make_command(
-		"drop",
-		"Drop the sentinel table on the source database",
-		" --source ... ",
-		"  --source      Postgres URI to the source database\n",
-		cli_sentinel_getopts,
-		cli_sentinel_drop);
+		cli_sentinel_setup);
 
 CommandLine sentinel_get_command =
 	make_command(
 		"get",
-		"Get the sentinel table values on the source database",
+		"Get the sentinel table values",
 		" --source ... ",
 		"  --source      Postgres URI to the source database\n"
 		"  --json        Format the output using JSON\n",
@@ -63,7 +54,7 @@ CommandLine sentinel_get_command =
 CommandLine sentinel_set_startpos_command =
 	make_command(
 		"startpos",
-		"Set the sentinel start position LSN on the source database",
+		"Set the sentinel start position LSN",
 		" --source ... <start LSN>",
 		"  --source      Postgres URI to the source database\n",
 		cli_sentinel_getopts,
@@ -72,7 +63,7 @@ CommandLine sentinel_set_startpos_command =
 CommandLine sentinel_set_endpos_command =
 	make_command(
 		"endpos",
-		"Set the sentinel end position LSN on the source database",
+		"Set the sentinel end position LSN",
 		" --source ... <end LSN>",
 		"  --source      Postgres URI to the source database\n"
 		"  --current     Use pg_current_wal_flush_lsn() as the endpos\n",
@@ -82,7 +73,7 @@ CommandLine sentinel_set_endpos_command =
 CommandLine sentinel_set_apply_command =
 	make_command(
 		"apply",
-		"Set the sentinel apply mode on the source database",
+		"Set the sentinel apply mode",
 		"",
 		"  --source      Postgres URI to the source database\n",
 		cli_sentinel_getopts,
@@ -91,7 +82,7 @@ CommandLine sentinel_set_apply_command =
 CommandLine sentinel_set_prefetch_command =
 	make_command(
 		"prefetch",
-		"Set the sentinel prefetch mode on the source database",
+		"Set the sentinel prefetch mode",
 		"",
 		"  --source      Postgres URI to the source database\n",
 		cli_sentinel_getopts,
@@ -107,12 +98,11 @@ static CommandLine *sentinel_set_subcommands[] = {
 
 static CommandLine sentinel_set_commands =
 	make_command_set("set",
-					 "Maintain a sentinel table on the source database",
+					 "Set the sentinel table values",
 					 NULL, NULL, NULL, sentinel_set_subcommands);
 
 static CommandLine *sentinel_subcommands[] = {
-	&sentinel_create_command,
-	&sentinel_drop_command,
+	&sentinel_setup_command,
 	&sentinel_get_command,
 	&sentinel_set_commands,
 	NULL
@@ -120,7 +110,7 @@ static CommandLine *sentinel_subcommands[] = {
 
 CommandLine sentinel_commands =
 	make_command_set("sentinel",
-					 "Maintain a sentinel table on the source database",
+					 "Maintain a sentinel table",
 					 NULL, NULL, NULL, sentinel_subcommands);
 
 
@@ -136,6 +126,7 @@ cli_sentinel_getopts(int argc, char **argv)
 
 	static struct option long_options[] = {
 		{ "source", required_argument, NULL, 'S' },
+		{ "dir", required_argument, NULL, 'D' },
 		{ "endpos", required_argument, NULL, 'E' },
 		{ "startpos", required_argument, NULL, 's' },
 		{ "current", no_argument, NULL, 'C' },
@@ -159,7 +150,7 @@ cli_sentinel_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	while ((c = getopt_long(argc, argv, "S:s:E:CVvdzqh",
+	while ((c = getopt_long(argc, argv, "S:D:E:s:CJVvdzqh",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -174,6 +165,13 @@ cli_sentinel_getopts(int argc, char **argv)
 				}
 				options.connStrings.source_pguri = pg_strdup(optarg);
 				log_trace("--source %s", options.connStrings.source_pguri);
+				break;
+			}
+
+			case 'D':
+			{
+				strlcpy(options.dir, optarg, MAXPGPATH);
+				log_trace("--dir %s", options.dir);
 				break;
 			}
 
@@ -283,30 +281,40 @@ cli_sentinel_getopts(int argc, char **argv)
 				exit(EXIT_CODE_QUIT);
 				break;
 			}
+
+			case '?':
+			default:
+			{
+				++errors;
+			}
 		}
 	}
 
-	if (options.connStrings.source_pguri == NULL)
+	if (options.currentpos)
 	{
-		log_fatal("Options --source is mandatory");
-		++errors;
-	}
+		if (options.endpos != InvalidXLogRecPtr)
+		{
+			log_fatal("Please choose only one of --endpos and --current");
+			++errors;
+		}
 
-	/* prepare safe versions of the connection strings (without password) */
-	if (!cli_prepare_pguris(&(options.connStrings)))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
+		if (options.connStrings.source_pguri == NULL)
+		{
+			log_fatal("Options --source is mandatory when using --current");
+			++errors;
+		}
 
-	if (options.currentpos && options.endpos != InvalidXLogRecPtr)
-	{
-		log_fatal("Please choose only one of --endpos and --current");
-		++errors;
+		/* prepare safe versions of the connection strings (without password) */
+		if (!cli_prepare_pguris(&(options.connStrings)))
+		{
+			/* errors have already been logged */
+			++errors;
+		}
 	}
 
 	if (errors > 0)
 	{
+		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
@@ -318,70 +326,40 @@ cli_sentinel_getopts(int argc, char **argv)
 
 
 /*
- * cli_sentinel_create creates the pgcopydb.sentinel table on the source
- * database.
+ * cli_sentinel_setup sets-up the sentinel table in pgcopydb catalogs.
  */
 static void
-cli_sentinel_create(int argc, char **argv)
+cli_sentinel_setup(int argc, char **argv)
 {
-	CopyDataSpec copySpecs = { 0 };
-
 	if (argc > 0)
 	{
 		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	(void) find_pg_commands(&(copySpecs.pgPaths));
+	CopyDataSpec copySpecs = { 0 };
 
-	if (!copydb_init_specs(&copySpecs, &sentinelDBoptions, DATA_SECTION_ALL))
+	if (!cli_sentinel_init_specs(&copySpecs))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!stream_create_sentinel(&copySpecs,
-								sentinelDBoptions.startpos,
-								sentinelDBoptions.endpos))
+	DatabaseCatalog *sourceDB = &(copySpecs.catalogs.source);
+
+	if (!sentinel_setup(sourceDB,
+						sentinelDBoptions.startpos,
+						sentinelDBoptions.endpos))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
-	}
-}
-
-
-/*
- * cli_sentinel_drop drops the pgcopydb.sentinel table on the source database.
- */
-static void
-cli_sentinel_drop(int argc, char **argv)
-{
-	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
-	PGSQL pgsql = { 0 };
-
-	if (argc > 0)
-	{
-		commandline_help(stderr);
-		exit(EXIT_CODE_BAD_ARGS);
-	}
-
-	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
-	}
-
-	if (!pgsql_execute(&pgsql, "drop schema pgcopydb cascade"))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
 
 /*
  * cli_sentinel_set_startpos updates the startpos registered on the pgcopydb
- * sentinel on the source database.
+ * sentinel.
  */
 static void
 cli_sentinel_set_startpos(int argc, char **argv)
@@ -422,26 +400,27 @@ cli_sentinel_set_startpos(int argc, char **argv)
 		}
 	}
 
-	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
-	PGSQL pgsql = { 0 };
+	CopyDataSpec copySpecs = { 0 };
 
-	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
+	if (!cli_sentinel_init_specs(&copySpecs))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!pgsql_update_sentinel_startpos(&pgsql, startpos))
+	DatabaseCatalog *sourceDB = &(copySpecs.catalogs.source);
+
+	if (!sentinel_update_startpos(sourceDB, startpos))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
 
 /*
  * cli_sentinel_set_endpos updates the endpos registered on the pgcopydb
- * sentinel on the source database.
+ * sentinel.
  */
 static void
 cli_sentinel_set_endpos(int argc, char **argv)
@@ -491,115 +470,110 @@ cli_sentinel_set_endpos(int argc, char **argv)
 		}
 	}
 
-	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
-	PGSQL pgsql = { 0 };
+	CopyDataSpec copySpecs = { 0 };
 
-	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
+	if (!cli_sentinel_init_specs(&copySpecs))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
-	}
-
-	if (!pgsql_begin(&pgsql))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
-	}
-
-	if (!pgsql_server_version(&pgsql))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
-	}
-
-	if (!pgsql_update_sentinel_endpos(&pgsql, useCurrentLSN, endpos))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
-	}
-
-	if (!pgsql_commit(&pgsql))
-	{
-		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
 	if (useCurrentLSN)
 	{
-		CopyDBSentinel sentinel = { 0 };
+		char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
 
-		if (!pgsql_get_sentinel(&pgsql, &sentinel))
+		if (!stream_fetch_current_lsn(&endpos, pguri, PGSQL_CONN_SOURCE))
 		{
-			/* errors have already been logged */
 			exit(EXIT_CODE_SOURCE);
 		}
 
-		log_info("pgcopydb sentinel endpos has been set to %X/%X",
-				 LSN_FORMAT_ARGS(sentinel.endpos));
-
-		fformat(stdout, "%X/%X\n", LSN_FORMAT_ARGS(sentinel.endpos));
+		log_info("Fetched endpos %X/%X from source database",
+				 LSN_FORMAT_ARGS(endpos));
 	}
+
+	DatabaseCatalog *sourceDB = &(copySpecs.catalogs.source);
+
+	if (!sentinel_update_endpos(sourceDB, endpos))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	CopyDBSentinel sentinel = { 0 };
+
+	if (!sentinel_get(sourceDB, &sentinel))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_SOURCE);
+	}
+
+	log_info("pgcopydb sentinel endpos has been set to %X/%X",
+			 LSN_FORMAT_ARGS(sentinel.endpos));
+
+	fformat(stdout, "%X/%X\n", LSN_FORMAT_ARGS(sentinel.endpos));
 }
 
 
 /*
  * cli_sentinel_set_apply updates the apply boolean registered on the pgcopydb
- * sentinel on the source database. When the apply boolean is true,
+ * sentinel. When the apply boolean is true,
  * catching-up is allowed: it's not only prefetching anymore.
  */
 static void
 cli_sentinel_set_apply(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
-	PGSQL pgsql = { 0 };
-
 	if (argc > 0)
 	{
 		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
+	CopyDataSpec copySpecs = { 0 };
+
+	if (!cli_sentinel_init_specs(&copySpecs))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!pgsql_update_sentinel_apply(&pgsql, true))
+	DatabaseCatalog *sourceDB = &(copySpecs.catalogs.source);
+
+	if (!sentinel_update_apply(sourceDB, true))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
 
 /*
  * cli_sentinel_set_prefetch updates the apply boolean registered on the
- * pgcopydb sentinel on the source database. When the apply boolean is false,
+ * pgcopydb sentinel. When the apply boolean is false,
  * catching-up is not allowed: it's prefetching only.
  */
 static void
 cli_sentinel_set_prefetch(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
-	PGSQL pgsql = { 0 };
-
 	if (argc > 0)
 	{
 		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
+	CopyDataSpec copySpecs = { 0 };
+
+	if (!cli_sentinel_init_specs(&copySpecs))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	if (!pgsql_update_sentinel_apply(&pgsql, false))
+	DatabaseCatalog *sourceDB = &(copySpecs.catalogs.source);
+
+	if (!sentinel_update_apply(sourceDB, false))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 }
 
@@ -610,24 +584,25 @@ cli_sentinel_set_prefetch(int argc, char **argv)
 static void
 cli_sentinel_get(int argc, char **argv)
 {
-	char *pguri = (char *) sentinelDBoptions.connStrings.source_pguri;
-	PGSQL pgsql = { 0 };
-
 	if (argc > 0)
 	{
 		commandline_help(stderr);
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
-	if (!pgsql_init(&pgsql, pguri, PGSQL_CONN_SOURCE))
+	CopyDataSpec copySpecs = { 0 };
+
+	if (!cli_sentinel_init_specs(&copySpecs))
 	{
 		/* errors have already been logged */
-		exit(EXIT_CODE_SOURCE);
+		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
+
+	DatabaseCatalog *sourceDB = &(copySpecs.catalogs.source);
 
 	CopyDBSentinel sentinel = { 0 };
 
-	if (!pgsql_get_sentinel(&pgsql, &sentinel))
+	if (!sentinel_get(sourceDB, &sentinel))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_SOURCE);
@@ -667,7 +642,6 @@ cli_sentinel_get(int argc, char **argv)
 		fformat(stdout, "%s\n", serialized_string);
 
 		json_free_serialized_string(serialized_string);
-		json_value_free(js);
 	}
 	else
 	{
@@ -684,4 +658,53 @@ cli_sentinel_get(int argc, char **argv)
 		fformat(stdout, "%-10s %X/%X\n", "replay_lsn",
 				LSN_FORMAT_ARGS(sentinel.replay_lsn));
 	}
+}
+
+
+/*
+ * cli_sentinel_init_specs initializes our CopyDataSpec from cli options.
+ */
+static bool
+cli_sentinel_init_specs(CopyDataSpec *copySpecs)
+{
+	char *dir =
+		IS_EMPTY_STRING_BUFFER(sentinelDBoptions.dir)
+		? NULL
+		: sentinelDBoptions.dir;
+
+	bool service = false;
+	char *serviceName = NULL;
+	bool createWorkDir = false;
+
+	/* pretend --resume, allowing to work on an existing directory */
+	bool restart = false;
+	bool resume = true;
+
+	sentinelDBoptions.notConsistent = true;
+
+	if (!copydb_init_workdir(copySpecs,
+							 dir,
+							 service,
+							 serviceName,
+							 restart,
+							 resume,
+							 createWorkDir))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!copydb_init_specs(copySpecs, &sentinelDBoptions, DATA_SECTION_NONE))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	if (!catalog_init_from_specs(copySpecs))
+	{
+		log_error("Failed to initialize pgcopydb internal catalogs");
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	return true;
 }

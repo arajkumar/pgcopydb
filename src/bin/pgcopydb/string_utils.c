@@ -548,10 +548,10 @@ IntervalToString(uint64_t millisecs, char *buffer, size_t size)
  * countLines returns how many line separators (\n) are found in the given
  * string.
  */
-int
+uint64_t
 countLines(char *buffer)
 {
-	int lineNumber = 0;
+	uint64_t lineNumber = 0;
 	char *currentLine = buffer;
 
 	if (buffer == NULL)
@@ -583,25 +583,34 @@ countLines(char *buffer)
 
 
 /*
- * splitLines prepares a multi-line error message in a way that calling code
- * can loop around one line at a time and call log_error() or log_warn() on
- * individual lines.
+ * splitLines splits a C-string "buffer" into a lines array. The buffer is
+ * modified: \n are replaced with \0. Then the lines array is just an array of
+ * pointers into the first character of each line found in the buffer memory
+ * area.
  */
-int
-splitLines(char *buffer, char **linesArray, int size)
+bool
+splitLines(LinesBuffer *lbuf, char *buffer)
 {
-	int lineNumber = 0;
-	char *currentLine = buffer;
+	lbuf->buffer = buffer;
+	lbuf->count = countLines(lbuf->buffer);
 
-	if (buffer == NULL)
+	if (lbuf->buffer == NULL || lbuf->count == 0)
 	{
-		return 0;
+		/* make sure we have a NULL lines in that case */
+		lbuf->lines = NULL;
+		return true;
 	}
 
-	if (linesArray == NULL)
+	lbuf->lines = (char **) calloc(lbuf->count, sizeof(char *));
+
+	if (lbuf->lines == NULL)
 	{
-		return -1;
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
 	}
+
+	uint64_t lineNumber = 0;
+	char *currentLine = lbuf->buffer;
 
 	do {
 		char *newLinePtr = strchr(currentLine, '\n');
@@ -611,7 +620,7 @@ splitLines(char *buffer, char **linesArray, int size)
 			/* strlen(currentLine) > 0 */
 			if (*currentLine != '\0')
 			{
-				linesArray[lineNumber++] = currentLine;
+				lbuf->lines[lineNumber++] = currentLine;
 			}
 
 			currentLine = NULL;
@@ -620,38 +629,61 @@ splitLines(char *buffer, char **linesArray, int size)
 		{
 			*newLinePtr = '\0';
 
-			linesArray[lineNumber++] = currentLine;
+			lbuf->lines[lineNumber++] = currentLine;
 
 			currentLine = ++newLinePtr;
 		}
-	} while (currentLine != NULL && *currentLine != '\0' && lineNumber < size);
+	} while (currentLine != NULL &&
+			 *currentLine != '\0' &&
+			 lineNumber < lbuf->count);
 
-	return lineNumber;
+	return true;
 }
+
 
 /*
  * processBufferCallback is a function callback to use with the subcommands.c
  * library when we want to output a command's output as it's running, such as
- * when running a pg_basebackup command.
+ * when running a pg_basebackup or vacuumdb command.
  */
 void
 processBufferCallback(const char *buffer, bool error)
 {
-	char *outLines[BUFSIZE] = { 0 };
-	int lineCount = splitLines((char *) buffer, outLines, BUFSIZE);
-	int lineNumber = 0;
-	const char *warningPattern = "^(pg_dump: warning:|pg_restore: warning:)";
+	const char *warningPattern = "^(pg_dump: warning:|pg_restore: warning:|WARNING:)";
+	const char *debugPattern = "^(DEBUG:)";
+	LinesBuffer lbuf = { 0 };
 
-	for (lineNumber = 0; lineNumber < lineCount; lineNumber++)
+	if (!splitLines(&lbuf, (char *) buffer))
 	{
-		if (strneq(outLines[lineNumber], ""))
+		/* errors have already been logged */
+		return;
+	}
+
+	for (uint64_t lineNumber = 0; lineNumber < lbuf.count; lineNumber++)
+	{
+		char *line = lbuf.lines[lineNumber];
+
+		if (strneq(line, ""))
 		{
-			char *match = regexp_first_match(outLines[lineNumber], warningPattern);
-			int logLevel = match != NULL ? LOG_WARN : (error ? LOG_ERROR : LOG_INFO);
-			log_level(logLevel, "%s", outLines[lineNumber]);
+			char *matchWarning = regexp_first_match(line, warningPattern);
+			char *matchDebug = regexp_first_match(line, debugPattern);
+
+			int logLevel = error ? LOG_ERROR : LOG_INFO;
+
+			if (matchDebug != NULL)
+			{
+				logLevel = LOG_DEBUG;
+			}
+			else if (matchWarning != NULL)
+			{
+				logLevel = LOG_WARN;
+			}
+
+			log_level(logLevel, "%s", line);
 		}
 	}
 }
+
 
 /*
  * pretty_print_bytes pretty prints bytes in a human readable form. Given
@@ -683,6 +715,7 @@ pretty_print_bytes(char *buffer, size_t size, uint64_t bytes)
 	sformat(buffer, size, "%d %s", (int) count, suffixes[sIndex]);
 }
 
+
 /*
  * pretty_print_bytes_per_second pretty prints bytes transmitted per second in
  * a human readable form. Given 17179869184 it places the string
@@ -713,7 +746,7 @@ pretty_print_bytes_per_second(char *buffer, size_t size, uint64_t bytes,
 	};
 
 	uint sIndex = 0;
-	long double count = ((long double) bytes) * 1000 * 8 / durationMs ;
+	long double count = ((long double) bytes) * 1000 * 8 / durationMs;
 
 	while (count >= 10000 && sIndex < 7)
 	{
@@ -735,7 +768,7 @@ pretty_print_count(char *buffer, size_t size, uint64_t number)
 {
 	const char *suffixes[7] = {
 		"",                     /* units */
-		"",                     /* thousands */
+		"thousands",            /* 10^3 */
 		"million",              /* 10^6 */
 		"billion",              /* 10^9 */
 		"trillion",             /* 10^12 */
@@ -752,7 +785,7 @@ pretty_print_count(char *buffer, size_t size, uint64_t number)
 		int t = number / 1000;
 		int u = number - (t * 1000);
 
-		sformat(buffer, size, "%d %d", t, u);
+		sformat(buffer, size, "%d %03d", t, u);
 	}
 	else
 	{

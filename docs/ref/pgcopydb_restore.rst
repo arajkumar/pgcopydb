@@ -7,15 +7,7 @@ pgcopydb restore - Restore database objects into a Postgres instance
 
 This command prefixes the following sub-commands:
 
-::
-
-  pgcopydb restore
-    schema      Restore a database schema from custom files to target database
-    pre-data    Restore a database pre-data schema from custom file to target database
-    post-data   Restore a database post-data schema from custom file to target database
-    roles       Restore database roles from SQL file to target database
-    parse-list  Parse pg_restore --list output from custom file
-
+.. include:: ../include/restore.rst
 
 .. _pgcopydb_restore_schema:
 
@@ -29,23 +21,7 @@ schema definitions from the given ``pgcopydb dump schema`` export directory.
 This command is not compatible with using Postgres files directly, it must
 be fed with the directory output from the ``pgcopydb dump ...`` commands.
 
-::
-
-   pgcopydb restore schema: Restore a database schema from custom files to target database
-   usage: pgcopydb restore schema  --dir <dir> [ --source <URI> ] --target <URI>
-
-     --source             Postgres URI to the source database
-     --target             Postgres URI to the target database
-     --dir                Work directory to use
-     --drop-if-exists     On the target database, clean-up from a previous run first
-     --no-owner           Do not set ownership of objects to match the original database
-     --no-acl             Prevent restoration of access privileges (grant/revoke commands).
-     --no-comments        Do not output commands to restore comments
-     --filters <filename> Use the filters defined in <filename>
-     --restart            Allow restarting when temp files exist already
-     --resume             Allow resuming operations after a failure
-     --not-consistent     Allow taking a new snapshot on the source database
-
+.. include:: ../include/restore-schema.rst
 
 .. _pgcopydb_restore_pre_data:
 
@@ -59,22 +35,7 @@ schema definitions from the given ``pgcopydb dump schema`` export directory.
 This command is not compatible with using Postgres files directly, it must
 be fed with the directory output from the ``pgcopydb dump ...`` commands.
 
-::
-
-   pgcopydb restore pre-data: Restore a database pre-data schema from custom file to target database
-   usage: pgcopydb restore pre-data  --dir <dir> [ --source <URI> ] --target <URI>
-
-     --source             Postgres URI to the source database
-     --target             Postgres URI to the target database
-     --dir                Work directory to use
-     --drop-if-exists     On the target database, clean-up from a previous run first
-     --no-owner           Do not set ownership of objects to match the original database
-     --no-acl             Prevent restoration of access privileges (grant/revoke commands).
-     --no-comments        Do not output commands to restore comments
-     --filters <filename> Use the filters defined in <filename>
-     --restart            Allow restarting when temp files exist already
-     --resume             Allow resuming operations after a failure
-     --not-consistent     Allow taking a new snapshot on the source database
+.. include:: ../include/restore-pre-data.rst
 
 .. _pgcopydb_restore_post_data:
 
@@ -88,22 +49,7 @@ schema definitions from the given ``pgcopydb dump schema`` export directory.
 This command is not compatible with using Postgres files directly, it must
 be fed with the directory output from the ``pgcopydb dump ...`` commands.
 
-::
-
-   pgcopydb restore post-data: Restore a database post-data schema from custom file to target database
-   usage: pgcopydb restore post-data  --dir <dir> [ --source <URI> ] --target <URI>
-
-     --source             Postgres URI to the source database
-     --target             Postgres URI to the target database
-     --dir                Work directory to use
-     --no-owner           Do not set ownership of objects to match the original database
-     --no-acl             Prevent restoration of access privileges (grant/revoke commands).
-     --no-comments        Do not output commands to restore comments
-     --filters <filename> Use the filters defined in <filename>
-     --restart            Allow restarting when temp files exist already
-     --resume             Allow resuming operations after a failure
-     --not-consistent     Allow taking a new snapshot on the source database
-
+.. include:: ../include/restore-post-data.rst
 
 .. _pgcopydb_restore_roles:
 
@@ -121,15 +67,7 @@ The ``pg_dumpall`` command issues two lines per role, the first one is a
 command. Both those lines are skipped when the role already exists on the
 target database.
 
-::
-
-   pgcopydb restore roles: Restore database roles from SQL file to target database
-   usage: pgcopydb restore roles  --dir <dir> [ --source <URI> ] --target <URI>
-
-     --source             Postgres URI to the source database
-     --target             Postgres URI to the target database
-     --dir                Work directory to use
-
+.. include:: ../include/restore-roles.rst
 
 .. _pgcopydb_restore_parse_list:
 
@@ -149,21 +87,7 @@ output of the command shows those pg_restore catalog entries commented out.
 A pg_restore archive catalog entry is commented out when its line starts
 with a semi-colon character (`;`).
 
-::
-
-   pgcopydb restore parse-list: Parse pg_restore --list output from custom file
-   usage: pgcopydb restore parse-list  --dir <dir> [ --source <URI> ] --target <URI>
-
-     --source             Postgres URI to the source database
-     --target             Postgres URI to the target database
-     --dir                Work directory to use
-     --filters <filename> Use the filters defined in <filename>
-     --skip-extensions    Skip restoring extensions
-     --skip-ext-comments  Skip restoring COMMENT ON EXTENSION
-     --restart            Allow restarting when temp files exist already
-     --resume             Allow resuming operations after a failure
-     --not-consistent     Allow taking a new snapshot on the source database
-
+.. include:: ../include/restore-parse-list.rst
 
 Description
 -----------
@@ -177,7 +101,7 @@ expected location within the ``--target`` directory, which has typically
 been created with the ``pgcopydb dump schema`` command.
 
 The ``pgcopydb restore pre-data`` and ``pgcopydb restore post-data`` are
-limiting their action to respectively the pre-data and the post-data files
+limiting their actions to the file with pre-data and post-data
 in the source directory..
 
 Options
@@ -202,9 +126,18 @@ The following options are available to ``pgcopydb restore schema``:
 
   During its normal operations pgcopydb creates a lot of temporary files to
   track sub-processes progress. Temporary files are created in the directory
-  location given by this option, or defaults to
+  specified by this option, or defaults to
   ``${TMPDIR}/pgcopydb`` when the environment variable is set, or
-  then to ``/tmp/pgcopydb``.
+  otherwise to ``/tmp/pgcopydb``.
+
+--restore-jobs
+
+  How many threads or processes can be used during pg_restore. A good option is
+  to set this option to the count of CPU cores that are available on the
+  Postgres target system.
+
+  If this value is not set, we reuse the ``--index-jobs`` value. If that value
+  is not set either, we use the the default value for ``--index-jobs``.
 
 --drop-if-exists
 
@@ -352,14 +285,14 @@ First, using ``pgcopydb restore schema``
 ::
 
    $ PGCOPYDB_DROP_IF_EXISTS=on pgcopydb restore schema --source /tmp/target/ --target "port=54314 dbname=demo"
-   09:54:37 20401 INFO  Restoring database from "/tmp/target/"
-   09:54:37 20401 INFO  Restoring database into "port=54314 dbname=demo"
-   09:54:37 20401 INFO  Found a stale pidfile at "/tmp/target//pgcopydb.pid"
-   09:54:37 20401 WARN  Removing the stale pid file "/tmp/target//pgcopydb.pid"
-   09:54:37 20401 INFO  Using pg_restore for Postgres "12.9" at "/Applications/Postgres.app/Contents/Versions/12/bin/pg_restore"
-   09:54:37 20401 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_restore --dbname 'port=54314 dbname=demo' --clean --if-exists /tmp/target//schema/pre.dump
-   09:54:38 20401 INFO   /Applications/Postgres.app/Contents/Versions/12/bin/pg_restore --dbname 'port=54314 dbname=demo' --clean --if-exists --use-list /tmp/target//schema/post.list /tmp/target//schema/post.dump
-
+   07:45:10.626 39254 INFO   Using work dir "/tmp/pgcopydb"
+   07:45:10.626 39254 INFO   Restoring database from existing files at "/tmp/pgcopydb"
+   07:45:10.720 39254 INFO   Found 2 indexes (supporting 2 constraints) in the target database
+   07:45:10.723 39254 INFO   Using pg_restore for Postgres "16.2" at "/usr/bin/pg_restore"
+   07:45:10.723 39254 INFO   [TARGET] Restoring database into "postgres://postgres@127.0.0.1:5435/demo?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60"
+   07:45:10.737 39254 INFO   Drop tables on the target database, per --drop-if-exists
+   07:45:10.750 39254 INFO    /usr/bin/pg_restore --dbname 'postgres://postgres@127.0.0.1:5435/demo?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section pre-data --jobs 4 --clean --if-exists --use-list /tmp/pgcopydb/schema/pre-filtered.list /tmp/pgcopydb/schema/schema.dump
+   07:45:10.803 39254 INFO    /usr/bin/pg_restore --dbname 'postgres://postgres@127.0.0.1:5435/demo?keepalives=1&keepalives_idle=10&keepalives_interval=10&keepalives_count=60' --section post-data --jobs 4 --clean --if-exists --use-list /tmp/pgcopydb/schema/post-filtered.list /tmp/pgcopydb/schema/schema.dump
 
 Then the ``pgcopydb restore pre-data`` and ``pgcopydb restore post-data``
 would look the same with just a single call to pg_restore instead of the

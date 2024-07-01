@@ -17,6 +17,8 @@ psql -o /tmp/s.out -d ${PGCOPYDB_SOURCE_PGURI} -1 -f /usr/src/pagila/pagila-sche
 psql -o /tmp/d.out -d ${PGCOPYDB_SOURCE_PGURI} -1 -f /usr/src/pagila/pagila-data.sql
 psql -o /tmp/e.out -d ${PGCOPYDB_SOURCE_PGURI} -1 -f /usr/src/pgcopydb/extra.sql
 
+export TMPDIR=/tmp/exclude
+
 # list the exclude filters now, and the computed dependencies
 cat /usr/src/pgcopydb/exclude.ini
 
@@ -24,26 +26,32 @@ cat /usr/src/pgcopydb/exclude.ini
 pgcopydb list tables --filters /usr/src/pgcopydb/exclude.ini
 pgcopydb list tables --filters /usr/src/pgcopydb/exclude.ini --list-skipped
 
-# list the dependencies of objects that are (not) selected by the filters
-pgcopydb list depends --filters /usr/src/pgcopydb/exclude.ini
+# list the dependencies of objects that are not selected by the filters
 pgcopydb list depends --filters /usr/src/pgcopydb/exclude.ini --list-skipped
 
 # list the sequences that are (not) selected by the filters
 pgcopydb list sequences --filters /usr/src/pgcopydb/exclude.ini
 pgcopydb list sequences --filters /usr/src/pgcopydb/exclude.ini --list-skipped
 
-pgcopydb clone --filters /usr/src/pgcopydb/exclude.ini
+sqlite3 /tmp/exclude/pgcopydb/schema/filter.db <<EOF
+select * from section;
 
-# list the tables that are (not) selected by the filters
-pgcopydb list tables --filters /usr/src/pgcopydb/include.ini
-pgcopydb list tables --filters /usr/src/pgcopydb/include.ini --list-skipped
+select oid, qname, restore_list_name, ownedby, attrelid, attroid from s_seq;
 
-# now another migration with the "include-only" parts of the data
-pgcopydb clone --filters /usr/src/pgcopydb/include.ini --restart
+select f.kind, count(*) from filter f group by kind;
+select f.oid, f.kind from filter f where kind like 'sequence';
 
-# print out the definition of the copy.foo table
-psql -d ${PGCOPYDB_SOURCE_PGURI} -c '\d app|copy.foo'
-psql -d ${PGCOPYDB_TARGET_PGURI} -c '\d app|copy.foo'
+attach '/tmp/exclude/pgcopydb/schema/source.db' as source;
+
+select NULL as oid, s.restore_list_name, 'sequence owned by'
+  from s_seq s
+ where not exists
+       (select 1 from source.s_table st where st.oid = s.ownedby);
+EOF
+
+pgcopydb clone --filters /usr/src/pgcopydb/exclude.ini --resume --not-consistent
+
+export TMPDIR=/tmp/include
 
 # now compare the output of running the SQL command with what's expected
 # as we're not root when running tests, can't write in /usr/src
@@ -53,12 +61,34 @@ find .
 
 pgopts="--single-transaction --no-psqlrc --expanded"
 
-for f in ./sql/*.sql
+for f in ./exclude/sql/*.sql
 do
     t=`basename $f .sql`
     r=/tmp/results/${t}.out
-    e=./expected/${t}.out
-    psql -d "${PGCOPYDB_TARGET_PGURI}" ${pgopts} --file ./sql/$t.sql &> $r
+    e=./exclude/expected/${t}.out
+    psql -d "${PGCOPYDB_TARGET_PGURI}" ${pgopts} --file ./exclude/sql/$t.sql &> $r
+    test -f $e || cat $r
+    diff -urN $e $r || cat $e $r
+    diff -urN $e $r || exit 1
+done
+
+# list the tables that are (not) selected by the filters
+pgcopydb list tables --filters /usr/src/pgcopydb/include.ini
+pgcopydb list tables --filters /usr/src/pgcopydb/include.ini --list-skipped
+
+# now another migration with the "include-only" parts of the data
+pgcopydb clone --filters /usr/src/pgcopydb/include.ini --resume --not-consistent
+
+# print out the definition of the copy.foo table
+psql -d ${PGCOPYDB_SOURCE_PGURI} -c '\d app|copy.foo'
+psql -d ${PGCOPYDB_TARGET_PGURI} -c '\d app|copy.foo'
+
+for f in ./include/sql/*.sql
+do
+    t=`basename $f .sql`
+    r=/tmp/results/${t}.out
+    e=./include/expected/${t}.out
+    psql -d "${PGCOPYDB_TARGET_PGURI}" ${pgopts} --file ./include/sql/$t.sql &> $r
     test -f $e || cat $r
     diff $e $r || cat $r
     diff $e $r || exit 1
