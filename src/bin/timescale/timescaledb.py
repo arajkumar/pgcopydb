@@ -258,6 +258,9 @@ You can do one of the following to resolve the issue:
 {"*" * 72}
 """
         log_func(message)
+        return True
+
+    return False
 
 
 def check_hypertable_incompatibility(args):
@@ -266,15 +269,6 @@ def check_hypertable_incompatibility(args):
     incompatible_tables = get_hypertable_incompatible_objects(args.source, dimensions, args.skip_index)
 
     return incompatible_tables
-
-
-def hypertable_has_incompatible_objects(hypertable_info):
-    for _, info in hypertable_info.items():
-        for i in info:
-            if i['is_compatible'] == 'f':
-                return True
-
-    return False
 
 
 def filter_incompatible_index_constraint(incompatible_tables):
@@ -290,9 +284,8 @@ def filter_incompatible_index_constraint(incompatible_tables):
 
 
 def warn_hypertable_incompatibility(args, hypertable_info):
-    if hypertable_has_incompatible_objects(hypertable_info):
-        if args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check:
-            show_hypertable_incompatibility(hypertable_info, error=False)
-        else:
-            show_hypertable_incompatibility(hypertable_info, error=True)
-            sys.exit(1)
+    warn = args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check
+
+    has_incompatibility = show_hypertable_incompatibility(hypertable_info, error=not warn)
+    if has_incompatibility and not warn:
+        sys.exit(1)
