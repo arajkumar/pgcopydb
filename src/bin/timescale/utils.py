@@ -8,7 +8,7 @@ from time import perf_counter
 from urllib.parse import urlparse
 from enum import Enum
 
-from version import SCRIPT_VERSION
+from version import SCRIPT_VERSION, DOCKER_IMAGE_NAME
 from environ import LIVE_MIGRATION_DOCKER, env
 from exec import run_cmd, psql
 
@@ -94,7 +94,7 @@ def docker_command(name, *args):
             -e PGCOPYDB_TARGET_PGURI=$TARGET \
             --pid=host \
             -v ~/live-migration:{env['PGCOPYDB_DIR']} \
-            timescale/live-migration:v{SCRIPT_VERSION} \
+            {DOCKER_IMAGE_NAME}:{SCRIPT_VERSION} \
             {" ".join(args)}""".rstrip()
     else:
         python = os.path.basename(sys.executable)
