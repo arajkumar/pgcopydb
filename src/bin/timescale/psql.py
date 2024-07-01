@@ -2,7 +2,7 @@ import subprocess
 import csv
 from io import StringIO
 
-def psql(conn, sql):
+def psql(conn, sql) -> list[dict]:
     """
     Execute the given SQL query using psql and return the result as a dictionary.
     """
