@@ -271,10 +271,13 @@ def check_hypertable_incompatibility(args):
     return incompatible_tables
 
 
-def filter_incompatible_index_constraint(incompatible_tables):
+def prepare_skip_index(incompatible_tables):
     incompatible_indexes = []
     for _, info in incompatible_tables.items():
         for i in info:
+            # The constraints which we deal here are the unique constraints
+            # and primary keys, which are also backed by indexes. Hence, we
+            # can skip the constraints by using the index name.
             nspname = i['nspname']
             idxname = i['idxrelname']
             indexname = f"{nspname}.{idxname}"

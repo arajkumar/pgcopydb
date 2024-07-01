@@ -124,14 +124,14 @@ def main():
                                 action='store_true',
                                 help='Skip the index/constraint compatibility '
                                      'check during migration. This flag is '
-                                     'useful when migrating data from Postgres '
-                                     'to TimescaleDB.')
+                                     'applicable only when migrating data '
+                                     'from Postgres to TimescaleDB.')
     parser_migrate.add_argument('--skip-hypertable-incompatible-objects',
                                 action='store_true',
                                 help='Automatically skip incompatible indexes '
                                      'and constraints during migration. This '
-                                     'flag is useful when migrating data from '
-                                     'Postgres to TimescaleDB.')
+                                     'flag is applicable only when migrating '
+                                     'data from Postgres to TimescaleDB.')
 
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',

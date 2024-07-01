@@ -30,7 +30,7 @@ from exec import (
 from timescaledb import (
         check_hypertable_incompatibility,
         warn_hypertable_incompatibility,
-        filter_incompatible_index_constraint,
+        prepare_skip_index,
         try_creating_incompatible_objects,
 )
 
@@ -297,7 +297,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
 
     # Always skip primary key, unique constraints and unique indexes
     # The way pgcopydb build the above objects is not compatible with hypertables.
-    skip_index = filter_incompatible_index_constraint(hypertable_info)
+    skip_index = prepare_skip_index(hypertable_info)
     if args.skip_index:
         args.skip_index.extend(skip_index)
     else:
