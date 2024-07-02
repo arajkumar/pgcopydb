@@ -36,6 +36,9 @@ jobs:
       run: |
         cd integration && cargo clippy --all-targets --all-features -- -D warnings
 
+    - name: Set Version String From .git
+      run: make version
+
     - name: Build docker image
       uses: docker/build-push-action@v3
       with:
