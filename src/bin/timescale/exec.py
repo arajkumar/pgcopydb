@@ -133,7 +133,7 @@ def run_cmd(cmd: str, log_file: LogFile = None, ignore_non_zero_code: bool = Fal
             process.wait()
             raise
         else:
-            retcode = process.poll()
+            retcode = process.wait()
             if retcode != 0 and not ignore_non_zero_code:
                 if log_file is not None:
                     print_logs_with_error(log_path=log_file.stderr)
