@@ -16,7 +16,13 @@ jobs:
     strategy:
       fail-fast: false
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # all history for all branches and tags
+
+    - name: Set Version String From .git
+      run: make version
 
     - name: Setup git PAT override
       run: |
@@ -39,6 +45,7 @@ jobs:
     - name: Build docker image
       uses: docker/build-push-action@v3
       with:
+        context: .
         push: false
         tags: local/live-migration:dev
         platforms: linux/amd64
