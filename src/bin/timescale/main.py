@@ -111,7 +111,7 @@ def main():
                                      'does not skip data during live replay from '
                                      'the specified table. Values for this '
                                      'flag must be schema qualified. '
-                                     'Eg: --skip-table-data public.exclude_table_1 public.exclude_table_2')
+                                     'Eg: --skip-table-data public.metrics public.metrics_New')
     parser_migrate.add_argument('--skip-index',
                                 '--exclude-index',
                                 dest='skip_index',
