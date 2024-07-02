@@ -34,9 +34,13 @@ class Filter:
         """
         Write filter to file as described in the pgcopydb documentation.
         """
-        for section, contents in self._filter.items():
+        # we want to preserve the order of the contents, because the new
+        # sqlite based filtering system is order dependent and complains
+        # if the filter contents are different on each run.
+        sections = sorted(self._filter.keys())
+        for section in sections:
             f.write(f"[{section}]\n")
-
+            contents = sorted(self._filter[section])
             for content in contents:
                 f.write(f"{content}\n")
 
