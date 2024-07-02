@@ -514,6 +514,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.skipAnalyze = options->skipAnalyze,
 		.skipDBproperties = options->skipDBproperties,
 		.skipCtidSplit = options->skipCtidSplit,
+		.skipPreRestore = options->skipPreRestore,
 		.noRolesPasswords = options->noRolesPasswords,
 		.failFast = options->failFast,
 

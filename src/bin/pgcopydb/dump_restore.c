@@ -151,6 +151,13 @@ copydb_target_prepare_schema(CopyDataSpec *specs)
 		return false;
 	}
 
+	if (specs->skipPreRestore)
+	{
+		log_info("Skipping pg_restore for pre-data section, "
+				 "per --skip-pre-restore");
+		return true;
+	}
+
 	if (specs->runState.schemaPreDataHasBeenRestored)
 	{
 		log_info("Skipping pg_restore for pre-data section, "

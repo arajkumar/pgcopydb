@@ -265,11 +265,11 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                 "dump",
                                 "schema",
                                 "--dir",
-                                "$PGCOPYDB_DIR/pgcopydb_clone",
+                                "$PGCOPYDB_DIR/pgcopydb_clone_pre_data",
                                 "--snapshot",
                                 "$(cat $PGCOPYDB_DIR/snapshot)",
                                 "--resume",
-                                ])
+                                ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
 
     with timeit("Restore pre-data"):
@@ -279,7 +279,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                      "--no-acl",
                                      "--no-owner",
                                      "--dir",
-                                     "$PGCOPYDB_DIR/pgcopydb_clone",
+                                     "$PGCOPYDB_DIR/pgcopydb_clone_pre_data",
                                      "--snapshot",
                                      "$(cat $PGCOPYDB_DIR/snapshot)",
                                      "--resume",
@@ -318,6 +318,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                  "--resume",
                                  "--no-acl",
                                  "--no-owner",
+                                 "--skip-pre-restore",
                                  "--snapshot",
                                  "$(cat $PGCOPYDB_DIR/snapshot)",
                                  ] + filter_args)

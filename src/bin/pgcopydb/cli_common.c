@@ -615,6 +615,7 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "skip-analyze", no_argument, NULL, 'a' },
 		{ "skip-db-properties", no_argument, NULL, 'g' },
 		{ "skip-split-by-ctid", no_argument, NULL, 'k' },
+		{ "skip-pre-restore", no_argument, NULL, '!' },
 		{ "no-tablespaces", no_argument, NULL, 'y' },
 		{ "filter", required_argument, NULL, 'F' },
 		{ "filters", required_argument, NULL, 'F' },
@@ -651,7 +652,7 @@ cli_copy_db_getopts(int argc, char **argv)
 	}
 
 	const char *optstring =
-		"S:T:D:J:I:b:L:u:mcAPOXj:xBeMlUagkyF:F:Q:irRCN:fp:ws:o:tE:Vvdzqh";
+		"S:T:D:J:I:b:L:u:mcAPOXj:xBeMlUagkyF:F:Q:irRCN:fp:ws:o:tE:Vvdzqh!";
 
 	while ((c = getopt_long(argc, argv,
 							optstring, long_options, &option_index)) != -1)
@@ -892,6 +893,13 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.skipCtidSplit = true;
 				log_trace("--skip-split-by-ctid");
+				break;
+			}
+
+			case '!':
+			{
+				options.skipPreRestore = true;
+				log_trace("--skip-pre-restore");
 				break;
 			}
 
