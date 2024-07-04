@@ -7,6 +7,7 @@ import sys
 import threading
 import logging
 import traceback
+import sqlite3
 
 from pathlib import Path
 
@@ -29,9 +30,6 @@ from exec import (
 )
 from timescaledb import (
         check_hypertable_incompatibility,
-        warn_hypertable_incompatibility,
-        prepare_skip_index,
-        try_creating_incompatible_objects,
 )
 
 logger = logging.getLogger(__name__)
@@ -265,7 +263,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                 "dump",
                                 "schema",
                                 "--dir",
-                                "$PGCOPYDB_DIR/pgcopydb_clone_pre_data",
+                                "$PGCOPYDB_DIR/pgcopydb_clone",
                                 "--snapshot",
                                 "$(cat $PGCOPYDB_DIR/snapshot)",
                                 "--resume",
@@ -279,7 +277,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                      "--no-acl",
                                      "--no-owner",
                                      "--dir",
-                                     "$PGCOPYDB_DIR/pgcopydb_clone_pre_data",
+                                     "$PGCOPYDB_DIR/pgcopydb_clone",
                                      "--snapshot",
                                      "$(cat $PGCOPYDB_DIR/snapshot)",
                                      "--resume",
@@ -291,18 +289,36 @@ def migrate_existing_data_from_pg_to_tsdb(args):
         mark_section_complete("hypertable-creation")
 
     hypertable_info = check_hypertable_incompatibility(args)
-    warn_hypertable_incompatibility(args, hypertable_info)
+
+    warn = args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check
+    error_shown = hypertable_info.warn_hypertable_incompatibility(error=not warn)
+    if error_shown and not warn:
+        logger.error("Please resolve the above errors before proceeding.")
+        sys.exit(1)
 
     stop_progress = monitor_db_sizes()
 
     # Always skip primary key, unique constraints and unique indexes
     # The way pgcopydb build the above objects is not compatible with hypertables.
-    skip_index = prepare_skip_index(hypertable_info)
-    if args.skip_index:
-        args.skip_index.extend(skip_index)
-    else:
-        args.skip_index = skip_index
-    filter_args = prepare_filters(args)
+    skip_index = hypertable_info.indexes_to_skip()
+    skip_foreign_keys = hypertable_info.foreign_keys_to_skip()
+    # Filter foreign keys directly on sqlite
+    pgcopydb_dir = args.dir / "pgcopydb_clone"
+    filter_file = str(pgcopydb_dir / "schema" / "filter.db")
+    source_file = str(pgcopydb_dir / "schema" / "source.db")
+    sqlite_conn = sqlite3.connect(source_file)
+    sqlite_conn.execute("DELETE FROM s_index")
+    sqlite_conn.execute("DELETE FROM s_constraint")
+    sqlite_conn.commit()
+    sqlite_conn.close()
+
+    sqlite_conn = sqlite3.connect(filter_file)
+    sql = f"INSERT OR REPLACE INTO filter(oid, restore_list_name, kind) VALUES (?, ?, ?);"
+    print(sql)
+    filter_list = [(f.obj_relid, f.restore_list_name, f.kind) for f in skip_foreign_keys + skip_index]
+    sqlite_conn.executemany(sql, filter_list)
+    sqlite_conn.commit()
+    sqlite_conn.close()
 
     with timeit("Copy table data"):
         copy_table_data = " ".join(["pgcopydb",
@@ -325,7 +341,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
         log = LogFile("pgcopydb_clone")
         run_cmd(copy_table_data, log)
 
-    try_creating_incompatible_objects(args, hypertable_info)
+    hypertable_info.create_incompatible_objects()
     stop_progress.set()
 
 
