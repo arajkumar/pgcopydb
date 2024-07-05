@@ -7,10 +7,11 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 class HealthCheck:
-    process_logs = []
-    stop_events = []
-    active_threads = []
-    health_check_interval = 5
+    def __init__(self) -> None:
+        self.process_logs = []
+        self.stop_events: dict[str, threading.Event] = {}        # Map of health_check name and its corresponding stop event.
+        self.active_threads: dict[str, threading.Thread] = {}    # Map of health_check name and its corresponding running thread.
+        self.health_check_interval = 5
 
     def get_filename(self, path):
         return path.split("/")[-1]
@@ -51,14 +52,23 @@ class HealthCheck:
 
         thread = threading.Thread(target=checker)
         thread.start()
-        self.active_threads.append(thread)
-        self.stop_events.append(stop_event)
+        self.active_threads[name] = thread
+        self.stop_events[name] = stop_event
+
+    def stop(self, name: str):
+        """
+        Stop checks for an active health checker under "name" and
+        stops its execution if found.
+        """
+        if name in self.stop_events:
+            self.stop_events[name].set()
+            self.active_threads[name].join()
 
     def stop_all(self):
         logger.info("Stopping all health checkers ...")
         for e in self.stop_events:
-            e.set()
+            self.stop_events[e].set()
         for t in self.active_threads:
-            t.join()
+            self.active_threads[t].join()
 
 health_checker = HealthCheck()

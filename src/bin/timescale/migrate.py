@@ -2,7 +2,6 @@
 # This script orchestrates CDC based migration process using pgcopydb.
 
 import os
-import signal
 import sys
 import threading
 import logging
@@ -17,7 +16,8 @@ from utils import timeit, docker_command, dbname_from_uri, store_val, \
 from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
-from exec import Command, run_cmd, run_sql, psql, print_logs_with_error, LogFile
+from exec import Process, run_cmd, run_sql, psql, print_logs_with_error, LogFile
+
 from filter import Filter
 from psql import psql as psql_cmd
 
@@ -133,20 +133,21 @@ COMMIT;
     psql_cmd(conn, query)
     return True
 
-@telemetry_command("create_follow")
+
 def create_follow(resume: bool = False):
     logger.info(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}...")
 
-    follow_command = "pgcopydb follow --dir $PGCOPYDB_DIR"
-    if resume:
-        # CDC with test_decoding uses a snapshot to retrieve catalog tables.
-        # While resuming, we can't guarantee the availability of the initial
-        # snapshot, but using --not-consistent to create a
-        # temporary snapshot is acceptable, as it's only used for catalog access.
-        follow_command += " --resume --not-consistent"
+    follow_args = [
+        "pgcopydb",
+        "follow",
+        "--dir",
+        env["PGCOPYDB_DIR"],
+    ]
+    follow_retry_args = follow_args + ["--resume", "--not-consistent"]
 
-    log_file = LogFile("pgcopydb_follow")
-    follow_proc = Command(command=follow_command, use_shell=True, log_file=log_file)
+    if resume:
+        follow_args.extend(["--resume", "--not-consistent"])
+
     def is_error_func_for_follow(log_line: str):
         if "pgcopydb.sentinel" in log_line:
             return False
@@ -155,9 +156,12 @@ def create_follow(resume: bool = False):
             "no tuple identifier for" in log_line:
             return True
         return False
-    health_checker.check_log_for_health("follow", log_file.stderr, is_error_func_for_follow)
 
-    return follow_proc
+    return Process(follow_args, "follow") \
+        .with_logging() \
+        .with_health_check(is_error_func_for_follow) \
+        .with_retry(follow_retry_args) \
+        .run()
 
 
 def show_hypertable_creation_prompt():
@@ -495,7 +499,7 @@ def migrate_existing_data(args):
     stop_progress.set()
 
 @telemetry_command("wait_for_DBs_to_sync")
-def wait_for_DBs_to_sync(follow_proc):
+def wait_for_DBs_to_sync(follow: Process):
     def get_source_wal_lsn():
         return run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_current_wal_lsn();")).strip()
 
@@ -514,7 +518,10 @@ def wait_for_DBs_to_sync(follow_proc):
     wal_lsn, replay_lsn = get_source_wal_lsn(), get_target_replay_lsn()
     event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
 
-    while not event.is_set() and follow_proc.process.poll() is None:
+    while not event.is_set():
+        if not follow.alive():
+            raise Exception("Follow process died. Exiting ...")
+
         prev_wal_lsn, prev_replay_lsn = wal_lsn, replay_lsn
         wal_lsn, replay_lsn = get_source_wal_lsn(), get_target_replay_lsn()
         wal_bytes_per_second = get_lsn_diff_bytes(wal_lsn, prev_wal_lsn) / LSN_UPDATE_INTERVAL_SECONDS
@@ -541,9 +548,6 @@ def wait_for_DBs_to_sync(follow_proc):
             arrival_seconds = wal_replay_lag_bytes / net_replay_per_second
             logger.info(f"Live-replay will complete in {seconds_to_human(arrival_seconds)} {stats}" )
         event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
-
-    if follow_proc.process.poll() is not None and follow_proc.process.returncode != 0:
-        raise Exception(f"pgcopydb follow exited with code: {follow_proc.process.returncode}")
 
 @telemetry_command("copy_sequences")
 def copy_sequences():
@@ -684,7 +688,8 @@ def migrate(args):
         run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR 0/0")
 
     housekeeping_thread, housekeeping_stop_event = None, None
-    follow_proc = create_follow(resume=args.resume)
+
+    follow = create_follow(resume=args.resume)
     try:
         if not is_section_migration_complete("roles") and not args.skip_roles:
             logger.info("Migrating roles from Source DB to Target DB ...")
@@ -718,14 +723,12 @@ def migrate(args):
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
 
-        wait_for_DBs_to_sync(follow_proc)
+        wait_for_DBs_to_sync(follow)
 
         run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR --current")
 
         logger.info("Waiting for live-replay to complete ...")
-        # TODO: Implement retry for follow.
-        follow_proc.wait()
-        follow_proc = None
+        follow.wait()
 
     except KeyboardInterrupt:
         logger.info("Exiting ... (Ctrl+C)")
@@ -765,7 +768,5 @@ def migrate(args):
         if housekeeping_thread and housekeeping_thread.is_alive():
             housekeeping_thread.join()
         # cleanup all subprocesses created by pgcopydb follow
-        if follow_proc and follow_proc.process.poll() is None:
-            os.killpg(os.getpgid(follow_proc.process.pid), signal.SIGINT)
-            follow_proc.wait()
+        follow.terminate()
         logger.info("All processes have exited successfully.")

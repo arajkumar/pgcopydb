@@ -13,7 +13,6 @@ from snapshot import snapshot
 from migrate import migrate
 from clean import clean
 from environ import pgcopydb_init_env
-from exec import INIT_TIME
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -25,7 +24,8 @@ def setup_logging(work_dir: Path):
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(work_dir / f"logs/main_{INIT_TIME}.log")
+    time_suffix = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S.%f")
+    file_handler = logging.FileHandler(work_dir / f"logs/main_{time_suffix}.log")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
