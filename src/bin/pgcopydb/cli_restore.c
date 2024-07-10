@@ -550,6 +550,24 @@ cli_restore_roles(int argc, char **argv)
 
 
 /*
+ * print_archive_toc_item_hook is an iterator callback function.
+ */
+static bool
+print_archive_toc_item_hook(void *context, ArchiveContentItem *item)
+{
+	fformat(stdout,
+			"%d; %u %u %s %s\n",
+			item->dumpId,
+			item->catalogOid,
+			item->objectOid,
+			item->description ? item->description : "",
+			item->restoreListName ? item->restoreListName : "");
+
+	return true;
+}
+
+
+/*
  * cli_restore_schema implements the command: pgcopydb restore parse-list
  */
 static void
@@ -561,27 +579,10 @@ cli_restore_schema_parse_list(int argc, char **argv)
 
 		log_info("Parsing Archive Content pre.list file: \"%s\"", filename);
 
-		ArchiveContentArray contents = { 0 };
-
-		if (!parse_archive_list(filename, &contents))
+		if (!archive_iter_toc(filename, NULL, print_archive_toc_item_hook))
 		{
 			/* errors have already been logged */
 			exit(EXIT_CODE_INTERNAL_ERROR);
-		}
-
-		log_notice("Read %d archive items in \"%s\"", contents.count, filename);
-
-		for (int i = 0; i < contents.count; i++)
-		{
-			ArchiveContentItem *item = &(contents.array[i]);
-
-			fformat(stdout,
-					"%d; %u %u %s %s\n",
-					item->dumpId,
-					item->catalogOid,
-					item->objectOid,
-					item->description ? item->description : "",
-					item->restoreListName ? item->restoreListName : "");
 		}
 
 		exit(EXIT_CODE_QUIT);
@@ -590,27 +591,6 @@ cli_restore_schema_parse_list(int argc, char **argv)
 	CopyDataSpec copySpecs = { 0 };
 
 	(void) cli_restore_prepare_specs(&copySpecs);
-
-	SourceFilters *filters = &(copySpecs.filters);
-
-	if (filters->type != SOURCE_FILTER_TYPE_NONE)
-	{
-		if (!copydb_prepare_snapshot(&copySpecs))
-		{
-			/* errors have already been logged */
-			exit(EXIT_CODE_INTERNAL_ERROR);
-		}
-
-		/* fetch schema information from source catalogs, including filtering */
-		if (!copydb_fetch_schema_and_prepare_specs(&copySpecs))
-		{
-			/* errors have already been logged */
-			(void) copydb_close_snapshot(&copySpecs);
-			exit(EXIT_CODE_TARGET);
-		}
-
-		(void) copydb_close_snapshot(&copySpecs);
-	}
 
 	log_info("Preparing the pg_restore --use-list for the pre-data "
 			 "archive file \"%s\" at: \"%s\"",
