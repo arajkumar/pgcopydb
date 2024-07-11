@@ -259,6 +259,9 @@ timescale_allow_relation(const char *nspname_in, const char *relname_in)
 		{ "_timescaledb_cache", NULL },
 		{ "_timescaledb_internal", "bgw_job_stat" },
 		{ "_timescaledb_internal", "compress_hyper_" },
+		{ "_timescaledb_internal", "bgw_policy_chunk_stats" },
+		{ "_timescaledb_internal", "job_errors" },
+		{ "_timescaledb_internal", "bgw_job_stat_history" },
 	};
 
 	int denylist_size = sizeof(denylist) / sizeof(denylist[0]);
