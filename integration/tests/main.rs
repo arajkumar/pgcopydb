@@ -32,6 +32,13 @@ fn has_table_count(dba: &mut DbAssert, table: &str, count: i64) {
     assert_eq!(v, count);
 }
 
+//TODO: Move this to test_common crate.
+fn must_true(db_assert: &mut DbAssert, query: &str) {
+    let client = db_assert.connection();
+    let v: bool = client.query_one(query, &[]).unwrap().get(0);
+    assert!(v);
+}
+
 fn start_source<'a>(
     docker: &'a Cli,
     pg_version: PgVersion,
@@ -168,6 +175,96 @@ fn test_end_to_end_migration() -> Result<()> {
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
 	"),
     )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+
+    let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
+        .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+
+    target_assert.has_table_count("public", "metrics", 744);
+
+    psql(&source_container, Sql(r"
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+	")).expect("query should succeed");
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
+
+#[test]
+fn test_end_to_end_migration_with_extension_upgrade() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    // Drop and recreate timescaledb extension with older version using
+    // a different connection.
+    psql(
+        &source_container,
+        Sql(r"
+		DROP EXTENSION timescaledb;
+	"),
+    )?;
+
+    // Create timescaledb extension with older version.
+    psql(
+        &source_container,
+        Sql(r#"
+		CREATE EXTENSION timescaledb WITH VERSION "2.13.0";
+	"#),
+    )?;
+
+    // Create hypertable and insert data.
+    psql(
+        &source_container,
+        Sql(r#"
+		CREATE TABLE metrics(time timestamptz primary key, value float8);
+		SELECT create_hypertable('metrics', 'time');
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+	"#),
+    )?;
+
+    // Upgrade timescaledb extension to 2.14.2.
+    psql(
+        &source_container,
+        Sql(r#"
+		ALTER EXTENSION timescaledb UPDATE TO "2.14.2";
+	"#),
+    )?;
+
+    let mut source_assert = DbAssert::new(&source_container.connection_string())?;
+    // Check oid of _timescaledb_catalog.hyptertable is greater than
+    // _timescaledb_catalog.dimension due to extension upgrade.
+    // The ordering of extension config tables must be taken care of during
+    // extension migration.
+    must_true(&mut source_assert, "SELECT '_timescaledb_catalog.hypertable'::regclass::oid > '_timescaledb_catalog.dimension'::regclass::oid");
 
     let temp_dir = tempdir().unwrap();
 
