@@ -4,7 +4,6 @@ import subprocess
 import logging
 import os
 import typing
-import time
 
 from pathlib import Path
 
@@ -210,6 +209,6 @@ class Process:
             try:
                 os.killpg(os.getpgid(self.process.pid), signal.SIGINT)
                 self.process.wait()
-            except:
+            except Exception:
                 # ignore all exceptions and wait for the process to terminate
                 pass

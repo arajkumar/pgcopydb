@@ -11,6 +11,7 @@ class Filter:
 
     EXCLUDE_EXTENSION = "exclude-extension"
     EXCLUDE_TABLE_DATA = "exclude-table-data"
+    EXCLUDE_INDEX = "exclude-index"
 
     def __init__(self):
         self._filter = defaultdict(set)
@@ -21,14 +22,24 @@ class Filter:
         """
         self._filter[self.EXCLUDE_EXTENSION].update(extensions)
 
+    def _check_schema(self, relation: list[str]):
+        for r in relation:
+            if "." not in r:
+                raise Exception(f"Must be a fully qualified Postgres name(schema.relation): {r}")
+
     def exclude_table_data(self, tables: list[str]):
         """
         Exclude table data from initial data migration.
         """
-        for table in tables:
-            if "." not in table:
-                raise Exception(f"dot separator ('.') not found: {table}")
+        self._check_schema(tables)
         self._filter[self.EXCLUDE_TABLE_DATA].update(tables)
+
+    def exclude_indexes(self, indexes: list[str]):
+        """
+        Exclude indexes.
+        """
+        self._check_schema(indexes)
+        self._filter[self.EXCLUDE_INDEX].update(indexes)
 
     def write(self, f):
         """

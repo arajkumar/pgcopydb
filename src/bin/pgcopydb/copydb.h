@@ -615,4 +615,11 @@ bool compare_fetch_schemas(CopyDataSpec *copySpecs,
 bool compare_write_checksum(SourceTable *table, const char *filename);
 bool compare_read_checksum(SourceTable *table, const char *filename);
 
+/* timescale.c */
+bool copydb_is_hypertable(PGSQL *pgsql,
+						  const char *schema,
+						  const char *table,
+						  bool restoring,
+						  bool *isHypertable);
+
 #endif  /* COPYDB_H */

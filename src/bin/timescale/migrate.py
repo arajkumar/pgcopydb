@@ -16,10 +16,18 @@ from utils import timeit, docker_command, dbname_from_uri, store_val, \
 from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
-from exec import Process, run_cmd, run_sql, psql, print_logs_with_error, LogFile
-
 from filter import Filter
 from psql import psql as psql_cmd
+from exec import (
+        Process,
+        run_cmd,
+        run_sql,
+        psql,
+        print_logs_with_error,
+        LogFile,
+)
+from timescaledb import create_hypertable_compatibility
+from catalog import Catalog
 
 logger = logging.getLogger(__name__)
 
@@ -218,171 +226,106 @@ def skip_extensions_list(args):
         return skip_extensions_default
 
 
-def prepare_filters(clone_cmd: list[str], args, filter: Filter):
+def prepare_filters(args):
+    pgcopydb_args = []
+    filter = Filter()
     if args.skip_table_data:
         logger.info("Excluding table data: %s", args.skip_table_data)
         filter.exclude_table_data(args.skip_table_data)
 
+    if args.skip_index:
+        logger.info("Excluding indexes: %s", args.skip_index)
+        filter.exclude_indexes(args.skip_index)
+
     # empty list of skip_extensions ignores all extensions
     if args.skip_extensions is not None and len(args.skip_extensions) == 0:
         logger.warn("Ignoring all extensions")
-        clone_cmd.append("--skip-extensions")
-        return
+        pgcopydb_args.append("--skip-extensions")
+    else:
+        skip_list = skip_extensions_list(args)
+        logger.info("Skipping extensions: %s", skip_list)
+        filter.exclude_extensions(skip_list)
 
-    skip_list = skip_extensions_list(args)
-    logger.info("Skipping extensions: %s", skip_list)
-    filter.exclude_extensions(skip_list)
+    filter_file = str(args.dir / "filter.ini")
 
+    # Apply filters
+    with open(filter_file, "w") as f:
+        filter.write(f)
+
+    pgcopydb_args.append(f"--filters={filter_file}")
+    return pgcopydb_args
 
 @telemetry_command("migrate_existing_data_from_pg_to_tsdb")
 def migrate_existing_data_from_pg_to_tsdb(args):
-    # TODO: Switch to the following simplified commands once we
-    # figure out how to deal with incompatible indexes.
-    # pgcopydb dump schema
-    # pgcopydb restore pre-data --skip-extensions --no-acl --no-owner
-    # <-- create hypertables -->
-    # pgcopydb clone --skip-extensions --no-acl --no-owner
+    filter_args = prepare_filters(args)
 
-    if not is_section_migration_complete("pre-data-dump"):
-        logger.info(f"Creating pre-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-        with timeit():
-            pgdump_command = " ".join(["pg_dump",
-                                       "-d",
-                                       '"$PGCOPYDB_SOURCE_PGURI"',
-                                       "--format=plain",
-                                       "--quote-all-identifiers",
-                                       "--no-tablespaces",
-                                       "--no-owner",
-                                       "--no-privileges",
-                                       "--section=pre-data",
-                                       "--file=$PGCOPYDB_DIR/pre-data-dump.sql",
-                                       ])
-            run_cmd(pgdump_command, LogFile("pre_data_dump"))
-        mark_section_complete("pre-data-dump")
+    with timeit("Dump schema"):
+        dump_schema = " ".join(["pgcopydb",
+                                "dump",
+                                "schema",
+                                "--dir",
+                                "$PGCOPYDB_DIR/pgcopydb_clone",
+                                "--snapshot",
+                                "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--resume",
+                                ] + filter_args)
+        run_cmd(dump_schema, LogFile("dump_schema"))
 
-    if not is_section_migration_complete("post-data-dump"):
-        logger.info(f"Creating post-data dump at {env['PGCOPYDB_DIR']}/dump ...")
-        with timeit():
-            pgdump_command = " ".join(["pg_dump",
-                                       "-d",
-                                       '"$PGCOPYDB_SOURCE_PGURI"',
-                                       "--format=plain",
-                                       "--quote-all-identifiers",
-                                       "--no-tablespaces",
-                                       "--no-owner",
-                                       "--no-privileges",
-                                       "--section=post-data",
-                                       "--file=$PGCOPYDB_DIR/post-data-dump.sql",
-                                       ])
-            run_cmd(pgdump_command, LogFile("post_data_dump"))
-        mark_section_complete("post-data-dump")
-
-    if not is_section_migration_complete("pre-data-restore"):
-        logger.info("Restoring pre-data ...")
-        with timeit():
-            log_file = LogFile("pre_data_restore")
-            psql_command = " ".join(["psql",
-                                     "-X",
-                                     "-d",
-                                     '"$PGCOPYDB_TARGET_PGURI"',
-                                     "--echo-errors",
-                                     "-v",
-                                     "ON_ERROR_STOP=0",
-                                     "-f",
-                                     "$PGCOPYDB_DIR/pre-data-dump.sql",
-                                     ])
-            run_cmd(psql_command, log_file)
-            print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
-        mark_section_complete("pre-data-restore")
-
-    filter = Filter()
-
-    with timeit():
-        logger.info("Copy extension config tables ...")
-        copy_extensions = [
-            "pgcopydb",
-            "copy",
-            "extensions",
-            "--dir",
-            "$PGCOPYDB_DIR/copy_extensions",
-            "--snapshot",
-            "$(cat $PGCOPYDB_DIR/snapshot)",
-            "--resume",
-        ]
-
-        prepare_filters(copy_extensions, args, filter)
-        # Apply filters
-        with open(args.dir / "filter.ini", "w") as f:
-            filter.write(f)
-            copy_extensions.append(f"--filters={f.name}")
-
-        copy_extensions = " ".join(copy_extensions)
-        run_cmd(copy_extensions, LogFile("copy_extensions"))
+    with timeit("Restore pre-data"):
+        restore_pre_data = " ".join(["pgcopydb",
+                                     "restore",
+                                     "pre-data",
+                                     "--no-acl",
+                                     "--no-owner",
+                                     "--dir",
+                                     "$PGCOPYDB_DIR/pgcopydb_clone",
+                                     "--snapshot",
+                                     "$(cat $PGCOPYDB_DIR/snapshot)",
+                                     "--resume",
+                                     ] + filter_args)
+        run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
     if not is_section_migration_complete("hypertable-creation"):
         show_hypertable_creation_prompt()
         mark_section_complete("hypertable-creation")
 
+    compatibility = create_hypertable_compatibility(args)
+
+    warn = args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check
+    error_shown = compatibility.warn_incompatibility(error=not warn)
+    if error_shown:
+        logger.error("Please resolve the above errors before proceeding.")
+        sys.exit(1)
+
     stop_progress = monitor_db_sizes()
 
-    if not is_section_migration_complete("copy-table-data"):
-        logger.info("Copying table data ...")
+    pgcopydb_dir = args.dir / "pgcopydb_clone"
+    # Apply the filter directly into the catalog
+    catalog = Catalog(dir=pgcopydb_dir)
+    compatibility.apply_filters(catalog)
+    catalog.update()
+
+    with timeit("Copy table data"):
         copy_table_data = " ".join(["pgcopydb",
-                                 "copy",
-                                 "table-data",
+                                 "clone",
                                  "--table-jobs",
                                  args.table_jobs,
                                  "--index-jobs",
                                  args.index_jobs,
                                  "--split-tables-larger-than='1 GB'",
                                  "--notice",
-                                 "--skip-vacuum",
                                  "--dir",
-                                 "$PGCOPYDB_DIR/copy_table_data",
+                                 str(pgcopydb_dir),
+                                 "--resume",
+                                 "--no-acl",
+                                 "--no-owner",
                                  "--snapshot",
                                  "$(cat $PGCOPYDB_DIR/snapshot)",
-                                 f"--filters={f.name}",
-                                 ])
-        with timeit():
-            run_cmd(copy_table_data, LogFile("copy_table_data"))
-        mark_section_complete("copy-table-data")
+                                 ] + filter_args)
+        log = LogFile("pgcopydb_clone")
+        run_cmd(copy_table_data, log)
 
-    if not is_section_migration_complete("post-data-restore"):
-        logger.info("Restoring post-data ...")
-        with timeit():
-            log_file = LogFile("post_data_restore")
-            psql_command = " ".join(["psql",
-                                     "-X",
-                                     "-d",
-                                     '"$PGCOPYDB_TARGET_PGURI"',
-                                     "--echo-errors",
-                                     "-v",
-                                     "ON_ERROR_STOP=0",
-                                     "-f",
-                                     "$PGCOPYDB_DIR/post-data-dump.sql",
-                                     ])
-            run_cmd(psql_command, log_file)
-            print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
-        mark_section_complete("post-data-restore")
-
-    if not is_section_migration_complete("analyze-db"):
-        logger.info("Perform ANALYZE on target DB tables ...")
-        with timeit():
-            vaccumdb_command = " ".join(["vacuumdb",
-                                        "--analyze",
-                                        "--echo",
-                                        "--exclude-schema=pg_catalog",
-                                        "--exclude-schema=information_schema",
-                                        "--exclude-schema=timescaledb_information",
-                                        "--exclude-schema=_timescaledb_internal",
-                                        "--exclude-schema=_timescaledb_debug",
-                                        "--dbname",
-                                        '"$PGCOPYDB_TARGET_PGURI"',
-                                        "--jobs",
-                                        args.table_jobs,
-                                        ])
-            run_cmd(vaccumdb_command, LogFile("analyze_db"))
-        mark_section_complete("analyze-db")
+    compatibility.create_incompatible_objects()
     stop_progress.set()
 
 
@@ -462,6 +405,8 @@ sed -i -E \
 def migrate_existing_data(args):
     logger.info("Copying table data ...")
 
+    filter_args = prepare_filters(args)
+
     clone_table_data = [
         "pgcopydb",
         "clone",
@@ -477,14 +422,7 @@ def migrate_existing_data(args):
         "--snapshot",
         "$(cat $PGCOPYDB_DIR/snapshot)",
         "--notice",
-    ]
-
-    filter = Filter()
-    prepare_filters(clone_table_data, args, filter)
-    # Apply filters
-    with open(args.dir / "filter.ini", "w") as f:
-        filter.write(f)
-        clone_table_data.append(f"--filters={f.name}")
+    ] + filter_args
 
     if args.resume:
         clone_table_data.append("--resume")
@@ -654,11 +592,8 @@ def migrate(args):
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(1)
 
-    source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
-    target_pg_uri = env["PGCOPYDB_TARGET_PGURI"]
-
-    source_type = get_dbtype(source_pg_uri)
-    target_type = get_dbtype(target_pg_uri)
+    source_type = get_dbtype(args.source)
+    target_type = get_dbtype(args.target)
 
     if args.pg_src:
         source_type = DBType.POSTGRES
@@ -720,7 +655,7 @@ def migrate(args):
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
         logger.info("Converting materialized views to views ...")
-        convert_matview_to_view(target_pg_uri)
+        convert_matview_to_view(args.target)
 
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
@@ -746,7 +681,7 @@ def migrate(args):
         copy_sequences()
 
         logger.info("Restoring materialized views ...")
-        restore_matview(target_pg_uri)
+        restore_matview(args.target)
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")

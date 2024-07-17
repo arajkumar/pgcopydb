@@ -13,7 +13,7 @@ from snapshot import snapshot
 from migrate import migrate
 from clean import clean
 from environ import pgcopydb_init_env, env
-from inspect import target_activity
+from inspect_db import target_activity
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -48,16 +48,28 @@ def main():
 
     common = argparse.ArgumentParser(add_help=False)
     def _dir_default():
-        dir = os.environ.get('PGCOPYDB_DIR', '')
-        if not dir:
-            dir = f'{tempfile.gettempdir()}/pgcopydb'
+        dir = os.environ.get('PGCOPYDB_DIR', f'{tempfile.gettempdir()}/pgcopydb')
         return Path(dir)
+
+    def _pg_uri_from_env(env_var1: str, env_var2: str):
+        pg_uri = os.environ.get(env_var1)
+        if pg_uri is None:
+            pg_uri = os.environ.get(env_var2)
+        return pg_uri
+
     common.add_argument('-h', '--help', action='help',
                         help='Show this help message and exit')
 
     common.add_argument('--dir', type=Path,
                         help='Working directory',
                         default=_dir_default())
+    common.add_argument('--source', type=str,
+                        help='Source connection string',
+                        default=_pg_uri_from_env('SOURCE', 'PGCOPYDB_SOURCE_PGURI'))
+    common.add_argument('--target', type=str,
+                        help='Target connection string',
+                        default=_pg_uri_from_env('TARGET', 'PGCOPYDB_TARGET_PGURI'))
+
 
     # snapshot
     parser_snapshot = subparsers.add_parser('snapshot',
@@ -87,11 +99,41 @@ def main():
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
-    parser_migrate.add_argument('--skip-table-data', nargs='+',
-                                help='Skips data from the given table during migration. However, the table schema will be migrated. ' \
-                                    'To skip data from a Hypertable, you will need to specify a list of schema qualified chunks belonging to the Hypertable. ' \
-                                    'Currently, this flag does not skip data during live replay from the specified table. ' \
-                                    'Values for this flag must be schema qualified. Eg: --skip-table-data public.exclude_table_1 public.exclude_table_2')
+    parser_migrate.add_argument('--skip-table-data',
+                                '--exclude-table-data',
+                                dest='skip_table_data',
+                                nargs='+',
+                                help='Skips data from the given table during '
+                                     'migration. However, the table schema '
+                                     'will be migrated. To skip data from a '
+                                     'Hypertable, you will need to specify a '
+                                     'list of schema qualified chunks belonging '
+                                     'to the Hypertable. Currently, this flag '
+                                     'does not skip data during live replay from '
+                                     'the specified table. Values for this '
+                                     'flag must be schema qualified. '
+                                     'Eg: --skip-table-data public.metrics public.metrics_New')
+    parser_migrate.add_argument('--skip-index',
+                                '--exclude-index',
+                                dest='skip_index',
+                                nargs='+',
+                                help='Skips the given indexes during migration. '
+                                     'Values for this flag must be schema '
+                                     'qualified. '
+                                     'Eg: --skip-index public.metrics_pkey public.Metrics_time_idx')
+    parser_migrate.add_argument('--skip-hypertable-compatibility-check',
+                                action='store_true',
+                                help='Skip the index/constraint compatibility '
+                                     'check during migration. This flag is '
+                                     'applicable only when migrating data '
+                                     'from Postgres to TimescaleDB.')
+    parser_migrate.add_argument('--skip-hypertable-incompatible-objects',
+                                action='store_true',
+                                help='Automatically skip incompatible indexes '
+                                     'and constraints during migration. This '
+                                     'flag is applicable only when migrating '
+                                     'data from Postgres to TimescaleDB.')
+
     # internal: for testing purposes only
     parser_migrate.add_argument('--pg-src',
                                 action='store_true',

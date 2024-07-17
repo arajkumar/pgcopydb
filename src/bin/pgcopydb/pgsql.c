@@ -2646,11 +2646,11 @@ pgsql_lock_table(PGSQL *pgsql, const char *qname, const char *lockmode)
  * name qname, in the given Postgres connection.
  */
 bool
-pgsql_truncate(PGSQL *pgsql, const char *qname, bool decendants)
+pgsql_truncate(PGSQL *pgsql, const char *qname, bool includeChilds)
 {
 	char sql[BUFSIZE] = { 0 };
 
-	if (decendants)
+	if (includeChilds)
 	{
 		sformat(sql, sizeof(sql), "TRUNCATE %s", qname);
 	}
@@ -2726,7 +2726,7 @@ pg_copy_data(PGSQL *src, PGSQL *dst, CopyArgs *args)
 
 	if (args->truncate)
 	{
-		if (!pgsql_truncate(dst, args->dstQname, args->truncateDescendants))
+		if (!pgsql_truncate(dst, args->dstQname, args->truncateChilds))
 		{
 			/* errors have already been logged */
 			return false;
