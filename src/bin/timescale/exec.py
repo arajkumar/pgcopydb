@@ -4,6 +4,7 @@ import subprocess
 import logging
 import os
 import typing
+import time
 
 from pathlib import Path
 
@@ -62,7 +63,7 @@ def print_logs_with_error(log_path: str = "", before: int = 0, after: int = 0, t
             logger.info("------------------END------------------")
 
 
-def start_process(args: list, log_file: LogFile, env=env):
+def start_process(args: list[str], log_file: LogFile, env=env):
     if log_file is None:
         stdout = subprocess.PIPE
         stderr = subprocess.PIPE
@@ -70,9 +71,11 @@ def start_process(args: list, log_file: LogFile, env=env):
         stdout = open(log_file.stdout, "w")
         stderr = open(log_file.stderr, "w")
 
-    # shell must be True to use exec command
-    process = subprocess.Popen(args, env=env,
-                               stdout=stdout, stderr=stderr,
+    process = subprocess.Popen(args,
+                               env=env,
+                               stdout=stdout,
+                               stderr=stderr,
+                               text=True,
                                universal_newlines=True,
                                bufsize=1)
     return process
@@ -125,13 +128,21 @@ def run_sql(execute_on_target: bool, sql: str) -> str:
 
 
 class Retry:
-    def __init__(self, args: list[str], max_retries: int) -> None:
+    def __init__(self, args: list[str], max_retries: int = 1, backoff: int = 0) -> None:
         self.args = args
         self.max_retries = max_retries
         self.count = 0
+        self.backoff = backoff
 
-    def increment(self):
+    def increment_and_wait_for_backoff(self):
         self.count += 1
+        self._wait_for_backoff()
+
+    def _wait_for_backoff(self):
+        """
+        Waits for given backoff duration. Defaults to no wait.
+        """
+        time.sleep(self.backoff * self.count)
 
     def should_retry(self) -> bool:
         return self.count < self.max_retries
@@ -143,13 +154,15 @@ class Process:
         self.process: subprocess.Popen = None
         self.name = name
         self.store_logs = False
+        self.health_check_func: typing.Callable = None
+        self.retry: Retry = None
 
     def with_logging(self):
         self.store_logs = True
         return self
 
-    def with_retry(self, retry_args: list[str], max_retries: int = 3):
-        self.retry = Retry(retry_args, max_retries)
+    def with_retry(self, retry_args: list[str], max_retries: int = 3, backoff: int = 0):
+        self.retry = Retry(retry_args, max_retries, backoff)
         return self
 
     def with_health_check(self, checker_func: typing.Callable):
@@ -162,6 +175,16 @@ class Process:
         return self
 
     def wait(self) -> int:
+        """
+        Wait for the current running process to complete.
+        """
+        if self.retry:
+            # If retry is enabled, we cannot do `self.process.wait()` as self.process's value will change
+            # due to retry, causing a race if accessed via self.process here. Hence, we should
+            # use alive() that avoids multiple simultaneous reads, avoiding the race behaviour.
+            while self.alive():
+                # Check every 5 seconds whether this process is running or not.
+                time.sleep(5)
         return self.process.wait()
 
     def current(self) -> subprocess.Popen:
@@ -181,8 +204,12 @@ class Process:
 
         # The retcode is not 0. Hence, if retry feature is enabled, let's retry.
         if self.retry and self.retry.should_retry():
-            self.retry.increment()
-            logger.warning(f"{self.name} failed. Retrying: {self.retry.count}/{self.retry.max_retries}")
+            retry_backoff = self.retry.backoff * (self.retry.count+1)
+            backoff_message = ""
+            if retry_backoff > 0:
+                backoff_message = f"after {retry_backoff}s"
+            logger.warning(f"{self.name} failed. Retrying: {self.retry.count+1}/{self.retry.max_retries} {backoff_message}")
+            self.retry.increment_and_wait_for_backoff()
             self.args = self.retry.args
             self.run()
         else:

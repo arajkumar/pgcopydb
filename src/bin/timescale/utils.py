@@ -75,6 +75,12 @@ def get_stored_val(name: str):
         return None
 
 
+def get_snapshot_id(dir) -> str:
+    with open(f"{dir}/snapshot", 'r') as file:
+        value = file.read()
+        return value
+
+
 def bytes_to_human(bytes):
     intervals = [("GiB", 2**30), ("MiB", 2**20), ("KiB", 2**10), ("B", 2**0)]
     for name, size in intervals:

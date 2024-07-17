@@ -12,7 +12,8 @@ from pathlib import Path
 from housekeeping import start_housekeeping
 from health_check import health_checker
 from utils import timeit, docker_command, dbname_from_uri, store_val, \
-    get_stored_val, bytes_to_human, seconds_to_human, DBType, get_dbtype
+    get_stored_val, bytes_to_human, seconds_to_human, DBType, get_dbtype, \
+    get_snapshot_id
 from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
@@ -205,8 +206,17 @@ def monitor_db_sizes() -> threading.Event:
     logger.info("Monitoring initial copy progress ...")
     def get_and_print_size():
         while not stop_event.is_set():
-            tgt_size = run_sql(execute_on_target=True, sql=DB_SIZE_SQL)[:-1]
-            logger.info(f"{tgt_size} copied to Target DB (Source DB is {src_size})")
+            try:
+                # During a disk resize event on the target instance (Timescale Cloud),
+                # it will be temporarily unavailable. If we query the target database size
+                # during this period of unavailability, it will cause the monitor_db_size() thread
+                # to panic and stop execution. To prevent this, the database size query is placed
+                # inside a try block to handle any temporary unavailability.
+                tgt_size = run_sql(execute_on_target=True, sql=DB_SIZE_SQL)[:-1]
+            except:
+                pass
+            else:
+                logger.info(f"{tgt_size} copied to Target DB (Source DB is {src_size})")
             stop_event.wait(timeout=60)
     t = threading.Thread(target=get_and_print_size)
     t.daemon = True
@@ -306,24 +316,28 @@ def migrate_existing_data_from_pg_to_tsdb(args):
     catalog.update()
 
     with timeit("Copy table data"):
-        copy_table_data = " ".join(["pgcopydb",
-                                 "clone",
-                                 "--table-jobs",
-                                 args.table_jobs,
-                                 "--index-jobs",
-                                 args.index_jobs,
-                                 "--split-tables-larger-than='1 GB'",
-                                 "--notice",
-                                 "--dir",
-                                 str(pgcopydb_dir),
-                                 "--resume",
-                                 "--no-acl",
-                                 "--no-owner",
-                                 "--snapshot",
-                                 "$(cat $PGCOPYDB_DIR/snapshot)",
-                                 ] + filter_args)
-        log = LogFile("pgcopydb_clone")
-        run_cmd(copy_table_data, log)
+        clone_args = ["pgcopydb",
+                        "clone",
+                        "--table-jobs",
+                        args.table_jobs,
+                        "--index-jobs",
+                        args.index_jobs,
+                        "--split-tables-larger-than=1GB",
+                        "--notice",
+                        "--dir",
+                        str(pgcopydb_dir),
+                        "--resume",
+                        "--no-acl",
+                        "--no-owner",
+                        "--snapshot",
+                        get_snapshot_id(env['PGCOPYDB_DIR']),
+                    ] + filter_args
+        (Process(clone_args, "clone")
+            .with_logging()
+            # Use the same args for retry as for the actual command since the actual command has --resume.
+            .with_retry(retry_args=clone_args, max_retries=5, backoff=20)
+            .run()
+            .wait())
 
     compatibility.create_incompatible_objects()
     stop_progress.set()
@@ -407,7 +421,8 @@ def migrate_existing_data(args):
 
     filter_args = prepare_filters(args)
 
-    clone_table_data = [
+    clone_dir = args.dir / "pgcopydb_clone"
+    clone_args = [
         "pgcopydb",
         "clone",
         "--no-acl",
@@ -416,23 +431,30 @@ def migrate_existing_data(args):
         args.table_jobs,
         "--index-jobs",
         args.index_jobs,
-        "--split-tables-larger-than='1 GB'",
+        "--split-tables-larger-than=1GB",
         "--dir",
-        "$PGCOPYDB_DIR/pgcopydb_clone",
+        str(clone_dir),
         "--snapshot",
-        "$(cat $PGCOPYDB_DIR/snapshot)",
+        get_snapshot_id(env['PGCOPYDB_DIR']),
         "--notice",
     ] + filter_args
 
-    if args.resume:
-        clone_table_data.append("--resume")
+    clone_retry_args = clone_args + ["--resume"]
 
-    clone_table_data = " ".join(clone_table_data)
+    if args.resume:
+        clone_args.append("--resume")
 
     stop_progress = monitor_db_sizes()
 
     with timeit():
-       run_cmd(clone_table_data, LogFile("pgcopydb_clone"))
+       (Process(clone_args, "clone")
+            .with_logging()
+            # The primary aim for using a retry here is to handle disk resize events.
+            # We believe 95% of disk retries should complete within 5 minutes.
+            # Hence, the below retry is for a total of 5 minutes, i.e., (1+2+...5) * 20 = 300 seconds.
+            .with_retry(retry_args=clone_retry_args, max_retries=5, backoff=20)
+            .run()
+            .wait())
 
     stop_progress.set()
 
