@@ -117,6 +117,8 @@ typedef struct LogicalMessageValues
 	LogicalMessageValue *array; /* malloc'ed area */
 } LogicalMessageValues;
 
+
+
 typedef struct LogicalMessageValuesArray
 {
 	int count;
@@ -124,10 +126,23 @@ typedef struct LogicalMessageValuesArray
 	LogicalMessageValues *array; /* malloc'ed area */
 } LogicalMessageValuesArray;
 
+typedef struct LogicalMessageAttribute
+{
+	char *name; /* malloc'ed area */
+
+	bool isgenerated;
+
+} LogicalMessageAttribute;
+
+typedef struct LogicalMessageAttributeArray
+{
+	int count;
+	LogicalMessageAttribute *array; /* malloc'ed area */
+} LogicalMessageAttributeArray;
+
 typedef struct LogicalMessageTuple
 {
-	int cols;
-	char **columns;                  /* malloc'ed area */
+	LogicalMessageAttributeArray attributes;
 	LogicalMessageValuesArray values;
 } LogicalMessageTuple;
 

@@ -1497,7 +1497,7 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	LogicalMessageTuple *newInsertColumns = newInsert->new.array;
 
 	/* Last and current statements must have same number of columns */
-	if (lastInsertColumns->cols != newInsertColumns->cols)
+	if (lastInsertColumns->attributes.count != newInsertColumns->attributes.count)
 	{
 		return false;
 	}
@@ -1513,7 +1513,7 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	 * TODO: This parameter limit check is not applicable for COPY operations.
 	 * It should be removed once we switch to using COPY.
 	 */
-	if (((lastValuesArray->count + 1) * lastInsertColumns->cols) >
+	if (((lastValuesArray->count + 1) * lastInsertColumns->attributes.count) >
 		PQ_QUERY_PARAM_MAX_LIMIT)
 	{
 		return false;
@@ -1521,9 +1521,11 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 
 
 	/* Last and current statements cols must have same name and order */
-	for (int i = 0; i < lastInsertColumns->cols; i++)
+	for (int i = 0; i < lastInsertColumns->attributes.count; i++)
 	{
-		if (!streq(lastInsertColumns->columns[i], newInsertColumns->columns[i]))
+		LogicalMessageAttribute *lastAttr = &(lastInsertColumns->attributes.array[i]);
+		LogicalMessageAttribute *newAttr = &(newInsertColumns->attributes.array[i]);
+		if (!streq(lastAttr->name, newAttr->name))
 		{
 			return false;
 		}
@@ -1606,12 +1608,10 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 bool
 AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
 {
-	tuple->cols = count;
+	tuple->attributes.count = count;
 
 	if (count == 0)
 	{
-		tuple->columns = NULL;
-
 		LogicalMessageValuesArray *valuesArray = &(tuple->values);
 		valuesArray->count = 0;
 		valuesArray->capacity = 0;
@@ -1620,9 +1620,9 @@ AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
 		return true;
 	}
 
-	tuple->columns = (char **) calloc(count, sizeof(char *));
+	tuple->attributes.array = (LogicalMessageAttribute *) calloc(count, sizeof(LogicalMessageAttribute *));
 
-	if (tuple->columns == NULL)
+	if (tuple->attributes.array == NULL)
 	{
 		log_error(ALLOCATION_FAILED_ERROR);
 		return false;
@@ -2074,11 +2074,12 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 		/* loop over column names and add them to the out stream */
 		appendPQExpBuffer(buf, "%s", "(");
 
-		for (int c = 0; c < stmt->cols; c++)
+		for (int c = 0; c < stmt->attributes.count; c++)
 		{
+			LogicalMessageAttribute *attr = &(stmt->attributes.array[c]);
 			appendPQExpBuffer(buf, "%s%s",
 							  c > 0 ? ", " : "",
-							  stmt->columns[c]);
+							  attr->name);
 		}
 
 		appendPQExpBuffer(buf, "%s", ")");
@@ -2218,15 +2219,15 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 			/* now loop over column values for this VALUES row */
 			for (int v = 0; v < values->cols; v++)
 			{
-				const char *colname = new->columns[v];
+				LogicalMessageAttribute *attr = &(new->attributes.array[v]);
 				LogicalMessageValue *value = &(values->array[v]);
 
-				if (new->cols <= v)
+				if (new->attributes.count <= v)
 				{
 					log_error("Failed to write UPDATE statement with more "
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
-							  new->cols);
+							  new->attributes.count);
 					destroyPQExpBuffer(buf);
 					return false;
 				}
@@ -2238,9 +2239,10 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 				 */
 				bool skip = false;
 
-				for (int oc = 0; oc < old->cols; oc++)
+				for (int oc = 0; oc < old->attributes.count; oc++)
 				{
-					if (streq(old->columns[oc], colname))
+					LogicalMessageAttribute *oldAttr = &(old->attributes.array[oc]);
+					if (streq(oldAttr->name, attr->name))
 					{
 						/* only works because old->values.count == 1 */
 						LogicalMessageValue *oldValue =
@@ -2260,13 +2262,13 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 					{
 						appendPQExpBuffer(buf, "%s%s = DEFAULT",
 										  first ? "" : ", ",
-										  colname);
+										  attr->name);
 					}
 					else
 					{
 						appendPQExpBuffer(buf, "%s%s = $%d",
 										  first ? "" : ", ",
-										  colname,
+										  attr->name,
 										  ++pos);
 
 						if (!stream_add_value_in_json_array(value, jsArray))
@@ -2290,18 +2292,19 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 		for (int r = 0; r < old->values.count; r++)
 		{
 			LogicalMessageValues *values = &(old->values.array[r]);
+			LogicalMessageAttribute *attr = &(old->attributes.array[0]);
 
 			/* now loop over column values for this VALUES row */
 			for (int v = 0; v < values->cols; v++)
 			{
 				LogicalMessageValue *value = &(values->array[v]);
 
-				if (old->cols <= v)
+				if (old->attributes.count <= v)
 				{
 					log_error("Failed to write UPDATE statement with more "
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
-							  old->cols);
+							  old->attributes.count);
 					destroyPQExpBuffer(buf);
 					return false;
 				}
@@ -2314,13 +2317,13 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 					 */
 					appendPQExpBuffer(buf, "%s%s IS NULL",
 									  v > 0 ? " and " : "",
-									  old->columns[v]);
+									  attr->name);
 				}
 				else
 				{
 					appendPQExpBuffer(buf, "%s%s = $%d",
 									  v > 0 ? " and " : "",
-									  old->columns[v],
+									  attr->name,
 									  ++pos);
 
 					if (!stream_add_value_in_json_array(value, jsArray))
@@ -2393,13 +2396,14 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 			for (int v = 0; v < values->cols; v++)
 			{
 				LogicalMessageValue *value = &(values->array[v]);
+				LogicalMessageAttribute *attr = &(old->attributes.array[v]);
 
-				if (old->cols <= v)
+				if (old->attributes.count <= v)
 				{
 					log_error("Failed to write DELETE statement with more "
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
-							  old->cols);
+							  old->attributes.count);
 					destroyPQExpBuffer(buf);
 					return false;
 				}
@@ -2412,13 +2416,13 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 					 */
 					appendPQExpBuffer(buf, "%s%s IS NULL",
 									  v > 0 ? " and " : "",
-									  old->columns[v]);
+									  attr->name);
 				}
 				else
 				{
 					appendPQExpBuffer(buf, "%s%s = $%d",
 									  v > 0 ? " and " : "",
-									  old->columns[v],
+									  attr->name,
 									  ++pos);
 
 					if (!stream_add_value_in_json_array(value, jsArray))
@@ -2944,9 +2948,10 @@ markGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
 	{
 		LogicalMessageTuple *tuple = &(columns->array[i]);
 
-		for (int c = 0; c < tuple->cols; c++)
+		for (int c = 0; c < tuple->attributes.count; c++)
 		{
-			if (isGeneratedColumn(generatedColumns, tuple->columns[c]))
+			LogicalMessageAttribute *attr = &(tuple->attributes.array[c]);
+			if (isGeneratedColumn(generatedColumns, attr->name))
 			{
 				for (int v = 0; v < tuple->values.count; v++)
 				{
