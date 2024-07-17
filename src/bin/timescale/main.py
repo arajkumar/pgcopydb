@@ -132,7 +132,8 @@ def main():
         case 'clean':
             clean(args)
         case 'migrate':
-            migrate(args)
+            exit_code = migrate(args)
+            sys.exit(exit_code)
         case 'inspect':
             target_uri = env["PGCOPYDB_TARGET_PGURI"]
             if not target_uri:

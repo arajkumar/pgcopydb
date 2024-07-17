@@ -689,6 +689,8 @@ def migrate(args):
 
     housekeeping_thread, housekeeping_stop_event = None, None
 
+    exit_code = 0
+
     follow = create_follow(resume=args.resume)
     try:
         if not is_section_migration_complete("roles") and not args.skip_roles:
@@ -737,10 +739,8 @@ def migrate(args):
         logger.error(f"Unexpected exception: {e}")
         logger.error(traceback.format_exc())
         telemetry.complete_fail()
-        logger.error("An error occurred during the live migration. "
-                     "Please report this issue to support@timescale.com "
-                     "with all log files from the <volume-mount>/logs "
-                     "directory.")
+
+        exit_code = 1
     else:
         logger.info("Copying sequences ...")
         copy_sequences()
@@ -759,6 +759,7 @@ def migrate(args):
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean'))
         telemetry.complete_success()
+        exit_code = 0
 
     finally:
         # TODO: Use daemon threads for housekeeping and health_checker.
@@ -769,4 +770,14 @@ def migrate(args):
             housekeeping_thread.join()
         # cleanup all subprocesses created by pgcopydb follow
         follow.terminate()
-        logger.info("All processes have exited successfully.")
+
+        if exit_code == 0:
+            logger.info("All processes have exited successfully.")
+        else:
+            logger.error("An error occurred during the live migration. "
+                         "Please report this issue to support@timescale.com "
+                         "with all log files from the <volume-mount>/logs "
+                         "directory.")
+            logger.error("Exit code: %d", exit_code)
+
+        return exit_code
