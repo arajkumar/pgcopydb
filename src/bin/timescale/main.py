@@ -177,11 +177,7 @@ def main():
             exit_code = migrate(args)
             sys.exit(exit_code)
         case 'inspect':
-            target_uri = env["PGCOPYDB_TARGET_PGURI"]
-            if not target_uri:
-                logger.error("Target db URI not found when reading $PGCOPYDB_TARGET_PGURI")
-                return
-            target_activity(args=args, conn=target_uri)
+            target_activity(args=args)
 
 
 if __name__ == "__main__":

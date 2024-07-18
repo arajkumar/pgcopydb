@@ -46,11 +46,11 @@ def trim(s: str, num_chars: int, direction_back: bool = True) -> str:
     return s
 
 
-def target_activity(args, conn: str):
+def _target_activity(args):
     print("{:^10} | {:^10} | {:^10} | {:^10} | {:^20} | {:^70}".format("TIME", "PID", "QUERY ID", "STATE", "RUNNING SINCE", "QUERY"))
     print("-" * 10, "|", "-" * 10, "|", "-" * 10, "|", "-" * 10, "|", "-" * 20, "|", "-" * 70)
     while True:
-        rows = get_activity(conn)
+        rows = get_activity(args.target)
         for row in rows:
             print("{:^10} | {:^10} | {:^10} | {:^10} | {:^20} | {:<70}".format(
                 row["time"],
@@ -60,3 +60,10 @@ def target_activity(args, conn: str):
                 row["running_since"],
                 trim(str(row["query"]).strip(), 70)))
         time.sleep(args.interval)
+
+def target_activity(args):
+    try:
+        _target_activity(args)
+    except KeyboardInterrupt:
+        print("Exiting...")
+        exit(0)

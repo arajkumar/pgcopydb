@@ -129,6 +129,9 @@ RUN mkdir /opt/timescale
 COPY src/bin/timescale /opt/timescale
 WORKDIR /opt/timescale
 ENV PGCOPYDB_DIR=/opt/timescale/ts_cdc
+
+RUN mkdir $PGCOPYDB_DIR && chmod 777 $PGCOPYDB_DIR
+
 ENV LIVE_MIGRATION_DOCKER=true
 ENV HOUSEKEEPING_INTERVAL=300
 

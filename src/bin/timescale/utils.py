@@ -108,6 +108,7 @@ def docker_command(name, *args):
             -e PGCOPYDB_SOURCE_PGURI=$SOURCE \
             -e PGCOPYDB_TARGET_PGURI=$TARGET \
             --pid=host \
+            --user=$(id -u):$(id -g) \
             -v ~/live-migration:{env['PGCOPYDB_DIR']} \
             {DOCKER_IMAGE_NAME}:{SCRIPT_VERSION} \
             {" ".join(args)}""".rstrip()
