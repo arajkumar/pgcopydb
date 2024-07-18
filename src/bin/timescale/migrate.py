@@ -329,6 +329,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                         "--resume",
                         "--no-acl",
                         "--no-owner",
+                        "--fail-fast",
                         "--snapshot",
                         get_snapshot_id(env['PGCOPYDB_DIR']),
                     ] + filter_args
@@ -427,6 +428,7 @@ def migrate_existing_data(args):
         "clone",
         "--no-acl",
         "--no-owner",
+        "--fail-fast",
         "--table-jobs",
         args.table_jobs,
         "--index-jobs",
