@@ -22,23 +22,6 @@ fn generate_test_network_name() -> String {
     format!("network-{}", rng.gen_range(10_000..=99_999))
 }
 
-// TODO: Move this to test_common crate.
-fn has_table_count(dba: &mut DbAssert, table: &str, count: i64) {
-    let client = dba.connection();
-    let v: i64 = client
-        .query_one(format!("select count(*) from {}", table).as_str(), &[])
-        .unwrap()
-        .get(0);
-    assert_eq!(v, count);
-}
-
-//TODO: Move this to test_common crate.
-fn must_true(db_assert: &mut DbAssert, query: &str) {
-    let client = db_assert.connection();
-    let v: bool = client.query_one(query, &[]).unwrap().get(0);
-    assert!(v);
-}
-
 fn start_source<'a>(
     docker: &'a Cli,
     pg_version: PgVersion,
@@ -264,7 +247,7 @@ fn test_end_to_end_migration_with_extension_upgrade() -> Result<()> {
     // _timescaledb_catalog.dimension due to extension upgrade.
     // The ordering of extension config tables must be taken care of during
     // extension migration.
-    must_true(&mut source_assert, "SELECT '_timescaledb_catalog.hypertable'::regclass::oid > '_timescaledb_catalog.dimension'::regclass::oid");
+    source_assert.is_true("SELECT '_timescaledb_catalog.hypertable'::regclass::oid > '_timescaledb_catalog.dimension'::regclass::oid");
 
     let temp_dir = tempdir().unwrap();
 
@@ -352,7 +335,7 @@ fn test_exclude_existing_table_data() -> Result<()> {
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
 
-    has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 0);
+    target_assert.has_table_count("public", "Metrics_data_excluded", 0);
     target_assert.has_table_count("public", "metrics", 744);
 
     psql(
@@ -371,7 +354,7 @@ fn test_exclude_existing_table_data() -> Result<()> {
 
     // Currently, we do not skip data during live replay. This is why
     // "metrics_data_excluded" has count as 696 which was added during CDC.
-    has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 696);
+    target_assert.has_table_count("public", "Metrics_data_excluded", 696);
     target_assert.has_table_count("public", "metrics", 1440);
 
     Ok(())
@@ -496,11 +479,7 @@ fn test_case_sensitive_object_live_replication() -> Result<()> {
     {
         let mut target_assert = DbAssert::new(&target_container.connection_string())?;
         target_assert.has_table("Sensitive_Schema0", "Sensitive_Metric1");
-        has_table_count(
-            &mut target_assert,
-            r#""Sensitive_Schema0"."Sensitive_Metric1""#,
-            744,
-        );
+        target_assert.has_table_count("Sensitive_Schema0", "Sensitive_Metric1", 744);
     }
 
     // Perform CDC on sensitive SQL objects.
@@ -519,11 +498,7 @@ fn test_case_sensitive_object_live_replication() -> Result<()> {
     )?;
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
-    has_table_count(
-        &mut target_assert,
-        r#""Sensitive_Schema0"."Sensitive_Metric1""#,
-        1440,
-    );
+    target_assert.has_table_count("Sensitive_Schema0", "Sensitive_Metric1", 1440);
 
     Ok(())
 }
@@ -668,7 +643,7 @@ fn test_pg_to_ts_with_table_data_filtering() -> Result<()> {
     )?;
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
-    has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 0);
+    target_assert.has_table_count("public", "Metrics_data_excluded", 0);
     target_assert.has_table_count("public", "metrics", 1440);
 
     Ok(())
@@ -747,7 +722,7 @@ fn test_pg_to_pg_with_table_data_filtering() -> Result<()> {
     )?;
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
-    has_table_count(&mut target_assert, r#"public."Metrics_data_excluded""#, 0);
+    target_assert.has_table_count("public", "Metrics_data_excluded", 0);
     target_assert.has_table_count("public", "metrics", 1440);
 
     Ok(())
