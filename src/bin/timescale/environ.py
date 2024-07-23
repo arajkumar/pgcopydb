@@ -26,5 +26,9 @@ def pgcopydb_init_env(args):
     env["SOURCE"] = args.source
     env["TARGET"] = args.target
 
+    # set application name to all connections executed using psql
+    # from live-migration tool.
+    env["PGAPPNAME"] = "live-migration"
+
     if args.dir:
         env["PGCOPYDB_DIR"] = str(args.dir.absolute())
