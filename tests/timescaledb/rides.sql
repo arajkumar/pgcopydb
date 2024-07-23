@@ -67,4 +67,18 @@ ALTER TABLE "metrics" ADD PRIMARY KEY (id, time);
 
 SELECT create_hypertable('metrics', 'time', create_default_indexes=>FALSE, chunk_time_interval=> '1h'::interval);
 
+CREATE SCHEMA IF NOT EXISTS "Foo";
+
+CREATE TABLE IF NOT EXISTS "Foo"."MetricsWithPrefix"(
+    id BIGINT,
+    "time" timestamp with time zone NOT NULL,
+    name TEXT NOT NULL,
+    value NUMERIC NOT NULL
+);
+
+SELECT create_hypertable('"Foo"."MetricsWithPrefix"', 'time',
+    create_default_indexes=>FALSE, chunk_time_interval=> '1h'::interval,
+    associated_schema_name=>'Foo_Custom',
+    associated_table_prefix=>'MetricsWithPrefix_Long_Long_Name_with_12345678');
+
 COMMIT;

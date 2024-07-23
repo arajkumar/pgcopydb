@@ -119,15 +119,6 @@ parseWal2jsonMessageActionAndXid(LogicalStreamContext *context)
 
 			metadata->filterOut = true;
 		}
-
-		if (metadata->action == STREAM_ACTION_TRUNCATE &&
-			timescale_is_chunk(nspname, relname))
-		{
-			log_warn("Filtering out message action TRUNCATE for %s.%s",
-					 nspname, relname);
-
-			metadata->filterOut = true;
-		}
 	}
 
 	return true;
@@ -321,26 +312,16 @@ SetMessageRelation(JSON_Object *jsobj,
 		return false;
 	}
 
-	char chunk_schema[PG_NAMEDATALEN] = { 0 };
-	char chunk_table[PG_NAMEDATALEN] = { 0 };
+	LogicalMessageRelation chunk = { schema, relname };
+	LogicalMessageRelation hypertable = { 0 };
 
-	if (timescale_is_chunk(schema, relname) &&
-		(metadata->action == STREAM_ACTION_INSERT ||
-		 metadata->action == STREAM_ACTION_UPDATE ||
-		 metadata->action == STREAM_ACTION_DELETE))
+	if (timescale_chunk_to_hypertable(&chunk, &hypertable))
 	{
-		if (!timescale_chunk_to_hypertable(schema,
-										   relname,
-										   chunk_schema,
-										   chunk_table))
+		if (metadata->action != STREAM_ACTION_TRUNCATE)
 		{
-			log_error("Failed to map chunk %s.%s to hypertable",
-					  table->nspname, table->relname);
-			return false;
+			schema = hypertable.nspname;
+			relname = hypertable.relname;
 		}
-
-		schema = chunk_schema;
-		relname = chunk_table;
 	}
 
 	table->nspname = pgsql_escape_identifier(pgsql, schema);

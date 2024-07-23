@@ -188,15 +188,6 @@ parseTestDecodingMessageActionAndXid(LogicalStreamContext *context)
 			metadata->filterOut = true;
 		}
 
-		if (header.action == STREAM_ACTION_TRUNCATE &&
-			timescale_is_chunk(header.table.nspname, header.table.relname))
-		{
-			log_warn("Filtering out message action TRUNCATE for %s.%s",
-					 header.table.nspname, header.table.relname);
-
-			metadata->filterOut = true;
-		}
-
 		metadata->action = header.action;
 	}
 	else
@@ -401,24 +392,14 @@ parseTestDecodingMessageHeader(TestDecodingHeader *header, const char *message)
 	}
 
 	/* Map if the relation is chunk */
-	if (timescale_is_chunk(header->table.nspname, header->table.relname) &&
-		header->action != STREAM_ACTION_TRUNCATE)
+	LogicalMessageRelation hypertable = { 0 };
+
+	if (timescale_chunk_to_hypertable(&header->table, &hypertable))
 	{
-		char nspname[PG_NAMEDATALEN] = { 0 };
-		char relname[PG_NAMEDATALEN] = { 0 };
-
-		if (!timescale_chunk_to_hypertable(header->table.nspname,
-										   header->table.relname,
-										   nspname,
-										   relname))
+		if (header->action != STREAM_ACTION_TRUNCATE)
 		{
-			log_error("Failed to map chunk %s.%s to hypertable",
-					  header->table.nspname, header->table.relname);
-			return false;
+			header->table = hypertable;
 		}
-
-		strlcpy(header->table.nspname, nspname, sizeof(nspname));
-		strlcpy(header->table.relname, relname, sizeof(relname));
 	}
 
 	sformat(header->qname, sizeof(header->qname), "%s.%s",

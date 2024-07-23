@@ -5,68 +5,148 @@
 #include "file_utils.h"
 #include "uthash.h"
 
-typedef struct ChunkHypertableMap
+typedef struct SourceHypertable_Lookup
 {
-	uint32_t hypertableID;
+	char chunkSchema[PG_NAMEDATALEN];
+	char chunkTablePrefix[PG_NAMEDATALEN];
+} SourceHypertable_Lookup;
+
+typedef struct SourceHypertable
+{
+	char chunkSchema[PG_NAMEDATALEN];
+	char chunkTablePrefix[PG_NAMEDATALEN];
 
 	char nspname[PG_NAMEDATALEN];
 	char relname[PG_NAMEDATALEN];
 
 	UT_hash_handle hh;          /* makes this structure hashable */
-} ChunkHypertableMap;
+} SourceHypertable;
 
 
 static bool tableExists(PGSQL *pgsql, const char *nspname,
 						const char *relname,
 						bool *exists);
 
-static ChunkHypertableMap *chunkHypertableMap = NULL;
+static SourceHypertable *hypertableCache = NULL;
 
 /*
- * parseHypertableDetails parses the result from a PostgreSQL query that
+ * parseHypertable parses the result from a PostgreSQL query that
  * fetches the hypertable & chunk details.
  */
+static bool
+parseHypertable(PGresult *result, int rowNumber, SourceHypertable *hypertable)
+{
+	int nspname = PQfnumber(result, "schema_name");
+	int relname = PQfnumber(result, "table_name");
+	int chunkSchmea = PQfnumber(result, "associated_schema_name");
+	int chunkTablePrefix = PQfnumber(result, "associated_table_prefix");
+
+	int errors = 0;
+
+	int numCols = PQnfields(result);
+
+	if (numCols != 4)
+	{
+		log_error("Expected 4 columns in hypertable query result, got %d", numCols);
+		return false;
+	}
+
+	/* nspname */
+	const char *value = PQgetvalue(result, rowNumber, nspname);
+	int length = strlcpy(hypertable->nspname, value, PG_NAMEDATALEN);
+
+	if (length >= PG_NAMEDATALEN)
+	{
+		log_error("Schema name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+				  value, length, PG_NAMEDATALEN - 1);
+		++errors;
+	}
+
+	/* relname */
+	value = PQgetvalue(result, rowNumber, relname);
+	length = strlcpy(hypertable->relname, value, PG_NAMEDATALEN);
+
+	if (length >= PG_NAMEDATALEN)
+	{
+		log_error("Table name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+				  value, length, PG_NAMEDATALEN - 1);
+		++errors;
+	}
+
+	/* associated_schema_name */
+	value = PQgetvalue(result, rowNumber, chunkSchmea);
+	length = strlcpy(hypertable->chunkSchema, value, PG_NAMEDATALEN);
+
+	if (length >= PG_NAMEDATALEN)
+	{
+		log_error("Chunk schema name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+				  value, length, PG_NAMEDATALEN - 1);
+		++errors;
+	}
+
+	/* associated_table_prefix */
+	value = PQgetvalue(result, rowNumber, chunkTablePrefix);
+	length = strlcpy(hypertable->chunkTablePrefix, value, PG_NAMEDATALEN);
+
+	if (length >= PG_NAMEDATALEN)
+	{
+		log_error("Chunk table prefix name \"%s\" is %d bytes long, "
+				  "the maximum expected is %d (PG_NAMEDATALEN - 1)",
+				  value, length, PG_NAMEDATALEN - 1);
+		++errors;
+	}
+
+	return errors == 0;
+}
+
+
 static void
-parseHypertableDetails(void *ctx, PGresult *res)
+getHypertables(void *ctx, PGresult *res)
 {
 	int numRows = PQntuples(res);
-	int numCols = PQnfields(res);
+	bool parsedOk = true;
 
-	for (int i = 0; i < numRows; i++)
+	for (int rowNumber = 0; rowNumber < numRows && parsedOk; rowNumber++)
 	{
-		ChunkHypertableMap *chunkMapEntry = (ChunkHypertableMap *) malloc(
-			sizeof(ChunkHypertableMap));
-		if (chunkMapEntry == NULL)
+		SourceHypertable *hypertable = (SourceHypertable *) calloc(1,
+																   sizeof(SourceHypertable));
+
+		if (hypertable == NULL)
 		{
-			log_error("Failed to allocate memory for ChunkHypertableMap");
+			log_error(ALLOCATION_FAILED_ERROR);
+
+			parsedOk = false;
+
 			break; /* Exit the loop on memory allocation failure */
 		}
-		for (int j = 0; j < numCols; j++)
+
+		if (!parseHypertable(res, rowNumber, hypertable))
 		{
-			char *columnName = PQfname(res, j);
-			char *columnValue = PQgetvalue(res, i, j);
-			if (streq(columnName, "id"))
-			{
-				if (!stringToUInt32(columnValue, &chunkMapEntry->hypertableID))
-				{
-					log_error("Failed to parse hypertable id: %s", columnValue);
-					continue; /* Skip this row */
-				}
-			}
-			else if (streq(columnName, "schema_name"))
-			{
-				strlcpy(chunkMapEntry->nspname, columnValue, PG_NAMEDATALEN);
-			}
-			else if (streq(columnName, "table_name"))
-			{
-				strlcpy(chunkMapEntry->relname, columnValue, PG_NAMEDATALEN);
-			}
+			log_error("Failed to parse hypertable details");
+			parsedOk = false;
+
+			break; /* Exit the loop on parse failure */
 		}
 
-		/* Insert the ChunkHypertableMap entry into the hashmap */
-		HASH_ADD_INT(chunkHypertableMap, hypertableID, chunkMapEntry);
-		log_notice("Adding hypertable relation: %s.%s id: %d", chunkMapEntry->nspname,
-				   chunkMapEntry->relname, chunkMapEntry->hypertableID);
+		log_info("Found hypertable %s.%s with chunk schema %s and prefix %s",
+				 hypertable->nspname, hypertable->relname,
+				 hypertable->chunkSchema, hypertable->chunkTablePrefix);
+
+		/*
+		 * Prepare keylen as per https://troydhanson.github.io/uthash/userguide.html#_compound_keys
+		 */
+		unsigned keylen = offsetof(SourceHypertable, chunkTablePrefix) + /* offset of last key field */
+						  sizeof(hypertable->chunkTablePrefix) - /* size of last key field */
+						  offsetof(SourceHypertable, chunkSchema); /* offset of first key field */
+		/* Add the table to the GeneratedColumnsCache. */
+		HASH_ADD(hh,
+				 hypertableCache,
+				 chunkSchema,
+				 keylen,
+				 hypertable);
 	}
 }
 
@@ -143,47 +223,73 @@ timescale_init(PGSQL *pgsql, char *pguri)
 	}
 
 	const char *sql =
-		"SELECT id, schema_name, table_name FROM _timescaledb_catalog.hypertable";
+		"SELECT "
+		"	schema_name, table_name, "
+		"	associated_schema_name, associated_table_prefix "
+		"FROM "
+		"	_timescaledb_catalog.hypertable";
+
 	if (!pgsql_execute_with_params(pgsql, sql, 0, NULL, NULL,
-								   NULL, &parseHypertableDetails))
+								   NULL, &getHypertables))
 	{
 		log_error("Failed to fetch pgcopydb.sentinel current values");
 		return false;
 	}
+
 	return true;
 }
 
 
 static bool
-extract_hypertable_id(const char *input, uint32_t *hypertableID)
+findChunkPrefixEndPos(const char *relname, int *prefixPosition)
 {
-	const char *prefix = "_hyper_";
+	/*
+	 * Format of the chunk table name: <prefix>_<chunk_id>_chunk.
+	 * i.e. It always ends with "_chunk".
+	 * Few examples of relname:
+	 * 1. long_1234567890123456789012345678901234567890123_100_chunk
+	 * 2. long_12345678901234567890123456_metrics_prefix_long_long_time_i
+	 * custom_schema.metrics_97_chunk
+	 * 3. _timescaledb_internal._hyper_2_67_chunk
+	 *
+	 * The logic should find the 2nd _ from the end of the string.
+	 */
 
-	/* Find the position of the prefix in the input string */
-	const char *prefixPosition = strstr(input, prefix);
+	/*
+	 * Check whether it ends with "_chunk".
+	 * If not, then it is not a chunk table.
+	 */
+	int position = strlen(relname) - 1;
 
-	if (prefixPosition != NULL)
+	char suffix[] = "_chunk";
+	int suffixLength = sizeof(suffix) - 1;
+
+	if (position < suffixLength)
 	{
-		/* Move the pointer to the character after the prefix */
-		prefixPosition += strlen(prefix);
+		return false;
+	}
 
-		char hypertableIDStr[PG_NAMEDATALEN] = { 0 };
+	if (relname[position - 5] != '_' || relname[position - 4] != 'c' ||
+		relname[position - 3] != 'h' || relname[position - 2] != 'u' ||
+		relname[position - 1] != 'n' || relname[position] != 'k')
+	{
+		return false;
+	}
 
-		/* Copy the hypertable id string into a temporary buffer */
-		sformat(hypertableIDStr, PG_NAMEDATALEN, "%s", prefixPosition);
+	position -= suffixLength;
 
-		/* Find the position of the first underscore after the hypertable id */
-		char *endptr = strchr(hypertableIDStr, '_');
-
-		/* Replace the underscore with a null character */
-		*endptr = '\0';
-
-		if (!stringToUInt32(hypertableIDStr, hypertableID))
+	/*
+	 * Find the previous _ after "_chunk".
+	 */
+	while (position >= 0)
+	{
+		if (relname[position] == '_')
 		{
-			log_error("Failed to parse hypertable id from %s", input);
-			return false;
+			*prefixPosition = position;
+			return true;
 		}
-		return true;
+
+		position--;
 	}
 
 	return false;
@@ -191,58 +297,63 @@ extract_hypertable_id(const char *input, uint32_t *hypertableID)
 
 
 bool
-timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
-							  char *nspname_out,
-							  char *relname_out)
+timescale_chunk_to_hypertable(const LogicalMessageRelation *chunk,
+							  LogicalMessageRelation *result)
 {
-	if (!isTimescale)
+	if (!isTimescale || hypertableCache == NULL)
 	{
-		return true;
-	}
-
-	uint32_t targetHypertableID;
-
-	if (!extract_hypertable_id(relname_in, &targetHypertableID))
-	{
-		log_error("BUG: Failed to find hypertable id from %s.%s", nspname_in, relname_in);
 		return false;
 	}
 
-	ChunkHypertableMap *foundMapEntry;
+	int chunkPrefixPosition = 0;
 
-	HASH_FIND_INT(chunkHypertableMap, &targetHypertableID, foundMapEntry);
-
-	if (foundMapEntry == NULL)
+	if (!findChunkPrefixEndPos(chunk->relname, &chunkPrefixPosition))
 	{
-		log_error("Failed to find hypertable from map for %s.%s", nspname_in, relname_in);
 		return false;
 	}
 
-	log_trace("Found mapping for chunk %s.%s => %s.%s", nspname_in, relname_in,
-			  foundMapEntry->nspname, foundMapEntry->relname);
+	SourceHypertable_Lookup key = { 0 };
 
-	strlcpy(nspname_out, foundMapEntry->nspname, PG_NAMEDATALEN);
-	strlcpy(relname_out, foundMapEntry->relname, PG_NAMEDATALEN);
+	strlcpy(key.chunkSchema, chunk->nspname, PG_NAMEDATALEN);
+	strlcpy(key.chunkTablePrefix, chunk->relname, chunkPrefixPosition + 1);
+
+	SourceHypertable *hypertable = NULL;
+
+	HASH_FIND(hh,
+			  hypertableCache,
+			  &key,
+			  sizeof(SourceHypertable_Lookup),
+			  hypertable);
+
+	if (hypertable == NULL)
+	{
+		log_trace("Failed to find hypertable for chunk \"%s\".\"%s\"",
+				  key.chunkSchema, key.chunkTablePrefix);
+		return false;
+	}
+
+	result->nspname = strdup(hypertable->nspname);
+
+	if (result->nspname == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+
+		return false;
+	}
+
+	result->relname = strdup(hypertable->relname);
+
+	if (result->relname == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+
+		return false;
+	}
+
+	log_trace("Found hypertable \"%s\".\"%s\" for chunk \"%s\".\"%s\"",
+			  result->nspname, result->relname, chunk->nspname, chunk->relname);
+
 	return true;
-}
-
-
-bool
-timescale_is_chunk(const char *nspname_in, const char *relname_in)
-{
-	if (!isTimescale)
-	{
-		return false;
-	}
-
-	/* Chunk will be always present in _timescaledb_internal schema */
-	if (streq(nspname_in, "_timescaledb_internal") &&
-		strstr(relname_in, "_hyper_"))
-	{
-		return true;
-	}
-
-	return false;
 }
 
 

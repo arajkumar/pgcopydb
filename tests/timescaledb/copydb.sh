@@ -72,14 +72,31 @@ where id >= 1000
 commit;
 EOF
 
+s=/tmp/fares-src.out
+t=/tmp/fares-tgt.out
+psql -o $s -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/fares.sql
+psql -o $t -d ${PGCOPYDB_TARGET_PGURI} -f /usr/src/pgcopydb/fares.sql
+
+diff $s $t
+
 # Insert some data into metrics hypertable. Since we have 1hr chunk,
 # we will have 3 chunks after this.
 psql -a ${PGCOPYDB_SOURCE_PGURI} <<EOF
 BEGIN;
     INSERT INTO metrics (id, time, name, value) VALUES
-    (1, now() - '1h'::interval, 'test-1', -1),
-    (2, now(), 'test', 0),
-    (3, now() + '1h'::interval, 'test+1', 1);
+    (1, '2024-07-23 04:44:51.466335+00', 'test-1', -1),
+    (2, '2024-07-23 05:44:51.466335+00', 'test', 0),
+    (3, '2024-07-23 06:44:51.466335+00', 'test+1', 1);
+COMMIT;
+EOF
+
+# Schema and chunk table prefix
+psql -a ${PGCOPYDB_SOURCE_PGURI} <<EOF
+BEGIN;
+    INSERT INTO "Foo"."MetricsWithPrefix" (id, time, name, value) VALUES
+    (1, '2024-07-23 04:44:51.466335+00', 'test-1', -1),
+    (2, '2024-07-23 05:44:51.466335+00', 'test', 0),
+    (3, '2024-07-23 06:44:51.466335+00', 'test+1', 1);
 COMMIT;
 EOF
 
@@ -95,25 +112,58 @@ test 3 -eq `psql -AtqX -d ${PGCOPYDB_SOURCE_PGURI} -c "${sql}"`
 # table to be truncated.
 psql -a ${PGCOPYDB_SOURCE_PGURI} <<EOF
 BEGIN;
-    SELECT drop_chunks('metrics', older_than => now());
+SELECT drop_chunks('metrics', older_than => '2024-07-23 05:44:51.466335+00'::timestamptz);
 COMMIT;
 EOF
 
+# grab the current LSN, it's going to be our streaming end position
+lsn=`psql -At -d ${PGCOPYDB_SOURCE_PGURI} -c 'select pg_current_wal_lsn()'`
+
+# and prefetch the changes captured in our replication slot
+pgcopydb stream prefetch --resume --endpos "${lsn}" -vv
+
+SHAREDIR=/var/lib/postgres/.local/share/pgcopydb
+WALFILE=000000010000000000000002.json
+SQLFILE=000000010000000000000002.sql
+
+# now compare JSON output, skipping the lsn and nextlsn fields which are
+# different at each run
+expected=/tmp/expected.json
+result=/tmp/result.json
+
+JQSCRIPT='del(.lsn) | del(.nextlsn) | del(.timestamp) | del(.xid) | del(.message.xid)'
+
+jq "${JQSCRIPT}" /usr/src/pgcopydb/${WALFILE} > ${expected}
+jq "${JQSCRIPT}" ${SHAREDIR}/${WALFILE} > ${result}
+
+# first command to provide debug information, second to stop when returns non-zero
+diff ${expected} ${result} || cat ${SHAREDIR}/${WALFILE}
+diff ${expected} ${result}
+
+# now prefetch the changes again, which should be a noop
+pgcopydb stream prefetch --resume --endpos "${lsn}" -vv
+
+# now transform the JSON file into SQL
+SQLFILENAME=`basename ${WALFILE} .json`.sql
+
+pgcopydb stream transform -vv ${SHAREDIR}/${WALFILE} /tmp/${SQLFILENAME}
+
+# we should get the same result as `pgcopydb stream prefetch`
+diff ${SHAREDIR}/${SQLFILE} /tmp/${SQLFILENAME} || (cat /tmp/${SQLFILENAME} && exit 1)
+
+# we should also get the same result as expected (discarding LSN numbers)
+DIFFOPTS='-I BEGIN -I COMMIT -I KEEPALIVE -I SWITCH -I ENDPOS'
+
+diff ${DIFFOPTS} /usr/src/pgcopydb/${SQLFILE} ${SHAREDIR}/${SQLFILENAME} || (cat ${SHAREDIR}/${SQLFILENAME} && exit 1)
+
+# now allow for replaying/catching-up changes
 pgcopydb stream sentinel set apply
 
-pgcopydb stream sentinel set endpos --current
+# now apply the SQL file to the target database
+pgcopydb stream catchup --resume --endpos "${lsn}" -vv
 
-pgcopydb follow -vv --resume
-
-kill -TERM ${COPROC_PID}
-wait ${COPROC_PID}
-
-s=/tmp/fares-src.out
-t=/tmp/fares-tgt.out
-psql -o $s -d ${PGCOPYDB_SOURCE_PGURI} -f /usr/src/pgcopydb/fares.sql
-psql -o $t -d ${PGCOPYDB_TARGET_PGURI} -f /usr/src/pgcopydb/fares.sql
-
-diff $s $t
+# now apply AGAIN the SQL file to the target database, skipping transactions
+pgcopydb stream catchup --resume --endpos "${lsn}" -vv
 
 # check replication of numeric data without precision loss.
 sql="select count(*) from metrics"
@@ -126,5 +176,12 @@ sql="select count(*) from metrics"
 test 3 -eq `psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}"`
 sql="select count(*) from show_chunks('metrics')"
 test 3 -eq `psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}"`
+
+# check that the schema and chunk table prefix is there
+sql="select count(*) from \"Foo\".\"MetricsWithPrefix\""
+test 3 -eq `psql -AtqX -d ${PGCOPYDB_TARGET_PGURI} -c "${sql}"`
+
+kill -TERM ${COPROC_PID}
+wait ${COPROC_PID}
 
 pgcopydb stream cleanup

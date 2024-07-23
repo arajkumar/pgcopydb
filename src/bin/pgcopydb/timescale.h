@@ -6,6 +6,8 @@
 #ifndef TIMESCALE_H
 #define TIMESCALE_H
 
+#include "ld_stream.h"
+
 #include "pgsql.h"
 
 bool timescale_init(PGSQL *pgsql, char *pguri);
@@ -14,14 +16,8 @@ bool timescale_init(PGSQL *pgsql, char *pguri);
  * Transforms if the given nspname and relname to hypertable it targets
  * the timescale chunk.
  */
-bool timescale_chunk_to_hypertable(const char *nspname_in, const char *relname_in,
-								   char *nspname_out,
-								   char *relname_out);
-
-/*
- * Checks whether the given relation is a timescale chunk table.
- */
-bool timescale_is_chunk(const char *nspname_in, const char *relname_in);
+bool timescale_chunk_to_hypertable(const LogicalMessageRelation *chunk,
+								   LogicalMessageRelation *result);
 
 /*
  * Checks whether to ignore the given nspname and relname.
