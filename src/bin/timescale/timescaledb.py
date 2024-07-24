@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 from multiprocessing import Pool
 
-from catalog import Catalog, Filter
+from catalog.pgcopydb import Catalog, Filter
 from psql import psql as psql_cmd
 
 logger = logging.getLogger(__name__)

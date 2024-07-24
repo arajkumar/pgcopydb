@@ -1,5 +1,4 @@
 import time
-import csv
 
 from psql import psql as psql_cmd
 

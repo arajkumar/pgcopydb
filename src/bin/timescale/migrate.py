@@ -18,7 +18,6 @@ from environ import LIVE_MIGRATION_DOCKER, env
 from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from filter import Filter
-from psql import psql as psql_cmd
 from exec import (
         Process,
         run_cmd,
@@ -28,7 +27,8 @@ from exec import (
         LogFile,
 )
 from timescaledb import create_hypertable_compatibility
-from catalog import Catalog
+from catalog.pgcopydb import Catalog
+from catalog import target
 
 logger = logging.getLogger(__name__)
 
@@ -51,97 +51,6 @@ def is_section_migration_complete(section):
 
 def mark_section_complete(section):
     Path(f"{env['PGCOPYDB_DIR']}/run/{section}-migration.done").touch()
-
-def convert_matview_to_view(conn):
-    query = """
-BEGIN;
-
-CREATE SCHEMA IF NOT EXISTS __live_migration;
-CREATE OR REPLACE FUNCTION __live_migration.skip_dml_function() RETURNS TRIGGER AS $$
-BEGIN
-    -- Do nothing and return NULL to skip the DML operation
-    RAISE INFO 'live-migration: Skipping % DML in MATERIALIZED VIEW %.%', TG_OP, TG_TABLE_SCHEMA, TG_TABLE_NAME;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-DO $$
-DECLARE
-    mv RECORD;
-    populated BOOLEAN;
-BEGIN
-    -- Create the audit table if it does not exist
-    CREATE TABLE IF NOT EXISTS __live_migration.matview_audit (
-        schemaname TEXT,
-        matviewname TEXT,
-        renamed BOOLEAN DEFAULT FALSE
-    );
-
-    SELECT COUNT(*) > 0 INTO populated FROM __live_migration.matview_audit;
-
-    -- Populate the audit table with materialized views if not already populated
-    IF populated = FALSE THEN
-        INSERT INTO __live_migration.matview_audit (schemaname, matviewname)
-        SELECT schemaname, matviewname
-        FROM pg_matviews;
-    END IF;
-
-    -- Loop through all materialized views in the current schema that have not been renamed
-    FOR mv IN
-        SELECT schemaname, matviewname
-        FROM __live_migration.matview_audit
-        WHERE NOT renamed
-    LOOP
-        -- Rename the materialized view with a live_migration_ prefix
-        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I RENAME TO %I', mv.schemaname, mv.matviewname, 'live_migration_' || mv.matviewname);
-
-        -- Update the audit table to mark the view as renamed
-        EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = true WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
-
-        -- Create a view to replace the materialized view
-        EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %I.%I', mv.schemaname, mv.matviewname, mv.schemaname, 'live_migration_' || mv.matviewname);
-        EXECUTE format('CREATE TRIGGER skip_dml_trigger
-                        INSTEAD OF INSERT OR UPDATE OR DELETE ON %I.%I
-                        FOR EACH ROW EXECUTE FUNCTION __live_migration.skip_dml_function()', mv.schemaname, mv.matviewname);
-    END LOOP;
-END $$;
-
-COMMIT;
-"""
-    psql_cmd(conn, query)
-    return True
-
-def restore_matview(conn):
-    query = """
-BEGIN;
-
-DO $$
-DECLARE
-    mv RECORD;
-BEGIN
-    -- Loop through all materialized views in the current schema that have not been renamed
-    FOR mv IN
-        SELECT schemaname, matviewname
-        FROM __live_migration.matview_audit
-        WHERE renamed
-    LOOP
-        -- Drop the view if it exists
-        EXECUTE format('DROP VIEW IF EXISTS %I.%I', mv.schemaname, mv.matviewname);
-
-        -- Rename the materialized view with a live_migration_ prefix
-        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I RENAME TO %I', mv.schemaname, 'live_migration_' || mv.matviewname, mv.matviewname);
-
-        -- Update the audit table to mark the view as renamed
-        EXECUTE format('UPDATE __live_migration.matview_audit SET renamed = false WHERE schemaname = %L AND matviewname = %L', mv.schemaname, mv.matviewname);
-
-    END LOOP;
-END $$;
-
-COMMIT;
-"""
-    psql_cmd(conn, query)
-    return True
-
 
 def create_follow(resume: bool = False):
     logger.info(f"Buffering live transactions from Source DB to {env['PGCOPYDB_DIR']}...")
@@ -213,7 +122,7 @@ def monitor_db_sizes() -> threading.Event:
                 # to panic and stop execution. To prevent this, the database size query is placed
                 # inside a try block to handle any temporary unavailability.
                 tgt_size = run_sql(execute_on_target=True, sql=DB_SIZE_SQL)[:-1]
-            except:
+            except Exception:
                 pass
             else:
                 logger.info(f"{tgt_size} copied to Target DB (Source DB is {src_size})")
@@ -678,8 +587,7 @@ def migrate(args):
 
         (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
 
-        logger.info("Converting materialized views to views ...")
-        convert_matview_to_view(args.target)
+        target.convert_matview_to_view(args.target)
 
         logger.info("Applying buffered transactions ...")
         run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
@@ -704,8 +612,7 @@ def migrate(args):
         logger.info("Copying sequences ...")
         copy_sequences()
 
-        logger.info("Restoring materialized views ...")
-        restore_matview(args.target)
+        target.restore_matview(args.target)
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")

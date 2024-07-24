@@ -12,8 +12,9 @@ from version import SCRIPT_VERSION, nudge_user_to_update
 from snapshot import snapshot
 from migrate import migrate
 from clean import clean
-from environ import pgcopydb_init_env, env
+from environ import pgcopydb_init_env
 from inspect_db import target_activity
+from catalog import target
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -167,6 +168,8 @@ def main():
 
     logger.info(f"Running live-migration {SCRIPT_VERSION}")
     nudge_user_to_update()
+
+    target.init(args.target)
 
     match args.command:
         case 'snapshot':
