@@ -64,8 +64,12 @@ def snapshot(args):
 
     if snapshot_id != '':
         logger.info(f"Snapshot {snapshot_id} created successfully.")
-        print("You can now start the migration process by running the following command:")
+        print("You can now start the migration process by running the "
+              "following command in a separate terminal:")
         print(docker_command("live-migration-migrate", "migrate"))
+        print()
+        print("Please do not close this terminal, or the migration "
+              "process will fail.")
 
         # TODO: Terminate the snapshot once the migration switches to
         # live replication.
@@ -74,6 +78,7 @@ def snapshot(args):
         except KeyboardInterrupt:
             process.terminate()
             process.wait()
+
         logger.info("Snapshot process completed.")
     else:
         logger.error("Snapshot creation failed.")
