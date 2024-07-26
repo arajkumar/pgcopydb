@@ -12,6 +12,8 @@ class Filter:
     EXCLUDE_EXTENSION = "exclude-extension"
     EXCLUDE_TABLE_DATA = "exclude-table-data"
     EXCLUDE_INDEX = "exclude-index"
+    EXCLUDE_SCHEMA = "exclude-schema"
+    EXCLUDE_TABLE = "exclude-table"
 
     def __init__(self):
         self._filter = defaultdict(set)
@@ -26,6 +28,19 @@ class Filter:
         for r in relation:
             if "." not in r:
                 raise Exception(f"Must be a fully qualified Postgres name(schema.relation): {r}")
+
+    def exclude_schema(self, schemas: list[str]):
+        """
+        Exclude schema from initial data migration.
+        """
+        self._filter[self.EXCLUDE_SCHEMA].update(schemas)
+
+    def exclude_table(self, tables: list[str]):
+        """
+        Exclude table from initial data migration.
+        """
+        self._check_schema(tables)
+        self._filter[self.EXCLUDE_TABLE].update(tables)
 
     def exclude_table_data(self, tables: list[str]):
         """

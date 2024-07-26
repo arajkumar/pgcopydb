@@ -70,6 +70,12 @@ def main():
     common.add_argument('--target', type=str,
                         help='Target connection string',
                         default=_pg_uri_from_env('TARGET', 'PGCOPYDB_TARGET_PGURI'))
+    common.add_argument('--migrate-across-timescaledb-versions',
+                        action='store_true',
+                        help='Migrate data across different TimescaleDB '
+                             'versions. This flag is applicable only when '
+                             'migrating data from TimescaleDB to '
+                             'TimescaleDB.')
 
 
     # snapshot
@@ -98,6 +104,7 @@ def main():
                                 help='Number of parallel jobs to copy "existing data" from source db to target db (Default: 8)')
     parser_migrate.add_argument('--index-jobs', default="8", type=str,
                                 help='Number of parallel jobs to create indexes in target db (Default: 8)')
+
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
     parser_migrate.add_argument('--skip-table-data',

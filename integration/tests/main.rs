@@ -6,9 +6,9 @@ use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::{tempdir, TempDir};
-use test_common::PgVersion::PG15;
+use test_common::PgVersion::{PG14, PG15};
 use test_common::PsqlInput::Sql;
-use test_common::TsVersion::{TS213, TS214};
+use test_common::TsVersion::{TS210, TS213, TS214};
 use test_common::{
     configure_cloud_setup, psql, timescaledb, DbAssert, HasConnectionString,
     InternalConnectionString, PgVersion, TsVersion,
@@ -192,6 +192,111 @@ fn test_end_to_end_migration() -> Result<()> {
     )?;
 
     target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
+
+#[test]
+fn test_cross_ext_version_ts2ts_migration() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG14, TS210, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+    // Drop and recreate timescaledb extension with older version using
+    // a different connection.
+    psql(
+        &source_container,
+        Sql(r"
+		DROP EXTENSION timescaledb;
+	"),
+    )?;
+
+    // Create timescaledb extension with older version.
+    psql(
+        &source_container,
+        Sql(r#"
+		CREATE EXTENSION timescaledb WITH VERSION "2.5.0";
+	"#),
+    )?;
+
+    // TODO: Add tests to verify partitioning using functions
+    psql(
+        &source_container,
+        Sql(r"
+		CREATE TABLE metrics(time timestamptz,
+							 id integer, value float8,
+							 primary key (time, id));
+		SELECT create_hypertable('metrics', 'time',
+								 chunk_time_interval => '1hr'::interval);
+		-- add 2nd dimension
+		SELECT add_dimension('metrics', 'id', number_partitions => 4);
+
+        INSERT INTO metrics(time, value, id) SELECT time, random(), (floor(random() * 10000) + 1) FROM generate_series('2024-01-01 00:00:00', '2024-02-01 00:00:00', INTERVAL'1 hour') as time;
+	"),
+    )?;
+
+    let mut source_assert = DbAssert::new(&source_container.connection_string())?;
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+
+    // assert that the source and target extensions are different
+    source_assert.is_true("SELECT EXISTS (SELECT extversion FROM pg_extension WHERE extname = 'timescaledb' AND extversion = '2.5.0')");
+    target_assert.is_true("SELECT EXISTS (SELECT extversion FROM pg_extension WHERE extname = 'timescaledb' AND extversion = '2.14.2')");
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((
+        snapshot_image,
+        vec![
+            String::from("snapshot"),
+            String::from("--migrate-across-timescaledb-versions"),
+        ],
+    ))
+    .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+
+    let migrate = RunnableImage::from((
+        migrate_image,
+        vec![
+            String::from("migrate"),
+            String::from("--migrate-across-timescaledb-versions"),
+        ],
+    ))
+    .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    // Verify that the dimensions are equal to 2
+    let dimension_query = "SELECT count(*) = 2 FROM timescaledb_information.dimensions WHERE hypertable_schema = 'public' AND hypertable_name = 'metrics'";
+    source_assert.is_true(dimension_query);
+    target_assert.is_true(dimension_query);
+
+    source_assert.has_table_count("public", "metrics", 745);
+    target_assert.has_table_count("public", "metrics", 745);
+
+    psql(&source_container, Sql(r"
+        INSERT INTO metrics(time, value, id) SELECT time, random(), (floor(random() * 10000) + 1) FROM generate_series('2024-02-01 00:00:00', '2024-03-01 00:00:00', INTERVAL'1 hour') as time;
+	")).expect("query should succeed");
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    source_assert.has_table_count("public", "metrics", 1442);
+    target_assert.has_table_count("public", "metrics", 1442);
 
     Ok(())
 }

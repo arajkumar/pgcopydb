@@ -29,7 +29,7 @@ def snapshot(args):
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(1)
 
-    validate_dbs()
+    validate_dbs(args)
 
     if LIVE_MIGRATION_DOCKER and not os.path.ismount(args.dir):
         logger.error("Volume mount not found. To proceed, mount a volume: '-v <host_dir>:%s'", args.dir)
@@ -74,9 +74,11 @@ def snapshot(args):
         except KeyboardInterrupt:
             process.terminate()
             process.wait()
+        logger.info("Snapshot process completed.")
     else:
         logger.error("Snapshot creation failed.")
         logger.error("You may need to cleanup and retry the snapshot creation.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean', '--prune'))
         sys.exit(process.returncode)
+

@@ -36,6 +36,7 @@ class timeit:
 class DBType(Enum):
     POSTGRES = 1
     TIMESCALEDB = 2
+    TIMESCALEDB_SKIP_VERSION = 3
 
 
 def get_dbtype(uri):

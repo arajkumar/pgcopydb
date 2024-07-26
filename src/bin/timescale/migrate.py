@@ -26,9 +26,13 @@ from exec import (
         print_logs_with_error,
         LogFile,
 )
-from timescaledb import create_hypertable_compatibility
-from catalog.pgcopydb import Catalog
-from catalog import target
+from catalog import (
+        target,
+        pgcopydb
+)
+from tsdb.postgres import create_hypertable_compatibility
+from tsdb.cross_version import CrossVersionMigration
+from tsdb.timescaledb import TimescaleDB
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +169,13 @@ def prepare_filters(args):
         logger.info("Skipping extensions: %s", skip_list)
         filter.exclude_extensions(skip_list)
 
+    if args.migrate_across_timescaledb_versions:
+        # Exclude timescaledb extension and hypertable chunks.
+        hypertables = TimescaleDB(args.source, get_snapshot_id(args.dir)).hypertables()
+        chunks = [c.table_name for ht in hypertables for c in ht.chunks()]
+        filter.exclude_table(chunks)
+        filter.exclude_extensions(["timescaledb"])
+
     filter_file = str(args.dir / "filter.ini")
 
     # Apply filters
@@ -173,6 +184,85 @@ def prepare_filters(args):
 
     pgcopydb_args.append(f"--filters={filter_file}")
     return pgcopydb_args
+
+
+@telemetry_command("migrate_existing_data_across_ts_versions")
+def migrate_existing_data_across_ts_versions(args):
+    filter_args = prepare_filters(args)
+
+    with timeit("Dump schema"):
+        dump_schema = " ".join(["pgcopydb",
+                                "dump",
+                                "schema",
+                                "--dir",
+                                "$PGCOPYDB_DIR/pgcopydb_clone",
+                                "--snapshot",
+                                "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--resume",
+                                ] + filter_args)
+        run_cmd(dump_schema, LogFile("dump_schema"))
+
+    with timeit("Restore pre-data"):
+        restore_pre_data = " ".join(["pgcopydb",
+                                     "restore",
+                                     "pre-data",
+                                     "--no-acl",
+                                     "--no-owner",
+                                     "--dir",
+                                     "$PGCOPYDB_DIR/pgcopydb_clone",
+                                     "--snapshot",
+                                     "$(cat $PGCOPYDB_DIR/snapshot)",
+                                     "--resume",
+                                     ] + filter_args)
+        run_cmd(restore_pre_data, LogFile("restore_pre_data"))
+
+    stop_progress = monitor_db_sizes()
+
+    pgcopydb_dir = args.dir / "pgcopydb_clone"
+
+    with timeit("Copy table data"):
+        clone_args = ["pgcopydb",
+                        "clone",
+                        "--table-jobs",
+                        args.table_jobs,
+                        "--index-jobs",
+                        args.index_jobs,
+                        "--split-tables-larger-than=1GB",
+                        "--notice",
+                        "--dir",
+                        str(pgcopydb_dir),
+                        "--resume",
+                        "--no-acl",
+                        "--no-owner",
+                        "--fail-fast",
+                        "--snapshot",
+                        get_snapshot_id(env['PGCOPYDB_DIR']),
+                    ] + filter_args
+        (Process(clone_args, "clone")
+            .with_logging()
+            # Use the same args for retry as for the actual command since the actual command has --resume.
+            .with_retry(retry_args=clone_args, max_retries=5, backoff=20)
+            .run()
+            .wait())
+
+        cross_migration = CrossVersionMigration(args)
+
+        if not cross_migration.validate():
+            sys.exit(1)
+
+        # Migrate hypertables from source to target. i.e. create hypertables
+        # based on the dimension info available on source to target.
+        cross_migration.migrate_hypertable_schema()
+
+        # Migrate hypertable data from source to target
+        # It suboptimal to do this post-data due to the existence of indexes
+        # and constraints on the hypertable. However, this is the best we can do
+        # given the current limitations of pgcopydb, because it truncates the
+        # target table before copying data.
+        cross_migration.migrate_hypertable_data()
+
+    stop_progress.set()
+
 
 @telemetry_command("migrate_existing_data_from_pg_to_tsdb")
 def migrate_existing_data_from_pg_to_tsdb(args):
@@ -220,7 +310,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
 
     pgcopydb_dir = args.dir / "pgcopydb_clone"
     # Apply the filter directly into the catalog
-    catalog = Catalog(dir=pgcopydb_dir)
+    catalog = pgcopydb.Catalog(dir=pgcopydb_dir)
     compatibility.apply_filters(catalog)
     catalog.update()
 
@@ -532,6 +622,9 @@ def migrate(args):
         source_type = DBType.POSTGRES
     if args.pg_target:
         target_type = DBType.POSTGRES
+    if args.migrate_across_timescaledb_versions:
+        source_type = DBType.TIMESCALEDB_SKIP_VERSION
+        target_type = DBType.TIMESCALEDB
 
     match (source_type, target_type):
         case (DBType.POSTGRES, DBType.POSTGRES):
@@ -540,6 +633,8 @@ def migrate(args):
             logger.info("Migrating from Postgres to TimescaleDB ...")
         case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
             logger.info("Migrating from TimescaleDB to TimescaleDB ...")
+        case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
+            logger.info("Migrating TimescaleDB to TimescaleDB(cross version) ....")
         case (DBType.TIMESCALEDB, DBType.POSTGRES):
             logger.info("Migration from TimescaleDB to Postgres is not supported")
             sys.exit(1)
@@ -580,6 +675,8 @@ def migrate(args):
                     # otherwise there are issues restoring indexes and
                     # foreign key constraints to chunks.
                     timescaledb_post_restore()
+                case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
+                    migrate_existing_data_across_ts_versions(args)
                 case (DBType.TIMESCALEDB, DBType.POSTGRES):
                     logger.error("Migration from TimescaleDB to Postgres is not supported")
                     sys.exit(1)

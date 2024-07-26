@@ -1,3 +1,8 @@
+"""
+Handles migration from PostgreSQL to TimescaleDB.
+
+This module is also responsible for checking the compatibility of indexes and constraints on the tables that are to be converted to hypertables.
+"""
 import logging
 
 from dataclasses import dataclass
@@ -9,7 +14,7 @@ from psql import psql as psql_cmd
 logger = logging.getLogger(__name__)
 
 
-def get_hypertable_dimensions(pguri) -> list[dict]:
+def get_hypertable_dimensions_agg(pguri) -> list[dict]:
     sql = """
 select
     hypertable_schema as nspname,
@@ -20,7 +25,6 @@ from timescaledb_information.dimensions group by 1, 2;
     dimensions = psql_cmd(conn=pguri,
                            sql=sql)
     return dimensions
-
 
 @dataclass
 class TableObjects:
@@ -412,7 +416,7 @@ You can do one of the following to resolve the issue:
                     catalog.remove_index(Filter(con.obj_idx_relid, con.kind, con.obj_name))
 
 def create_hypertable_compatibility(args):
-    hypertables = get_hypertable_dimensions(args.target)
+    hypertables = get_hypertable_dimensions_agg(args.target)
     hypertable_objs = []
     # Get indexes and constraints for hypertables
     for ht in hypertables:

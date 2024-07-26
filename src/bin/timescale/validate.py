@@ -72,11 +72,11 @@ def has_tables_without_pkey_replident() -> list[str]:
     return tables_with_no_pkey_and_replident
 
 
-def check_timescaledb_version():
-    result = run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
+def check_timescaledb_version(args):
+    result = run_cmd(psql(uri=args.source, sql="select extversion from pg_extension where extname = 'timescaledb';"))
     source_ts_version = str(result)[:-1]
 
-    result = run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI", sql="select extversion from pg_extension where extname = 'timescaledb';"))
+    result = run_cmd(psql(uri=args.target, sql="select extversion from pg_extension where extname = 'timescaledb';"))
     target_ts_version = str(result)[:-1]
 
     if source_ts_version != target_ts_version:
@@ -85,7 +85,7 @@ def check_timescaledb_version():
         sys.exit(1)
 
 
-def validate_dbs():
+def validate_dbs(args):
     wal_level = get_src_wal_level()
     if wal_level != "logical":
         logger.error(f"Live migration requires Source DB 'wal_level' to be 'logical'. Found: '{wal_level}'")
@@ -100,5 +100,8 @@ def validate_dbs():
         logger.error(f"Live migration requires the current user to have 'EXECUTE' permissions on pg_replication_origin functions in the Target DB")
         sys.exit(1)
 
-    if get_dbtype(env["PGCOPYDB_SOURCE_PGURI"]) == DBType.TIMESCALEDB:
-        check_timescaledb_version()
+    # We don't need to check TimescaleDB version if we are migrating
+    # across different TimescaleDB versions.
+    if (not args.migrate_across_timescaledb_versions and
+        get_dbtype(args.source) == DBType.TIMESCALEDB):
+        check_timescaledb_version(args)
