@@ -416,12 +416,42 @@ sed -i -E \
 
 
 @telemetry_command("migrate_existing_data")
-def migrate_existing_data(args):
+def migrate_existing_data(args, timescaledb: bool = True):
     logger.info("Copying table data ...")
 
     filter_args = prepare_filters(args)
 
-    clone_dir = args.dir / "pgcopydb_clone"
+    clone_dir = str(args.dir / "pgcopydb_clone")
+
+    with timeit("Dump schema"):
+        dump_schema = " ".join(["pgcopydb",
+                                "dump",
+                                "schema",
+                                "--dir",
+                                clone_dir,
+                                "--snapshot",
+                                "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--resume",
+                                ] + filter_args)
+        run_cmd(dump_schema, LogFile("dump_schema"))
+
+    with timeit("Restore pre-data"):
+        restore_pre_data = " ".join(["pgcopydb",
+                                     "restore",
+                                     "pre-data",
+                                     "--no-acl",
+                                     "--no-owner",
+                                     "--dir",
+                                     clone_dir,
+                                     "--snapshot",
+                                     "$(cat $PGCOPYDB_DIR/snapshot)",
+                                     "--resume",
+                                     ] + filter_args)
+        run_cmd(restore_pre_data, LogFile("restore_pre_data"))
+
+    if timescaledb:
+        timescaledb_pre_restore()
+
     clone_args = [
         "pgcopydb",
         "clone",
@@ -434,16 +464,12 @@ def migrate_existing_data(args):
         args.index_jobs,
         "--split-tables-larger-than=1GB",
         "--dir",
-        str(clone_dir),
+        clone_dir,
         "--snapshot",
         get_snapshot_id(env['PGCOPYDB_DIR']),
         "--notice",
+        "--resume",
     ] + filter_args
-
-    clone_retry_args = clone_args + ["--resume"]
-
-    if args.resume:
-        clone_args.append("--resume")
 
     stop_progress = monitor_db_sizes()
 
@@ -453,9 +479,16 @@ def migrate_existing_data(args):
             # The primary aim for using a retry here is to handle disk resize events.
             # We believe 95% of disk retries should complete within 5 minutes.
             # Hence, the below retry is for a total of 5 minutes, i.e., (1+2+...5) * 20 = 300 seconds.
-            .with_retry(retry_args=clone_retry_args, max_retries=5, backoff=20)
+            .with_retry(retry_args=clone_args, max_retries=5, backoff=20)
             .run()
             .wait())
+
+
+    if timescaledb:
+        # IMPORTANT: timescaledb_post_restore must come after post-data,
+        # otherwise there are issues restoring indexes and
+        # foreign key constraints to chunks.
+        timescaledb_post_restore()
 
     stop_progress.set()
 
@@ -665,16 +698,11 @@ def migrate(args):
             logger.info("Migrating existing data from Source DB to Target DB ...")
             match (source_type, target_type):
                 case (DBType.POSTGRES, DBType.POSTGRES):
-                    migrate_existing_data(args)
+                    migrate_existing_data(args=args, timescaledb=False)
                 case (DBType.POSTGRES, DBType.TIMESCALEDB):
                     migrate_existing_data_from_pg_to_tsdb(args)
                 case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
-                    timescaledb_pre_restore()
-                    migrate_existing_data(args)
-                    # IMPORTANT: timescaledb_post_restore must come after post-data,
-                    # otherwise there are issues restoring indexes and
-                    # foreign key constraints to chunks.
-                    timescaledb_post_restore()
+                    migrate_existing_data(args, timescaledb=True)
                 case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
                     migrate_existing_data_across_ts_versions(args)
                 case (DBType.TIMESCALEDB, DBType.POSTGRES):
