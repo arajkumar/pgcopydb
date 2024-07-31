@@ -416,7 +416,7 @@ sed -i -E \
 
 
 @telemetry_command("migrate_existing_data")
-def migrate_existing_data(args, timescaledb: bool = True):
+def migrate_existing_data(args, timescaledb: TimescaleDB = None):
     logger.info("Copying table data ...")
 
     filter_args = prepare_filters(args)
@@ -450,7 +450,7 @@ def migrate_existing_data(args, timescaledb: bool = True):
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
     if timescaledb:
-        timescaledb_pre_restore()
+       timescaledb.pre_restore()
 
     clone_args = [
         "pgcopydb",
@@ -488,7 +488,7 @@ def migrate_existing_data(args, timescaledb: bool = True):
         # IMPORTANT: timescaledb_post_restore must come after post-data,
         # otherwise there are issues restoring indexes and
         # foreign key constraints to chunks.
-        timescaledb_post_restore()
+        timescaledb.post_restore(disable_jobs=True)
 
     stop_progress.set()
 
@@ -590,7 +590,7 @@ def replication_origin_exists():
 
 def timescaledb_pre_restore():
     logger.info("Timescale pre-restore ...")
-    run_sql(execute_on_target=True, sql="select timescaledb_pre_restore();")
+    run_sql(execute_on_target=True, sql="select custom_schema.timescaledb_pre_restore();")
 
 
 def timescaledb_post_restore():
@@ -598,9 +598,9 @@ def timescaledb_post_restore():
     run_sql(execute_on_target=True,
             sql="""
             begin;
-            select public.timescaledb_post_restore();
+            select custom_schema.timescaledb_post_restore();
             -- disable all background jobs
-            select public.alter_job(job_id, scheduled => false)
+            select custom_schema.alter_job(job_id, scheduled => false)
             from timescaledb_information.jobs
             where job_id >= 1000;
             commit;
@@ -659,6 +659,7 @@ def migrate(args):
         source_type = DBType.TIMESCALEDB_SKIP_VERSION
         target_type = DBType.TIMESCALEDB
 
+    timescaledb: TimescaleDB = None
     match (source_type, target_type):
         case (DBType.POSTGRES, DBType.POSTGRES):
             logger.info("Migrating from Postgres to Postgres ...")
@@ -666,6 +667,7 @@ def migrate(args):
             logger.info("Migrating from Postgres to TimescaleDB ...")
         case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
             logger.info("Migrating from TimescaleDB to TimescaleDB ...")
+            timescaledb = TimescaleDB(args.target)
         case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
             logger.info("Migrating TimescaleDB to TimescaleDB(cross version) ....")
         case (DBType.TIMESCALEDB, DBType.POSTGRES):
@@ -698,11 +700,11 @@ def migrate(args):
             logger.info("Migrating existing data from Source DB to Target DB ...")
             match (source_type, target_type):
                 case (DBType.POSTGRES, DBType.POSTGRES):
-                    migrate_existing_data(args=args, timescaledb=False)
+                    migrate_existing_data(args=args, timescaledb=timescaledb)
                 case (DBType.POSTGRES, DBType.TIMESCALEDB):
                     migrate_existing_data_from_pg_to_tsdb(args)
                 case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
-                    migrate_existing_data(args, timescaledb=True)
+                    migrate_existing_data(args, timescaledb=timescaledb)
                 case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
                     migrate_existing_data_across_ts_versions(args)
                 case (DBType.TIMESCALEDB, DBType.POSTGRES):
@@ -741,7 +743,7 @@ def migrate(args):
 
         if source_type == DBType.TIMESCALEDB:
             logger.info("Enabling background jobs ...")
-            enable_user_background_jobs()
+            timescaledb.enable_jobs()
             if caggs_count > 0:
                 logger.info("Setting replica identity back to DEFAULT for caggs ...")
                 set_replica_identity_for_caggs('DEFAULT')

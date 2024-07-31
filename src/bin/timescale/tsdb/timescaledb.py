@@ -154,9 +154,73 @@ class Chunk:
 
 class TimescaleDB:
 
-    def __init__(self, conn, snapshot):
+    def __init__(self, conn, snapshot: str = None):
         self.conn = conn
         self.snapshot = snapshot
+
+        ext_info = self._ext_info()
+        self.version = ext_info["version"]
+        self.nspname = ext_info["nspname"]
+
+    def _ext_info(self) -> dict:
+        sql = """
+        SELECT
+            extversion as version,
+            FORMAT('%I', nspname) as nspname
+        FROM
+            pg_extension
+        JOIN
+            pg_namespace ON extnamespace = pg_namespace.oid
+        WHERE
+            extname = 'timescaledb';
+        """
+        result = psql(self.conn, sql)
+        return result[0]
+
+    def pre_restore(self):
+        """
+        Execute timescaledb_pre_restore()
+        """
+        sql = f"SELECT {self.nspname}.timescaledb_pre_restore();"
+        psql(self.conn, sql)
+
+    def post_restore(self, disable_jobs: bool = False):
+        """
+        Execute timescaledb_post_restore()
+        """
+        # TODO: Track the current scheduled state of the jobs and
+        # re-enable them after the restore.
+        if disable_jobs:
+            disable_jobs_sql = f"""
+                SELECT {self.nspname}.alter_job(job_id, scheduled => false)
+                FROM timescaledb_information.jobs
+                WHERE job_id >= 1000;
+            """
+        else:
+            disable_jobs_sql = ""
+
+        sql = f"""
+            BEGIN;
+
+            SELECT {self.nspname}.timescaledb_post_restore();
+            {disable_jobs_sql}
+
+            COMMIT;
+        """
+        psql(self.conn, sql)
+
+    def enable_jobs(self):
+        sql = f"""
+            BEGIN;
+
+            SELECT {self.nspname}.alter_job(job_id, scheduled => true)
+            FROM timescaledb_information.jobs
+            WHERE job_id >= 1000;
+            SELECT {self.nspname}.timescaledb_post_restore();
+
+            COMMIT;
+        """
+        psql(self.conn, sql)
 
     def _has_feature(self, feature_table: str, where: str = 'true') -> bool:
         sql = f"""

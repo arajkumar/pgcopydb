@@ -197,6 +197,86 @@ fn test_end_to_end_migration() -> Result<()> {
 }
 
 #[test]
+fn test_end_to_end_migration_non_public_ext_schema() -> Result<()> {
+    let _ = pretty_env_logger::try_init();
+
+    let docker = Cli::default();
+
+    let network_name = generate_test_network_name();
+
+    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let target_container = start_target(&docker, PG15, TS214, &network_name);
+
+	// Drop and recreate timescaledb extension with schema "CustomSchema".
+	psql(
+		&source_container,
+		Sql(r"
+		DROP EXTENSION IF EXISTS timescaledb CASCADE;
+	"),
+	)?;
+
+	// We need a different connection to create the extension.
+	psql(
+		&source_container,
+		Sql(r#"
+		CREATE SCHEMA IF NOT EXISTS "CustomSchema";
+		CREATE EXTENSION timescaledb WITH SCHEMA "CustomSchema";
+	"#),
+	)?;
+
+    psql(
+        &source_container,
+        Sql(r#"
+		CREATE TABLE metrics(time timestamptz primary key, value float8);
+		SELECT "CustomSchema".create_hypertable('metrics', 'time');
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+	"#),
+    )?;
+
+    let temp_dir = tempdir().unwrap();
+
+    let snapshot_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stdout(
+            "You can now start the migration process",
+        ));
+
+    let snapshot = RunnableImage::from((snapshot_image, vec![String::from("snapshot")]))
+        .with_network(&network_name);
+    let _snapshot = docker.run(snapshot);
+
+    let migrate_image = live_migration_image(&temp_dir, &source_container, &target_container)
+        .with_wait_for(WaitFor::message_on_stderr("Applying buffered transactions"));
+
+    let migrate = RunnableImage::from((migrate_image, vec![String::from("migrate")]))
+        .with_network(&network_name);
+    let _migrate = docker.run(migrate);
+
+    let mut source_assert = DbAssert::new(&source_container.connection_string())?;
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+
+    source_assert.has_table_count("public", "metrics", 744);
+    target_assert.has_table_count("public", "metrics", 744);
+
+    psql(&source_container, Sql(r"
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
+	")).expect("query should succeed");
+
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    source_assert.has_table_count("_timescaledb_catalog", "hypertable", 1);
+    target_assert.has_table_count("_timescaledb_catalog", "hypertable", 1);
+
+    source_assert.has_table_count("public", "metrics", 1440);
+    target_assert.has_table_count("public", "metrics", 1440);
+
+    Ok(())
+}
+
+#[test]
 fn test_cross_ext_version_ts2ts_migration() -> Result<()> {
     let _ = pretty_env_logger::try_init();
 
