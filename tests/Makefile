@@ -8,7 +8,6 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-wal2json cdc-test-decoding cdc-endpos-between-transaction cdc-low-level \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 timescaledb timescaledb-test-decoding \
-	 cdc-generated-column \
 	 target-only-partition \
 	 target-only-timescaledb-hypertable \
 	 endpos-in-multi-wal-txn;
@@ -64,9 +63,6 @@ timescaledb: build
 timescaledb-test-decoding: build
 	$(MAKE) -C $@
 
-cdc-generated-column: build
-	$(MAKE) -C $@
-
 target-only-partition: build
 	$(MAKE) -C $@
 
@@ -82,6 +78,5 @@ build:
 .PHONY: follow-wal2json follow-9.6
 .PHONY: endpos-in-multi-wal-txn
 .PHONY: timescaledb timescaledb-test-decoding
-.PHONY: cdc-generated-column
 .PHONY: target-only-partition
 .PHONY: target-only-timescaledb-hypertable

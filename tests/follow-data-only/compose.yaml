@@ -1,11 +1,8 @@
-version: "3.9"  # optional since v1.27.0
 services:
   source:
     build:
       context: .
       dockerfile: Dockerfile.pg
-      args:
-        - PGVERSION
     expose:
       - 5432
     environment:
@@ -14,8 +11,6 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust
     command: >
       -c wal_level=logical
-      -c max_replication_slots=4
-      -c max_wal_senders=4
       -c ssl=on
       -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
       -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
@@ -36,7 +31,6 @@ services:
       context: .
       dockerfile: Dockerfile.inject
     environment:
-      PGVERSION:
       PGSSLMODE: "require"
       PGCOPYDB_SOURCE_PGURI: postgres://postgres:h4ckm3@source/postgres
       PGCOPYDB_TARGET_PGURI: postgres://postgres:h4ckm3@target/postgres
@@ -47,13 +41,11 @@ services:
   test:
     build: .
     environment:
-      PGVERSION:
       PGSSLMODE: "require"
       PGCOPYDB_SOURCE_PGURI: postgres://postgres:h4ckm3@source/postgres
       PGCOPYDB_TARGET_PGURI: postgres://postgres:h4ckm3@target/postgres
       PGCOPYDB_TABLE_JOBS: 4
       PGCOPYDB_INDEX_JOBS: 2
-      PGCOPYDB_SPLIT_TABLES_LARGER_THAN: 200kB
       TMPDIR: /var/run/pgcopydb
     # share TMPDIR between inject and test services
     volumes:

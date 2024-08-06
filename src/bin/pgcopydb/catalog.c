@@ -186,7 +186,10 @@ static char *sourceDBcreateDDLs[] = {
 	"create table sentinel("
 	"  id integer primary key check (id = 1), "
 	"  startpos pg_lsn, endpos pg_lsn, apply bool, "
-	" write_lsn pg_lsn, flush_lsn pg_lsn, replay_lsn pg_lsn)"
+	" write_lsn pg_lsn, flush_lsn pg_lsn, replay_lsn pg_lsn)",
+
+	"create table timeline_history("
+	"  tli integer primary key, startpos pg_lsn, endpos pg_lsn)"
 };
 
 
@@ -437,7 +440,8 @@ static char *sourceDBdropDDLs[] = {
 	"drop table if exists s_table_parts_done",
 	"drop table if exists s_table_indexes_done",
 
-	"drop table if exists sentinel"
+	"drop table if exists sentinel",
+	"drop table if exists timeline_history"
 };
 
 
@@ -3038,35 +3042,6 @@ catalog_iter_s_table_nopk_init(SourceTableIterator *iter)
 
 
 /*
- * catalog_iter_s_generated_column_next fetches the next GeneratedColumn entry
- * in our catalogs.
- */
-bool
-catalog_iter_s_generated_column_next(GeneratedColumnIterator *iter)
-{
-	SQLiteQuery *query = &(iter->query);
-
-	int rc = catalog_sql_step(query);
-
-	if (rc == SQLITE_DONE)
-	{
-		iter->column = NULL;
-
-		return true;
-	}
-
-	if (rc != SQLITE_ROW)
-	{
-		log_error("Failed to step through statement: %s", query->sql);
-		log_error("[SQLite] %s", sqlite3_errmsg(query->db));
-		return false;
-	}
-
-	return catalog_s_generated_column_fetch(query);
-}
-
-
-/*
  * catalog_iter_s_table_next fetches the next SourceTable entry in our catalogs.
  */
 bool
@@ -3091,43 +3066,6 @@ catalog_iter_s_table_next(SourceTableIterator *iter)
 	}
 
 	return catalog_s_table_fetch(query);
-}
-
-
-/*
- * catalog_s_generated_column_fetch fetches a GeneratedColumn entry from
- * a SQLite ppStmt result set.
- */
-bool
-catalog_s_generated_column_fetch(SQLiteQuery *query)
-{
-	GeneratedColumn *column = (GeneratedColumn *) query->context;
-
-	/* cleanup the memory area before re-use */
-	bzero(column, sizeof(GeneratedColumn));
-
-	if (sqlite3_column_type(query->ppStmt, 0) != SQLITE_NULL)
-	{
-		strlcpy(column->nspname,
-				(char *) sqlite3_column_text(query->ppStmt, 0),
-				sizeof(column->nspname));
-	}
-
-	if (sqlite3_column_type(query->ppStmt, 1) != SQLITE_NULL)
-	{
-		strlcpy(column->relname,
-				(char *) sqlite3_column_text(query->ppStmt, 1),
-				sizeof(column->relname));
-	}
-
-	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
-	{
-		strlcpy(column->attname,
-				(char *) sqlite3_column_text(query->ppStmt, 2),
-				sizeof(column->attname));
-	}
-
-	return true;
 }
 
 
@@ -3246,25 +3184,6 @@ catalog_s_table_fetch(SQLiteQuery *query)
 	{
 		table->durationMs = sqlite3_column_int64(query->ppStmt, 20);
 		table->bytesTransmitted = sqlite3_column_int64(query->ppStmt, 21);
-	}
-
-	return true;
-}
-
-
-/*
- * catalog_iter_s_generated_column_finish cleans-up the internal memory used
- * for the iteration.
- */
-bool
-catalog_iter_s_generated_column_finish(GeneratedColumnIterator *iter)
-{
-	SQLiteQuery *query = &(iter->query);
-
-	if (!catalog_sql_finalize(query))
-	{
-		/* errors have already been logged */
-		return false;
 	}
 
 	return true;
@@ -7789,6 +7708,171 @@ catalog_count_summary_done_fetch(SQLiteQuery *query)
 
 
 /*
+ * catalog_add_timeline_history inserts a timeline history entry to our
+ * internal catalogs database.
+ */
+bool
+catalog_add_timeline_history(DatabaseCatalog *catalog, TimelineHistoryEntry *entry)
+{
+	if (catalog == NULL)
+	{
+		log_error("BUG: catalog_add_timeline_history: catalog is NULL");
+		return false;
+	}
+
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_add_timeline_history: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"insert or replace into timeline_history(tli, startpos, endpos)"
+		"values($1, $2, $3)";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char slsn[PG_LSN_MAXLENGTH] = { 0 };
+	char elsn[PG_LSN_MAXLENGTH] = { 0 };
+
+	sformat(slsn, sizeof(slsn), "%X/%X", LSN_FORMAT_ARGS(entry->begin));
+	sformat(elsn, sizeof(elsn), "%X/%X", LSN_FORMAT_ARGS(entry->end));
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT, "tli", entry->tli, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "startpos", 0, slsn },
+		{ BIND_PARAMETER_TYPE_TEXT, "endpos", 0, elsn }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which does not return any row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_lookup_timeline_history fetches the current TimelineHistoryEntry
+ * from our catalogs.
+ */
+bool
+catalog_lookup_timeline_history(DatabaseCatalog *catalog,
+								int tli,
+								TimelineHistoryEntry *entry)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_lookup_timeline_history: db is NULL");
+		return false;
+	}
+
+	SQLiteQuery query = {
+		.context = entry,
+		.fetchFunction = &catalog_timeline_history_fetch
+	};
+
+	char *sql =
+		"  select tli, startpos, endpos"
+		"    from timeline_history"
+		"   where tli = $1";
+
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* bind our parameters now */
+	BindParam params[] = {
+		{ BIND_PARAMETER_TYPE_INT, "tli", tli, NULL }
+	};
+
+	int count = sizeof(params) / sizeof(params[0]);
+
+	if (!catalog_sql_bind(&query, params, count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* now execute the query, which return exactly one row */
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_timeline_history_fetch fetches a TimelineHistoryEntry from a query
+ * ppStmt result.
+ */
+bool
+catalog_timeline_history_fetch(SQLiteQuery *query)
+{
+	TimelineHistoryEntry *entry = (TimelineHistoryEntry *) query->context;
+
+	bzero(entry, sizeof(TimelineHistoryEntry));
+
+	/* tli */
+	entry->tli = sqlite3_column_int(query->ppStmt, 0);
+
+	/* begin LSN */
+	if (sqlite3_column_type(query->ppStmt, 1) != SQLITE_NULL)
+	{
+		const char *startpos = (const char *) sqlite3_column_text(query->ppStmt, 1);
+
+		if (!parseLSN(startpos, &entry->begin))
+		{
+			log_error("Failed to parse LSN from \"%s\"", startpos);
+			return false;
+		}
+	}
+
+	/* end LSN */
+	if (sqlite3_column_type(query->ppStmt, 2) != SQLITE_NULL)
+	{
+		const char *endpos = (const char *) sqlite3_column_text(query->ppStmt, 2);
+
+		if (!parseLSN(endpos, &entry->end))
+		{
+			log_error("Failed to parse LSN from \"%s\"", endpos);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * catalog_execute executes sqlite query
  */
 bool
@@ -8044,105 +8128,6 @@ catalog_sql_step(SQLiteQuery *query)
 
 
 /*
- * catalog_iter_s_generated_column iterates over the list of tables that
- * have a generated columns in our catalogs.
- */
-bool
-catalog_iter_s_generated_column(DatabaseCatalog *catalog,
-								void *context,
-								GeneratedColumnIterFun *callback)
-{
-	GeneratedColumnIterator *iter =
-		(GeneratedColumnIterator *) calloc(1, sizeof(GeneratedColumnIterator));
-
-	iter->catalog = catalog;
-
-	if (!catalog_iter_s_generated_column_init(iter))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	for (;;)
-	{
-		if (!catalog_iter_s_generated_column_next(iter))
-		{
-			/* errors have already been logged */
-			return false;
-		}
-
-		GeneratedColumn *column = iter->column;
-
-		if (column == NULL)
-		{
-			if (!catalog_iter_s_generated_column_finish(iter))
-			{
-				/* errors have already been logged */
-				return false;
-			}
-
-			break;
-		}
-
-		/* now call the provided callback */
-		if (!(*callback)(context, column))
-		{
-			log_error("Failed to iterate over list of tables, "
-					  "see above for details");
-			return false;
-		}
-	}
-
-
-	return true;
-}
-
-
-/*
- * catalog_iter_s_generated_column_init initializes an Interator over our
- * catalog of GeneratedColumn.
- */
-bool
-catalog_iter_s_generated_column_init(GeneratedColumnIterator *iter)
-{
-	sqlite3 *db = iter->catalog->db;
-
-	if (db == NULL)
-	{
-		log_error("BUG: Failed to initialize s_table iterator: db is NULL");
-		return false;
-	}
-
-	iter->column = (GeneratedColumn *) calloc(1, sizeof(GeneratedColumn));
-
-	if (iter->column == NULL)
-	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		return false;
-	}
-
-	char *sql =
-		"  select nspname, relname, attname "
-		"    from s_attr a"
-		"      join s_table t on t.oid = a.oid "
-		"   where a.attisgenerated";
-
-	SQLiteQuery *query = &(iter->query);
-
-	query->context = iter->column;
-	query->fetchFunction = &catalog_s_generated_column_fetch;
-
-	if (!catalog_sql_prepare(db, sql, query))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	return true;
-}
-
-
-/*
  * catalog_sql_finalize finalizes a SQL query.
  */
 bool
@@ -8336,4 +8321,119 @@ catalog_stop_timing(TopLevelTiming *timing)
 						 timing->ppDuration,
 						 INTSTRING_MAX_DIGITS);
 	}
+}
+
+
+/*
+ * catalog_iter_s_table_generated_columns iterates over the list of tables that
+ * have a generated columns in our catalogs.
+ */
+bool
+catalog_iter_s_table_generated_columns(DatabaseCatalog *catalog,
+									   void *context,
+									   SourceTableIterFun *callback)
+{
+	SourceTableIterator *iter =
+		(SourceTableIterator *) calloc(1, sizeof(SourceTableIterator));
+
+	iter->catalog = catalog;
+
+	if (!catalog_iter_s_table_generated_columns_init(iter))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (;;)
+	{
+		if (!catalog_iter_s_table_next(iter))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		SourceTable *table = iter->table;
+
+		if (table == NULL)
+		{
+			if (!catalog_iter_s_table_finish(iter))
+			{
+				/* errors have already been logged */
+				return false;
+			}
+
+			break;
+		}
+
+		/* now call the provided callback */
+		if (!(*callback)(context, table))
+		{
+			log_error("Failed to iterate over list of tables, "
+					  "see above for details");
+			return false;
+		}
+	}
+
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_s_table_generated_columns_init initializes an Interator over our
+ * catalog of SourceTable entries which has generated columns.
+ */
+bool
+catalog_iter_s_table_generated_columns_init(SourceTableIterator *iter)
+{
+	sqlite3 *db = iter->catalog->db;
+
+	if (db == NULL)
+	{
+		log_error(
+			"BUG: Failed to initialize catalog_iter_s_table_generated_columns_init iterator: db is NULL");
+		return false;
+	}
+
+	iter->table = (SourceTable *) calloc(1, sizeof(SourceTable));
+
+	if (iter->table == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	char *sql =
+		"  select t.oid, qname, nspname, relname, amname, restore_list_name, "
+		"         relpages, reltuples, ts.bytes, ts.bytes_pretty, "
+		"         exclude_data, part_key, "
+		"         (select count(1) from s_table_part p where p.oid = t.oid) "
+		"    from s_table t join s_attr a "
+
+		/*
+		 * Currently, we handle only:
+		 * - Generated columns with is_generated = 'ALWAYS' for INSERT and UPDATE
+		 * - IDENTITY columns for INSERT using "overriding system value"
+		 *
+		 * TODO: Add support for IDENTITY columns in UPDATE.
+		 * https://github.com/dimitri/pgcopydb/issues/844
+		 */
+		"       on (a.oid = t.oid and a.attisgenerated = 1) "
+		"       left join s_table_size ts on ts.oid = t.oid "
+		"group by t.oid "
+		"  having sum(a.attisgenerated) > 0 "
+		"order by bytes desc";
+
+	SQLiteQuery *query = &(iter->query);
+
+	query->context = iter->table;
+	query->fetchFunction = &catalog_s_table_fetch;
+
+	if (!catalog_sql_prepare(db, sql, query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return true;
 }

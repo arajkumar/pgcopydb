@@ -141,7 +141,7 @@ getHypertables(void *ctx, PGresult *res)
 		unsigned keylen = offsetof(SourceHypertable, chunkTablePrefix) + /* offset of last key field */
 						  sizeof(hypertable->chunkTablePrefix) - /* size of last key field */
 						  offsetof(SourceHypertable, chunkSchema); /* offset of first key field */
-		/* Add the table to the GeneratedColumnsCache. */
+		/* Add the table to the hypertableCache. */
 		HASH_ADD(hh,
 				 hypertableCache,
 				 chunkSchema,
