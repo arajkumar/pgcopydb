@@ -1,4 +1,4 @@
-# that image is built by docker-compose build: project-service
+# that image is built by docker compose build: project-service
 FROM pagila
 
 WORKDIR /usr/src/pgcopydb
@@ -10,4 +10,4 @@ COPY ./expected ./test/expected
 
 USER docker
 WORKDIR /usr/src/pgcopydb/test/
-CMD /usr/src/pgcopydb/copydb.sh
+CMD ["/usr/src/pgcopydb/copydb.sh"]

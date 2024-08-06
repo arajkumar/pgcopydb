@@ -55,32 +55,27 @@ static bool canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 static bool coalesceLogicalTransactionStatement(LogicalTransaction *txn,
 												LogicalTransactionStatement *new);
 
-static bool removeGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
-												  LogicalTransaction *txn);
-static bool removeGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
-												LogicalTransactionStatement *stmt);
+static bool markGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
+												LogicalTransaction *txn);
+static bool markGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
+											  LogicalTransactionStatement *stmt);
 
-static void createFQColumnName(FQColumnName *qColumnName,
-							   const char *schema,
-							   const char *table,
-							   const char *column);
-
-static bool populateGeneratedColumnCache(void *ctx, GeneratedColumn *column);
+static bool prepareGeneratedColumnsCache_hook(void *ctx, SourceTable *table);
 
 static bool prepareGeneratedColumnsCache(StreamSpecs *specs);
 
-static bool isGeneratedColumn(GeneratedColumnsCache *cache,
-							  const char *schema,
-							  const char *table,
-							  const char *column);
+static bool isGeneratedColumn(GeneratedColumnSet *columns, const char *attname);
+
+static GeneratedColumnSet * lookupGeneratedColumnsForTable(GeneratedColumnsCache *cache,
+														   const char *nspname,
+														   const char *relname);
 
 /*
- * stream_transform_context_init_pgsql initializes StreamContext's
- * transformPGSQL and opens a connection to the target. This is required to use
- * PQescapeIdentifier API of libpq when escaping identifiers
+ * stream_transform_context_init initializes StreamContext for the transform
+ * operation.
  */
 bool
-stream_transform_context_init_pgsql(StreamSpecs *specs)
+stream_transform_context_init(StreamSpecs *specs)
 {
 	StreamContext *privateContext = &(specs->private);
 
@@ -101,6 +96,16 @@ stream_transform_context_init_pgsql(StreamSpecs *specs)
 		return false;
 	}
 
+	/*
+	 * Prepare the generated columns cache, which helps to skip the generated
+	 * columns in the SQL output.
+	 */
+	if (!prepareGeneratedColumnsCache(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	return true;
 }
 
@@ -113,7 +118,7 @@ stream_transform_context_init_pgsql(StreamSpecs *specs)
 bool
 stream_transform_stream(StreamSpecs *specs)
 {
-	if (!stream_transform_context_init_pgsql(specs))
+	if (!stream_transform_context_init(specs))
 	{
 		/* errors have already been logged */
 		return false;
@@ -276,25 +281,14 @@ stream_transform_resume(StreamSpecs *specs)
 		return false;
 	}
 
-	/*
-	 * Prepare the generated columns cache, which helps to skip the generated
-	 * columns in the SQL output.
-	 */
-	if (!prepareGeneratedColumnsCache(specs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	/* we need timeline and wal_segment_size to compute WAL filenames */
 	if (specs->system.timeline == 0)
 	{
-		if (!stream_read_context(&(specs->paths),
-								 &(specs->system),
-								 &(specs->WalSegSz)))
+		if (!stream_read_context(specs))
 		{
 			log_error("Failed to read the streaming context information "
-					  "from the source database, see above for details");
+					  "from the source database and internal catalogs, "
+					  "see above for details");
 			return false;
 		}
 	}
@@ -470,15 +464,17 @@ stream_transform_write_message(StreamContext *privateContext,
 	}
 
 	/*
-	 * Before serializing the transaction to disk or stdout, we need to remove
-	 * the generated columns from the transaction, as they are not supposed to
-	 * be part of the SQL output.
+	 * Before serializing the transaction to disk or stdout, we need to find
+	 * the generated columns from the transactionn and mark them as such.
+	 *
+	 * It will help to set the value of the generated columns to DEFAULT in the
+	 * SQL output.
 	 */
 	GeneratedColumnsCache *cache = privateContext->generatedColumnsCache;
 
 	if (currentMsg->isTransaction && cache != NULL)
 	{
-		if (!removeGeneratedColumnsFromTransaction(cache, txn))
+		if (!markGeneratedColumnsFromTransaction(cache, txn))
 		{
 			/* errors have already been logged */
 			return false;
@@ -673,9 +669,9 @@ stream_transform_worker(StreamSpecs *specs)
 	 * The timeline and wal segment size are determined when connecting to the
 	 * source database, and stored to local files at that time. When the Stream
 	 * Transform Worker process is created, that information is read from our
-	 * local files.
+	 * local files and internal catalogs.
 	 */
-	if (!stream_read_context(&(specs->paths), &(specs->system), &(specs->WalSegSz)))
+	if (!stream_read_context(specs))
 	{
 		if (asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
@@ -684,7 +680,8 @@ stream_transform_worker(StreamSpecs *specs)
 		}
 
 		log_error("Failed to read the streaming context information "
-				  "from the source database, see above for details");
+				  "from the source database and internal catalogs, "
+				  "see above for details");
 		return false;
 	}
 
@@ -708,18 +705,7 @@ stream_transform_from_queue(StreamSpecs *specs)
 		return false;
 	}
 
-	if (!stream_transform_context_init_pgsql(specs))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
-	/*
-	 *
-	 * Prepare the generated columns cache, which helps to skip the generated
-	 * columns in the SQL output.
-	 */
-	if (!prepareGeneratedColumnsCache(specs))
+	if (!stream_transform_context_init(specs))
 	{
 		/* errors have already been logged */
 		return false;
@@ -993,16 +979,6 @@ stream_transform_file(StreamSpecs *specs, char *jsonfilename, char *sqlfilename)
 	if (privateContext->sqlFile == NULL)
 	{
 		log_error("Failed to open file \"%s\"", tempfilename);
-		return false;
-	}
-
-	/*
-	 * Prepare the generated columns cache, which helps to skip the generated
-	 * columns in the SQL output.
-	 */
-	if (!prepareGeneratedColumnsCache(specs))
-	{
-		/* errors have already been logged */
 		return false;
 	}
 
@@ -1522,7 +1498,7 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	LogicalMessageTuple *newInsertColumns = newInsert->new.array;
 
 	/* Last and current statements must have same number of columns */
-	if (lastInsertColumns->cols != newInsertColumns->cols)
+	if (lastInsertColumns->attributes.count != newInsertColumns->attributes.count)
 	{
 		return false;
 	}
@@ -1538,7 +1514,7 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 	 * TODO: This parameter limit check is not applicable for COPY operations.
 	 * It should be removed once we switch to using COPY.
 	 */
-	if (((lastValuesArray->count + 1) * lastInsertColumns->cols) >
+	if (((lastValuesArray->count + 1) * lastInsertColumns->attributes.count) >
 		PQ_QUERY_PARAM_MAX_LIMIT)
 	{
 		return false;
@@ -1546,9 +1522,11 @@ canCoalesceLogicalTransactionStatement(LogicalTransaction *txn,
 
 
 	/* Last and current statements cols must have same name and order */
-	for (int i = 0; i < lastInsertColumns->cols; i++)
+	for (int i = 0; i < lastInsertColumns->attributes.count; i++)
 	{
-		if (!streq(lastInsertColumns->columns[i], newInsertColumns->columns[i]))
+		LogicalMessageAttribute *lastAttr = &(lastInsertColumns->attributes.array[i]);
+		LogicalMessageAttribute *newAttr = &(newInsertColumns->attributes.array[i]);
+		if (!streq(lastAttr->attname, newAttr->attname))
 		{
 			return false;
 		}
@@ -1631,23 +1609,25 @@ streamLogicalTransactionAppendStatement(LogicalTransaction *txn,
 bool
 AllocateLogicalMessageTuple(LogicalMessageTuple *tuple, int count)
 {
-	tuple->cols = count;
+	tuple->attributes.count = count;
 
 	if (count == 0)
 	{
-		tuple->columns = NULL;
-
 		LogicalMessageValuesArray *valuesArray = &(tuple->values);
 		valuesArray->count = 0;
 		valuesArray->capacity = 0;
 		valuesArray->array = NULL;
 
+		tuple->attributes.array = NULL;
+
 		return true;
 	}
 
-	tuple->columns = (char **) calloc(count, sizeof(char *));
+	tuple->attributes.array = (LogicalMessageAttribute *) calloc(count,
+																 sizeof(
+																	 LogicalMessageAttribute));
 
-	if (tuple->columns == NULL)
+	if (tuple->attributes.array == NULL)
 	{
 		log_error(ALLOCATION_FAILED_ERROR);
 		return false;
@@ -2099,11 +2079,17 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 		/* loop over column names and add them to the out stream */
 		appendPQExpBuffer(buf, "%s", "(");
 
-		for (int c = 0; c < stmt->cols; c++)
+		LogicalMessageAttribute *attr = &(stmt->attributes.array[0]);
+
+		for (int c = 0; c < stmt->attributes.count; c++)
 		{
-			appendPQExpBuffer(buf, "%s%s",
-							  c > 0 ? ", " : "",
-							  stmt->columns[c]);
+			/* skip generated columns */
+			if (!attr[c].isgenerated)
+			{
+				appendPQExpBuffer(buf, "%s%s",
+								  c > 0 ? ", " : "",
+								  attr[c].attname);
+			}
 		}
 
 		appendPQExpBuffer(buf, "%s", ")");
@@ -2138,15 +2124,26 @@ stream_write_insert(FILE *out, LogicalMessageInsert *insert)
 			{
 				LogicalMessageValue *value = &(values->array[v]);
 
-				appendPQExpBuffer(buf, "%s$%d",
-								  v > 0 ? ", " : "",
-								  ++pos);
-
-				if (!stream_add_value_in_json_array(value, jsArray))
+				/*
+				 * Instead of skipping the generated column, we could have
+				 * set the value to DEFAULT. But, PG13 doesn't allow multi
+				 * value INSERT with DEFAULT for generated columns.
+				 *
+				 * TODO: Once we stop supporting PG13, set the value to DEFAULT
+				 * for generated columns similar to UPDATE.
+				 */
+				if (!attr[v].isgenerated)
 				{
-					/* errors have already been logged */
-					destroyPQExpBuffer(buf);
-					return false;
+					appendPQExpBuffer(buf, "%s$%d",
+									  v > 0 ? ", " : "",
+									  ++pos);
+
+					if (!stream_add_value_in_json_array(value, jsArray))
+					{
+						/* errors have already been logged */
+						destroyPQExpBuffer(buf);
+						return false;
+					}
 				}
 			}
 
@@ -2235,15 +2232,15 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 			/* now loop over column values for this VALUES row */
 			for (int v = 0; v < values->cols; v++)
 			{
-				const char *colname = new->columns[v];
+				LogicalMessageAttribute *attr = &(new->attributes.array[v]);
 				LogicalMessageValue *value = &(values->array[v]);
 
-				if (new->cols <= v)
+				if (new->attributes.count <= v)
 				{
 					log_error("Failed to write UPDATE statement with more "
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
-							  new->cols);
+							  new->attributes.count);
 					destroyPQExpBuffer(buf);
 					return false;
 				}
@@ -2255,9 +2252,10 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 				 */
 				bool skip = false;
 
-				for (int oc = 0; oc < old->cols; oc++)
+				for (int oc = 0; oc < old->attributes.count; oc++)
 				{
-					if (streq(old->columns[oc], colname))
+					LogicalMessageAttribute *oldAttr = &(old->attributes.array[oc]);
+					if (streq(oldAttr->attname, attr->attname))
 					{
 						/* only works because old->values.count == 1 */
 						LogicalMessageValue *oldValue =
@@ -2273,16 +2271,25 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 
 				if (!skip)
 				{
-					appendPQExpBuffer(buf, "%s%s = $%d",
-									  first ? "" : ", ",
-									  colname,
-									  ++pos);
-
-					if (!stream_add_value_in_json_array(value, jsArray))
+					if (attr->isgenerated)
 					{
-						/* errors have already been logged */
-						destroyPQExpBuffer(buf);
-						return false;
+						appendPQExpBuffer(buf, "%s%s = DEFAULT",
+										  first ? "" : ", ",
+										  attr->attname);
+					}
+					else
+					{
+						appendPQExpBuffer(buf, "%s%s = $%d",
+										  first ? "" : ", ",
+										  attr->attname,
+										  ++pos);
+
+						if (!stream_add_value_in_json_array(value, jsArray))
+						{
+							/* errors have already been logged */
+							destroyPQExpBuffer(buf);
+							return false;
+						}
 					}
 
 					if (first)
@@ -2302,14 +2309,15 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 			/* now loop over column values for this VALUES row */
 			for (int v = 0; v < values->cols; v++)
 			{
+				LogicalMessageAttribute *attr = &(old->attributes.array[v]);
 				LogicalMessageValue *value = &(values->array[v]);
 
-				if (old->cols <= v)
+				if (old->attributes.count <= v)
 				{
 					log_error("Failed to write UPDATE statement with more "
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
-							  old->cols);
+							  old->attributes.count);
 					destroyPQExpBuffer(buf);
 					return false;
 				}
@@ -2322,13 +2330,13 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 					 */
 					appendPQExpBuffer(buf, "%s%s IS NULL",
 									  v > 0 ? " and " : "",
-									  old->columns[v]);
+									  attr->attname);
 				}
 				else
 				{
 					appendPQExpBuffer(buf, "%s%s = $%d",
 									  v > 0 ? " and " : "",
-									  old->columns[v],
+									  attr->attname,
 									  ++pos);
 
 					if (!stream_add_value_in_json_array(value, jsArray))
@@ -2401,13 +2409,14 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 			for (int v = 0; v < values->cols; v++)
 			{
 				LogicalMessageValue *value = &(values->array[v]);
+				LogicalMessageAttribute *attr = &(old->attributes.array[v]);
 
-				if (old->cols <= v)
+				if (old->attributes.count <= v)
 				{
 					log_error("Failed to write DELETE statement with more "
 							  "VALUES (%d) than COLUMNS (%d)",
 							  values->cols,
-							  old->cols);
+							  old->attributes.count);
 					destroyPQExpBuffer(buf);
 					return false;
 				}
@@ -2420,13 +2429,13 @@ stream_write_delete(FILE *out, LogicalMessageDelete *delete)
 					 */
 					appendPQExpBuffer(buf, "%s%s IS NULL",
 									  v > 0 ? " and " : "",
-									  old->columns[v]);
+									  attr->attname);
 				}
 				else
 				{
 					appendPQExpBuffer(buf, "%s%s = $%d",
 									  v > 0 ? " and " : "",
-									  old->columns[v],
+									  attr->attname,
 									  ++pos);
 
 					if (!stream_add_value_in_json_array(value, jsArray))
@@ -2697,59 +2706,33 @@ LogicalMessageValueEq(LogicalMessageValue *a, LogicalMessageValue *b)
  * The goal of this normalization is to make sure that the identifiers are
  * comparable in the context of Hash Table.
  */
-#define NORMALIZE_IDENTIFIER(buf, bufsize, offset, ident) \
+#define NORMALIZED_PG_NAMEDATA_COPY(dst, src) \
 	{ \
-		int len = strlen(ident); \
-		if (ident[0] == '"' && ident[len - 1] == '"') \
+		int len = strlen(src); \
+		if (src[0] == '"' && src[len - 1] == '"') \
 		{ \
-			offset += sformat(buf, bufsize, "%s", ident); \
+			strlcpy(dst, src, PG_NAMEDATALEN); \
 		} \
 		else \
 		{ \
-			offset += sformat(buf, bufsize, "\"%s\"", ident); \
+			sformat(dst, PG_NAMEDATALEN, "\"%s\"", src); \
 		} \
 	}
 
 /*
- * createFQColumnName creates a fully qualified column name in the form
- * schema.table.column and normalizes the identifiers by quoting them if
- * necessary.
+ * lookupGeneratedColumnsForTable lookup the generated columns set for the given
+ * table "nspname.relname".
  *
- */
-static void
-createFQColumnName(FQColumnName *qColumnName,
-				   const char *schema,
-				   const char *table,
-				   const char *column)
-{
-	int offset = 0;
-	char *buf = (char *) qColumnName;
-	const int bufsize = sizeof(FQColumnName);
-
-	NORMALIZE_IDENTIFIER(buf + offset, bufsize - offset, offset, schema);
-	offset += sformat(buf + offset, bufsize - offset, ".");
-
-	NORMALIZE_IDENTIFIER(buf + offset, bufsize - offset, offset, table);
-	offset += sformat(buf + offset, bufsize - offset, ".");
-
-	NORMALIZE_IDENTIFIER(buf + offset, bufsize - offset, offset, column);
-}
-
-
-/*
- * isGeneratedColumn checks whether the given "column" in "schema.table" is
- * generated or not using the cache.
- *
- * Returns true if the column is generated, false otherwise.
+ * Returns a GeneratedColumnSet if the table has generated columns, NULL
+ * otherwise.
  *
  * NOTE: There is no error condition, if the cache is NULL, it means that we
  * don't have any generated columns in the catalog.
  */
-static bool
-isGeneratedColumn(GeneratedColumnsCache *cache,
-				  const char *schema,
-				  const char *table,
-				  const char *column)
+static GeneratedColumnSet *
+lookupGeneratedColumnsForTable(GeneratedColumnsCache *cache,
+							   const char *nspname,
+							   const char *relname)
 {
 	/*
 	 * NULL cache means that we don't have any generated columns in the
@@ -2757,38 +2740,83 @@ isGeneratedColumn(GeneratedColumnsCache *cache,
 	 */
 	if (cache == NULL)
 	{
-		return false;
+		return NULL;
 	}
 
 	GeneratedColumnsCache *item = NULL;
-	FQColumnName qColumnName = { 0 };
 
-	(void) createFQColumnName(&qColumnName,
-							  schema, table, column);
+	GeneratedColumnsCache_Lookup key = { 0 };
 
-	HASH_FIND_STR(cache, qColumnName, item);
+	NORMALIZED_PG_NAMEDATA_COPY(key.nspname, nspname);
+	NORMALIZED_PG_NAMEDATA_COPY(key.relname, relname);
 
-	bool isGenerated = (item != NULL);
+	HASH_FIND(hh, cache, &key, sizeof(GeneratedColumnsCache_Lookup), item);
 
-	if (isGenerated)
+	if (item == NULL)
 	{
-		log_debug("IsColumnGenerated: %s is a generated column",
-				  qColumnName);
+		return NULL;
 	}
 
-	return isGenerated;
+	if (item->columns == NULL)
+	{
+		log_error("BUG: Table \"%s.%s\" is in the cache but columns are NULL",
+				  nspname, relname);
+		return NULL;
+	}
+
+	log_trace("Table \"%s.%s\" has generated columns", nspname, relname);
+
+	return item->columns;
 }
 
 
 /*
- * populateGeneratedColumnCache is a callback function that populates the
+ * isGeneratedColumn checks whether the given "attname" is a generated column.
+ *
+ * Returns true if the column is generated, false otherwise.
+ *
+ * NOTE: There is no error condition, if the columns is NULL, it means that we
+ * don't have any generated columns in the catalog.
+ */
+static bool
+isGeneratedColumn(GeneratedColumnSet *columns, const char *attname)
+{
+	char attnameNormalized[PG_NAMEDATALEN] = { 0 };
+
+	NORMALIZED_PG_NAMEDATA_COPY(attnameNormalized, attname);
+
+	GeneratedColumnSet *generatedColumns = NULL;
+
+	HASH_FIND_STR(columns, attnameNormalized, generatedColumns);
+
+	if (generatedColumns != NULL)
+	{
+		log_trace("Column \"%s\" is generated", attnameNormalized);
+
+		return true;
+	}
+
+	return false;
+}
+
+
+/*
+ * prepareGeneratedColumnsCache_hook is a callback function that populates the
  * generated columns cache from the catalog.
  */
 static bool
-populateGeneratedColumnCache(void *ctx, GeneratedColumn *column)
+prepareGeneratedColumnsCache_hook(void *ctx, SourceTable *table)
 {
 	StreamSpecs *specs = (StreamSpecs *) ctx;
 	StreamContext *privateContext = &(specs->private);
+	DatabaseCatalog *sourceDB = specs->sourceDB;
+
+	if (!catalog_s_table_fetch_attrs(sourceDB, table))
+	{
+		log_error("Failed to fetch attributes for table \"%s\".%s",
+				  table->nspname, table->relname);
+		return false;
+	}
 
 	GeneratedColumnsCache *item = (GeneratedColumnsCache *)
 								  calloc(1, sizeof(GeneratedColumnsCache));
@@ -2799,12 +2827,43 @@ populateGeneratedColumnCache(void *ctx, GeneratedColumn *column)
 		return false;
 	}
 
-	(void) createFQColumnName(&(item->qColumnName),
-							  column->nspname,
-							  column->relname,
-							  column->attname);
+	for (int i = 0; i < table->attributes.count; i++)
+	{
+		SourceTableAttribute *attr = &(table->attributes.array[i]);
 
-	HASH_ADD_STR(privateContext->generatedColumnsCache, qColumnName, item);
+		if (attr->attisgenerated)
+		{
+			/* Add a generated column to the GeneratedColumnSet */
+			GeneratedColumnSet *generatedColumn = (GeneratedColumnSet *)
+												  calloc(1, sizeof(GeneratedColumnSet));
+			if (generatedColumn == NULL)
+			{
+				log_error(ALLOCATION_FAILED_ERROR);
+				return false;
+			}
+
+			NORMALIZED_PG_NAMEDATA_COPY(generatedColumn->attname, attr->attname);
+			HASH_ADD_STR(item->columns, attname, generatedColumn);
+		}
+	}
+
+
+	NORMALIZED_PG_NAMEDATA_COPY(item->nspname, table->nspname);
+	NORMALIZED_PG_NAMEDATA_COPY(item->relname, table->relname);
+
+	/*
+	 * Prepare keylen as per https://troydhanson.github.io/uthash/userguide.html#_compound_keys
+	 */
+	unsigned keylen = offsetof(GeneratedColumnsCache, relname) + /* offset of last key field */
+					  sizeof(item->relname) -    /* size of last key field */
+					  offsetof(GeneratedColumnsCache, nspname); /* offset of first key field */
+
+	/* Add the table to the GeneratedColumnsCache. */
+	HASH_ADD(hh,
+			 privateContext->generatedColumnsCache,
+			 nspname,
+			 keylen,
+			 item);
 
 	return true;
 }
@@ -2817,9 +2876,13 @@ populateGeneratedColumnCache(void *ctx, GeneratedColumn *column)
 static bool
 prepareGeneratedColumnsCache(StreamSpecs *specs)
 {
-	if (!catalog_iter_s_generated_column(specs->sourceDB,
-										 specs,
-										 &populateGeneratedColumnCache))
+	/*
+	 * TODO: GeneratedColumn must be retrieved from the target catalog
+	 * because the schema of the target can be different from the source.
+	 */
+	if (!catalog_iter_s_table_generated_columns(specs->sourceDB,
+												specs,
+												&prepareGeneratedColumnsCache_hook))
 	{
 		log_error("Failed to prepare a generated column cache for our catalog,"
 				  "see above for details");
@@ -2831,18 +2894,18 @@ prepareGeneratedColumnsCache(StreamSpecs *specs)
 
 
 /*
- * removeGeneratedColumnsFromTransaction removes the generated columns from the
- * given transaction.
+ * markGeneratedColumnsFromTransaction marks the generated columns in the
+ * transaction.
  */
 static bool
-removeGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
-									  LogicalTransaction *txn)
+markGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
+									LogicalTransaction *txn)
 {
 	LogicalTransactionStatement *stmt = txn->first;
 
 	for (; stmt != NULL; stmt = stmt->next)
 	{
-		if (!removeGeneratedColumnsFromStatement(cache, stmt))
+		if (!markGeneratedColumnsFromStatement(cache, stmt))
 		{
 			return false;
 		}
@@ -2853,12 +2916,12 @@ removeGeneratedColumnsFromTransaction(GeneratedColumnsCache *cache,
 
 
 /*
- * removeGeneratedColumnsFromStatement removes the generated columns from the
+ * markGeneratedColumnsFromStatement marks the generated columns in the
  * given statement after looking up the cache.
  */
 static bool
-removeGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
-									LogicalTransactionStatement *stmt)
+markGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
+								  LogicalTransactionStatement *stmt)
 {
 	LogicalMessageTupleArray *columns = NULL;
 	const char *nspname = NULL;
@@ -2878,64 +2941,34 @@ removeGeneratedColumnsFromStatement(GeneratedColumnsCache *cache,
 	}
 	else
 	{
-		/* Only INSERT and UPDATE statements might have generated columns */
+		/*
+		 * Only INSERT and UPDATE statements can update the table
+		 * generated columns.
+		 */
 		return true;
 	}
 
-	if (columns->count > 1)
+	GeneratedColumnSet *generatedColumns = lookupGeneratedColumnsForTable(cache, nspname,
+																		  relname);
+
+	if (generatedColumns == NULL)
 	{
-		log_error("BUG: removeGeneratedColumnsFromStatement called on a statement "
-				  "with multiple VALUES clauses");
-		return false;
+		/* no generated columns in this table */
+		return true;
 	}
 
-	LogicalMessageTuple *tuple = &(columns->array[0]);
-
-	for (int c = 0; c < tuple->cols; c++)
+	for (int i = 0; i < columns->count; i++)
 	{
-		if (isGeneratedColumn(cache,
-							  nspname,
-							  relname,
-							  tuple->columns[c]))
+		LogicalMessageTuple *tuple = &(columns->array[i]);
+
+		for (int c = 0; c < tuple->attributes.count; c++)
 		{
-			/* deallocate the column */
-			free(tuple->columns[c]);
+			LogicalMessageAttribute *attr = &(tuple->attributes.array[c]);
 
-			/* remove the column from the tuple */
-			for (int j = c; j < tuple->cols - 1; j++)
+			if (isGeneratedColumn(generatedColumns, attr->attname))
 			{
-				tuple->columns[j] = tuple->columns[j + 1];
+				attr->isgenerated = true;
 			}
-
-			/* number of colums have reduced now */
-			tuple->cols--;
-
-			/* remove the value from the tuple */
-			for (int r = 0; r < tuple->values.count; r++)
-			{
-				LogicalMessageValues *values = &(tuple->values.array[r]);
-
-				LogicalMessageValue *value = &(values->array[c]);
-
-				if ((value->oid == TEXTOID || value->oid == BYTEAOID) &&
-					!value->isNull)
-				{
-					free(value->val.str);
-				}
-
-				for (int v = c; v < values->cols - 1; v++)
-				{
-					values->array[v] = values->array[v + 1];
-				}
-
-				values->cols--;
-			}
-
-			/*
-			 * Since we move the next column to the current position, the
-			 * moved once can be generated too, so we need to recheck it.
-			 */
-			c--;
 		}
 	}
 

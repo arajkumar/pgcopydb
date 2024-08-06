@@ -221,33 +221,9 @@ bool catalog_iter_s_table_nopk(DatabaseCatalog *catalog,
 							   void *context,
 							   SourceTableIterFun *callback);
 
-typedef struct GeneratedColumn
-{
-	char nspname[PG_NAMEDATALEN];
-	char relname[PG_NAMEDATALEN];
-	char attname[PG_NAMEDATALEN];
-} GeneratedColumn;
-
-typedef struct GeneratedColumnIterator
-{
-	DatabaseCatalog *catalog;
-	GeneratedColumn *column;
-	SQLiteQuery query;
-} GeneratedColumnIterator;
-
-/*
- * To loop over our catalog "arrays" we provide an iterator based API, which
- * allows for allocating a single item in memory for the whole scan.
- */
-typedef bool (GeneratedColumnIterFun)(void *context, GeneratedColumn *column);
-
-bool catalog_iter_s_generated_column_finish(GeneratedColumnIterator *iter);
-bool catalog_iter_s_generated_column_next(GeneratedColumnIterator *iter);
-bool catalog_iter_s_generated_column(DatabaseCatalog *catalog,
-									 void *context,
-									 GeneratedColumnIterFun *callback);
-bool catalog_s_generated_column_fetch(SQLiteQuery *query);
-bool catalog_iter_s_generated_column_init(GeneratedColumnIterator *iter);
+bool catalog_iter_s_table_generated_columns(DatabaseCatalog *catalog,
+											void *context,
+											SourceTableIterFun *callback);
 
 typedef struct SourceTableIterator
 {
@@ -258,6 +234,7 @@ typedef struct SourceTableIterator
 
 bool catalog_iter_s_table_init(SourceTableIterator *iter);
 bool catalog_iter_s_table_nopk_init(SourceTableIterator *iter);
+bool catalog_iter_s_table_generated_columns_init(SourceTableIterator *iter);
 bool catalog_iter_s_table_next(SourceTableIterator *iter);
 bool catalog_iter_s_table_finish(SourceTableIterator *iter);
 
@@ -649,6 +626,16 @@ bool catalog_count_summary_done(DatabaseCatalog *catalog,
 								CatalogProgressCount *count);
 bool catalog_count_summary_done_fetch(SQLiteQuery *query);
 
+
+/*
+ * Logical decoding
+ */
+bool catalog_add_timeline_history(DatabaseCatalog *catalog,
+								  TimelineHistoryEntry *entry);
+bool catalog_lookup_timeline_history(DatabaseCatalog *catalog,
+									 int tli,
+									 TimelineHistoryEntry *entry);
+bool catalog_timeline_history_fetch(SQLiteQuery *query);
 
 /*
  * Internal tooling for catalogs management

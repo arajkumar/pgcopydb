@@ -116,6 +116,7 @@ typedef struct LogicalMessageValues
 	LogicalMessageValue *array; /* malloc'ed area */
 } LogicalMessageValues;
 
+
 typedef struct LogicalMessageValuesArray
 {
 	int count;
@@ -123,10 +124,22 @@ typedef struct LogicalMessageValuesArray
 	LogicalMessageValues *array; /* malloc'ed area */
 } LogicalMessageValuesArray;
 
+typedef struct LogicalMessageAttribute
+{
+	char *attname; /* malloc'ed area */
+
+	bool isgenerated;
+} LogicalMessageAttribute;
+
+typedef struct LogicalMessageAttributeArray
+{
+	int count;
+	LogicalMessageAttribute *array; /* malloc'ed area */
+} LogicalMessageAttributeArray;
+
 typedef struct LogicalMessageTuple
 {
-	int cols;
-	char **columns;                  /* malloc'ed area */
+	LogicalMessageAttributeArray attributes;
 	LogicalMessageValuesArray values;
 } LogicalMessageTuple;
 
@@ -276,21 +289,45 @@ typedef enum
 
 
 /*
- * Fully Qualified Postgres column name: "nspname"."relname"."attname".
- * We need to account for the dots hence add 2 more bytes.
+ * Lookup key for the hash table GeneratedColumnsCache.
  */
-typedef char FQColumnName[(PG_NAMEDATALEN * 3) + 2];
+typedef struct GeneratedColumnsCache_Lookup
+{
+	/* The table which has generated columns */
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
+} GeneratedColumnsCache_Lookup;
+
+
+typedef struct GeneratedColumnSet
+{
+	char attname[PG_NAMEDATALEN];
+
+	UT_hash_handle hh;           /* makes this structure hashable */
+} GeneratedColumnSet;
+
 
 /*
- * Keep track of tables with generated columns to avoid unnecessary lookups
- * in the catalog.
+ * This is a multi-level hash table. The first level is the table
+ * (nspname.relname) with generated columns. The second level is the
+ * column name (attname).
+ *
+ * This design quickly eliminates tables without generated columns and
+ * finds generated column names efficiently.
+ *
+ * Another option is a single hash table with a composite key of
+ * nspname.relname.attname, but it requires a lookup for each column
+ * while processing.
  */
 typedef struct GeneratedColumnsCache
 {
-	/* This is a char [] type */
-	FQColumnName qColumnName;
+	char nspname[PG_NAMEDATALEN];
+	char relname[PG_NAMEDATALEN];
 
-	UT_hash_handle hh;          /* makes this structure hashable */
+	/* set of generated columns implemented as a hash table */
+	GeneratedColumnSet *columns;
+
+	UT_hash_handle hh;           /* makes this structure hashable */
 } GeneratedColumnsCache;
 
 
@@ -361,6 +398,7 @@ typedef struct PreparedStmt
 
 	UT_hash_handle hh;          /* makes this structure hashable */
 } PreparedStmt;
+
 
 /*
  * As we're using synchronous_commit = off to speed-up things on the apply
@@ -582,9 +620,7 @@ bool stream_fetch_current_lsn(uint64_t *lsn,
 
 bool stream_write_context(StreamSpecs *specs, LogicalStreamClient *stream);
 bool stream_cleanup_context(StreamSpecs *specs);
-bool stream_read_context(CDCPaths *paths,
-						 IdentifySystem *system,
-						 uint32_t *WalSegSz);
+bool stream_read_context(StreamSpecs *specs);
 
 StreamAction StreamActionFromChar(char action);
 char * StreamActionToString(StreamAction action);
@@ -602,7 +638,7 @@ bool stream_compute_pathnames(uint32_t WalSegSz,
 							  char *walFileName,
 							  char *sqlFileName);
 
-bool stream_transform_context_init_pgsql(StreamSpecs *specs);
+bool stream_transform_context_init(StreamSpecs *specs);
 bool stream_transform_stream(StreamSpecs *specs);
 bool stream_transform_resume(StreamSpecs *specs);
 bool stream_transform_line(void *ctx, const char *line, bool *stop);

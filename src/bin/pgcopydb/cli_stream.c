@@ -983,7 +983,7 @@ cli_stream_transform(int argc, char **argv)
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
 
-		if (!stream_transform_context_init_pgsql(&specs))
+		if (!stream_transform_context_init(&specs))
 		{
 			exit(EXIT_CODE_INTERNAL_ERROR);
 		}
