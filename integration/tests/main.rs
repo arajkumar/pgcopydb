@@ -108,8 +108,8 @@ fn test_fail_on_different_timescaledb_versions() {
 
     let image = live_migration_image(&temp_dir, &source_container, &target_container)
         .with_wait_for(WaitFor::message_on_stderr(
-        "Source TimescaleDB version (2.13.1) does not match Target TimescaleDB version (2.14.2)",
-    ));
+            "TimescaleDB version (2.13.1) on source does not match version target(2.14.2)",
+        ));
 
     let target =
         RunnableImage::from((image, vec![String::from("snapshot")])).with_network(&network_name);

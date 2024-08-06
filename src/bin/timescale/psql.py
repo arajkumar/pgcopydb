@@ -19,7 +19,16 @@ def psql(conn, sql, **kwargs) -> list[dict]:
         COMMIT;
         """
 
-    command = ["psql", "--dbname", conn, "--quiet", "--csv", "--command", sql]
+    command = ["psql",
+               "--no-psqlrc",
+               "--no-align",
+               "--dbname",
+               conn,
+               "--quiet",
+               "--csv",
+               "--command",
+               sql,
+               ]
 
     try:
         result = subprocess.check_output(command,

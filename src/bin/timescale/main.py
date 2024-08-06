@@ -15,6 +15,7 @@ from clean import clean
 from environ import pgcopydb_init_env
 from inspect_db import target_activity
 from catalog import target
+from validate import validate
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -87,6 +88,11 @@ def main():
                                  help='Output plugin (Default: wal2json)',
                                  default='wal2json',
                                  choices=['wal2json', 'test_decoding'])
+    parser_snapshot.add_argument('--ignore-compatibility-checks',
+                                 default=False,
+                                 action='store_true',
+                                 help='Ignore the results of the compatibility checks when creating a snapshot. ' \
+                                    'This will allow the snapshot to be created even if the compatibility checks fail.')
 
     parser_clean = subparsers.add_parser('clean', help='Clean up resources',
                                          parents=[common],
@@ -163,6 +169,10 @@ def main():
                                help='Interval in seconds for refreshing live migration querying activity. ' \
                                     'Defaults to 1 second.')
 
+    subparsers.add_parser('validate',
+                          parents=[common],
+                          help='Run pre-migration compatibility checks',
+                          add_help=False)
     args = parser.parse_args()
 
     if args.command is None:
@@ -188,7 +198,8 @@ def main():
             sys.exit(exit_code)
         case 'inspect':
             target_activity(args=args)
-
+        case 'validate':
+            validate(args)
 
 if __name__ == "__main__":
     main()
