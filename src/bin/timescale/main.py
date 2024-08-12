@@ -77,6 +77,14 @@ def main():
                              'versions. This flag is applicable only when '
                              'migrating data from TimescaleDB to '
                              'TimescaleDB.')
+    common.add_argument('--force-timescaledb-public-schema',
+                        default=False,
+                        action='store_true',
+                        help='Force migrate extension installed on '
+                             'non-public schema in source database to '
+                             'public schema in Timescale cloud.')
+
+
 
 
     # snapshot
@@ -91,8 +99,11 @@ def main():
     parser_snapshot.add_argument('--ignore-compatibility-checks',
                                  default=False,
                                  action='store_true',
-                                 help='Ignore the results of the compatibility checks when creating a snapshot. ' \
-                                    'This will allow the snapshot to be created even if the compatibility checks fail.')
+                                 help='Ignore the results of the compatibility '
+                                      'checks when creating a snapshot. This '
+                                      'will allow the snapshot to be created '
+                                      'even if the compatibility checks fail.'
+                                 )
 
     parser_clean = subparsers.add_parser('clean', help='Clean up resources',
                                          parents=[common],

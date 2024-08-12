@@ -5429,3 +5429,41 @@ pgsql_is_table_partition_root(PGSQL *pgsql,
 
 	return true;
 }
+
+
+/*
+ * pgsql_extension_exists checks that an extension with the given name exists on
+ * the Postgres server.
+ */
+bool
+pgsql_extension_exists(PGSQL *pgsql, const char *extname, bool *exists)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_BOOL, false };
+
+	char *sql =
+		" select exists( "
+		"	select 1 from pg_extension where extname = $1 "
+		" )";
+
+	int paramCount = 1;
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { extname };
+
+	if (!pgsql_execute_with_params(pgsql, sql,
+								   paramCount, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check if extension \"%s\" exists", extname);
+		return false;
+	}
+
+	if (!context.parsedOk)
+	{
+		log_error("Failed to check if extension \"%s\" exists", extname);
+		return false;
+	}
+
+	*exists = context.boolVal;
+
+	return true;
+}

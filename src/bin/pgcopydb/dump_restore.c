@@ -628,6 +628,41 @@ skipExtensionFromFilter(CopyDataSpec *specs,
 		return true;
 	}
 
+	/*
+	 * Timescale cloud preloads the timescaledb extension, additionally it is
+	 * not happy with CREATE EXTENSION IF NOT EXISTS timescaledb, so we need
+	 * to skip the extension creation by explicitly checking for it.
+	 */
+	if (streq(name, "timescaledb"))
+	{
+		PGSQL dst = { 0 };
+
+		if (!pgsql_init(&dst, specs->connStrings.target_pguri, PGSQL_CONN_TARGET))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		bool exists = false;
+
+		if (!pgsql_extension_exists(&dst, "timescaledb", &exists))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
+		*skip = exists;
+
+		if (*skip)
+		{
+			log_notice("Skipping EXTENSION %s \"%s\"",
+					   isExtensionComment ? "COMMENT ON" : "",
+					   name);
+		}
+
+		return true;
+	}
+
 	return true;
 }
 

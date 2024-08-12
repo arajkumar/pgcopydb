@@ -74,6 +74,18 @@ def _has_tables_without_replica_ident(source) -> list[dict]:
     result = [r["tables"] for r in result]
     return result
 
+def _target_is_timescale_cloud(target) -> bool:
+    # _timescaledb_catalog.metadata table has the following keys:
+    # - forge_profile_id
+    # - forge_service_id
+    # - forge_env
+    sql = """
+        SELECT count(*) > 0 as cloud FROM _timescaledb_catalog.metadata
+        WHERE key IN ('forge_profile_id', 'forge_service_id', 'forge_env')
+    """
+    return psql(conn=target, sql=sql)[0]["cloud"] == "t"
+
+
 class Status(Enum):
     OK = 1
     WARN = 2
@@ -311,17 +323,28 @@ def check_db_compatibility(args) -> Report:
                                 "and attname='finalized' and not attisdropped "
                                 "and attnum > 0;")
         has_caggs_finalized = has_caggs_finalized and has_caggs_finalized[0]["exists"]
-        tsdb_checks = [
-            Check(
-                check_message="TimescaleDB extension installed on 'public' schema",
-                sql="select n.nspname nspname from pg_extension e join pg_namespace n on e.extnamespace = n.oid where extname = 'timescaledb'",
-                source_value=lambda x: str(psql(source_uri, x)[0]["nspname"]),
-                target_value=None,
-                check=lambda source, _: source == "public",
-                help="TimescaleDB extension on source should be installed on "
-                     "'public' schema."
-            ),
-        ]
+        tsdb_checks = []
+
+        if _target_is_timescale_cloud(target_uri) and not args.force_timescaledb_public_schema:
+            tsdb_checks.append(
+                Check(
+                    check_message="TimescaleDB extension installed on 'public' schema",
+                    sql="select n.nspname nspname from pg_extension e join pg_namespace n on e.extnamespace = n.oid where extname = 'timescaledb'",
+                    source_value=lambda x: str(psql(source_uri, x)[0]["nspname"]),
+                    target_value=None,
+                    check=lambda source, _: source == "public",
+                    help="TimescaleDB extension on source should be installed on "
+                         "'public' schema. If not, you can still migrate to "
+                         "Timescale Cloud by using "
+                         "--force-timescaledb-public-schema flag when creating "
+                         "snapshot. "
+                         "Be aware that using this flag will cause issues if "
+                         "existing queries references TimescaleDB objects "
+                         "using the custom schema. You may need to update those "
+                         "queries not to reference the custom schema and "
+                         "set Postgres search_path to custom schema."
+                )
+            )
 
         if has_caggs_finalized:
             tsdb_checks.append(Check(

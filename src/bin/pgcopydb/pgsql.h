@@ -580,4 +580,6 @@ bool pgsql_current_wal_flush_lsn(PGSQL *pgsql, uint64_t *lsn);
 bool pgsql_current_wal_insert_lsn(PGSQL *pgsql, uint64_t *lsn);
 
 char * pgsql_escape_identifier(PGSQL *pgsql, char *src);
+
+bool pgsql_extension_exists(PGSQL *pgsql, const char *extname, bool *exists);
 #endif /* PGSQL_H */
