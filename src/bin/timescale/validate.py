@@ -273,7 +273,7 @@ def check_db_compatibility(args) -> Report:
             'unaccent', 'uuid-ossp',
            -- Though we don't support the following, it is still fine to
            -- include here as we skip them by default
-           'aiven_extras'
+           'aiven_extras', 'rds_tools'
         )
         """,
             source_value=lambda x: str(psql(source_uri, x)[0]["agg"]),
@@ -281,7 +281,8 @@ def check_db_compatibility(args) -> Report:
             check=lambda source, _: source == "[]",
             help="Following extensions are not supported on Timescale Cloud: "
                  "{source}. You can skip unsupported extension using "
-                 "--skip-extension flag.",
+                 "--skip-extension flag during migration.",
+            warn_only = True,
         ),
         Check(
             check_message="Source db should not have table attributes with NaN, +- Infinity as values",

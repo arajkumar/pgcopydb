@@ -141,6 +141,7 @@ def skip_extensions_list(args):
     # Default known list of extensions that should be skipped
     skip_extensions_default = [
             "aiven_extras",
+            "rds_tools",
     ]
 
     if args.skip_extensions:
