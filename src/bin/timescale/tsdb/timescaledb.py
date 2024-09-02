@@ -181,7 +181,13 @@ class TimescaleDB:
         """
         Execute timescaledb_pre_restore()
         """
-        sql = f"SELECT {self.nspname}.timescaledb_pre_restore();"
+        # Execure post_restore() before pre_restore() to ensure that the
+        # extension is loaded.
+        sql = f"""
+            SELECT
+                {self.nspname}.timescaledb_post_restore(),
+                {self.nspname}.timescaledb_pre_restore();
+        """
         psql(self.conn, sql)
 
     def post_restore(self, disable_jobs: bool = False):

@@ -1,3 +1,4 @@
+import atexit
 import argparse
 import os
 import tempfile
@@ -16,6 +17,8 @@ from environ import pgcopydb_init_env
 from inspect_db import target_activity
 from catalog import target
 from validate import validate
+from telemetry import Telemetry
+from utils import migration_id
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -192,10 +195,22 @@ def main():
 
     pgcopydb_init_env(args)
     create_dirs(args.dir)
+
     logger = setup_logging(args.dir)
 
-    logger.info(f"Running live-migration {SCRIPT_VERSION}")
+    id = migration_id(args.dir)
+    logger.info(f"Running live-migration: {SCRIPT_VERSION} id: {id}")
     nudge_user_to_update()
+
+    telemetry = Telemetry(args.command,
+                          args.source,
+                          args.target,
+                          id,
+    )
+    # Write telemetry on exit
+    atexit.register(telemetry.write)
+    # Inject telemetry into args
+    args.telemetry = telemetry
 
     target.init(args.target)
 
@@ -205,6 +220,9 @@ def main():
         case 'clean':
             clean(args)
         case 'migrate':
+            # Telemetry by default sends event only on failure.
+            # Let's enable telemetry on success as well for migrate command.
+            telemetry.send_on_success()
             exit_code = migrate(args)
             sys.exit(exit_code)
         case 'inspect':

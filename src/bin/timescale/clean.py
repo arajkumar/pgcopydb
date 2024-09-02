@@ -2,14 +2,11 @@ import logging
 import os
 from pathlib import Path
 
-from telemetry import telemetry_command
 from exec import run_cmd
 from catalog import target
 
 logger = logging.getLogger(__name__)
 
-
-@telemetry_command("clean")
 def clean(args):
     run_cmd("pgcopydb stream cleanup --dir $PGCOPYDB_DIR")
     logger.info("Cleaned logical decoding artifacts from source and target database ...")
@@ -36,3 +33,5 @@ def clean(args):
                     continue
                 dir.rmdir()
         logger.info("Pruned all files except logs directory ...")
+
+    args.telemetry.mark_success()

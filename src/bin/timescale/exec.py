@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from environ import env
-from exception import RedactedException
+from exception import ProcessFailedException
 from health_check import health_checker
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def start_process(args: list[str], log_file: LogFile, env=env):
     return process
 
 
-def run_cmd(cmd: str, log_file: LogFile = None, ignore_non_zero_code: bool = False) -> str:
+def run_cmd(cmd: str, log_file: LogFile = None) -> str:
     if log_file is not None:
         stdout = open(log_file.stdout, "w")
         stderr = open(log_file.stderr, "w")
@@ -99,32 +99,26 @@ def run_cmd(cmd: str, log_file: LogFile = None, ignore_non_zero_code: bool = Fal
 
         try:
             out, err = process.communicate()
-        except:
+        except Exception as e:
             os.killpg(os.getpgid(process.pid), signal.SIGINT)
             process.wait()
-            raise
+            raise ProcessFailedException from e
         else:
             retcode = process.wait()
-            if retcode != 0 and not ignore_non_zero_code:
+            if retcode != 0:
                 if log_file is not None:
                     print_logs_with_error(log_path=log_file.stderr)
-                cmd_name = cmd.split()[0]
-                raise RedactedException(
-                    f"""command '{cmd}' exited with {retcode} code.
-                    stderr={err}. stdout={out}""",
-                    f"{cmd_name} exited with code {retcode}")
+                message = f"""
+                Command '{cmd}' failed with exit code {retcode}.
+                stderr: {err}
+                stdout: {out}
+                """
+                raise ProcessFailedException(message)
             return str(out)
         finally:
             if log_file is not None:
                 stdout.close()
                 stderr.close()
-
-
-def run_sql(execute_on_target: bool, sql: str) -> str:
-    dest = "$PGCOPYDB_SOURCE_PGURI"
-    if execute_on_target:
-        dest = "$PGCOPYDB_TARGET_PGURI"
-    return run_cmd(psql(dest, sql))
 
 
 class Retry:

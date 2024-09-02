@@ -10,61 +10,31 @@
 # the script removes all preceding files, retaining a buffer of three files for safety of large txns.
 # This operation is performed every 5 minutes by default.
 #
-# To function correctly, housekeeping script requires certain environment variables:
-#
-# ```shell
-# # Required.
-# export PGCOPYDB_SOURCE_PGURI=''
-# export PGCOPYDB_TARGET_PGURI=''
-# export PGCOPYDB_DIR=''
-#
-# # Optional.
-# export HOUSEKEEPING_INTERVAL=300 # Seconds.
-# ```
-#
-# ## Usage
-# ```shell
-# python housekeeping.py
-# ```
 
 import os
 import json
-import subprocess
-import tempfile
 import threading
 import logging
 from pathlib import Path
 
+from psql import psql
+
 ORIGIN = 'pgcopydb'
 BUFFER = 3 + 1  # Number of files to buffer from being deleted.
 
-env = os.environ.copy()
 logger = logging.getLogger(__name__)
-
-def run_cmd(cmd: str) -> str:
-    result = subprocess.run(cmd, shell=True, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"command '{cmd}' exited with {result.returncode} code. stderr={result.stderr}")
-    return str(result.stdout)
-
-
-def run_sql_source(sql: str) -> str:
-    return run_cmd(f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "$PGCOPYDB_SOURCE_PGURI" -c " {sql} " """)
-
-
-def run_sql_target(sql: str) -> str:
-    return run_cmd(f"""psql -X -A -t -v ON_ERROR_STOP=1 --echo-errors -d "$PGCOPYDB_TARGET_PGURI" -c " {sql} " """)
-
 
 HOUSEKEEPING_INTERVAL = int(os.getenv("HOUSEKEEPING_INTERVAL", 300))
 
+def origin_progress(conn, origin):
+    sql = f"select pg_replication_origin_progress('{origin}', false) as origin"
+    r = psql(conn, sql)
+    return r[0]["origin"]
 
-def get_last_replicated_origin():
-    get_last_replicated_origin_sql = f"select pg_replication_origin_progress('{ORIGIN}', false)"
-    lsn = run_sql_target(get_last_replicated_origin_sql)[:-1]
-    wal_file_name = run_sql_source(f"select pg_walfile_name('{lsn}'::pg_lsn)")[:-1]
-    return lsn, wal_file_name
-
+def walfile_name(conn, lsn):
+    sql = f"select pg_walfile_name('{lsn}'::pg_lsn) as wal_file_name"
+    r = psql(conn, sql)
+    return r[0]["wal_file_name"]
 
 def is_txn_state_file(f: Path) -> bool:
     CONTENT_PREFIX = '{"xid"'
@@ -89,11 +59,12 @@ def get_txn_state_file_in_dir(directory: Path) -> [Path]:
     return [f for f in directory.iterdir() if f.is_file() and f.suffix == '.json' and is_txn_state_file(f)]
 
 
-def is_replicated(lsn_in_file, lsn_replicated) -> bool:
+def is_replicated(conn, lsn_in_file, lsn_replicated) -> bool:
     if lsn_in_file == "" or lsn_replicated == "":
         return False
-    result = run_sql_target(f"select '{lsn_in_file}'::pg_lsn < '{lsn_replicated}'::pg_lsn")
-    return bool(result)
+    sql = f"select ('{lsn_in_file}'::pg_lsn < '{lsn_replicated}'::pg_lsn) as replicated"
+    r = psql(conn, sql)
+    return r[0]["replicated"] == 't'
 
 
 def state_file_lsn(f: Path) -> str:
@@ -107,13 +78,6 @@ def filename_no_ext(f: Path) -> str:
     if f.suffix == ".partial":
         f = f.with_suffix('')
     return f.stem
-
-
-def delete_file(filename: Path):
-    try:
-        filename.unlink()
-    except FileNotFoundError:
-        return
 
 
 def sort_files_by_name(abs_files):
@@ -132,20 +96,16 @@ def sort_files_by_name(abs_files):
     return result
 
 
-def housekeeping(stop_event=None):
-    work_dir = env["PGCOPYDB_DIR"]
-    if work_dir is not None:
-        work_dir = Path(work_dir).absolute()
-    else:
-        work_dir = Path(tempfile.gettempdir()).absolute() / "pgcopydb"
-    cdc_dir = work_dir / "cdc"
+def housekeeping(stop_event, args):
+    cdc_dir = args.dir / "cdc"
 
     if not cdc_dir.is_dir():
         raise ValueError(f"cdc directory {cdc_dir} is not valid")
 
     logger.info(f"Performing housekeeping every {HOUSEKEEPING_INTERVAL}s ...")
-    while stop_event is None or not stop_event.is_set():
-        lsn_replicated, present_wal_file = get_last_replicated_origin()
+    while not stop_event.is_set():
+        lsn_replicated = origin_progress(args.target, ORIGIN)
+        present_wal_file = walfile_name(args.source, lsn_replicated)
 
         files = get_files_in_dir(cdc_dir)
         if len(files) == 0:
@@ -167,42 +127,42 @@ def housekeeping(stop_event=None):
                 if i <= delete_upto_index and f != filename_no_ext(Path(present_wal_file)):
                     sql_file = cdc_dir / f"{f}.sql"
                     json_file = cdc_dir / f"{f}.json"
-                    delete_file(sql_file)
-                    delete_file(json_file)
+                    sql_file.unlink(missing_ok=True)
+                    json_file.unlink(missing_ok=True)
                     logger.debug(f"Deleted {f}.{{sql,json}} ...")
 
         state_files = get_txn_state_file_in_dir(cdc_dir)
         count = 0
         for f in state_files:
             lsn = state_file_lsn(f)
-            if is_replicated(lsn, lsn_replicated):
-                delete_file(f)
+            if is_replicated(args.target, lsn, lsn_replicated):
+                f.unlink(missing_ok=True)
                 count += 1
         if count > 0:
             logger.info(f"Cleaned up {count} transaction files")
         stop_event.wait(timeout=HOUSEKEEPING_INTERVAL)
 
 
-def start_housekeeping(new_env):
-    global env
-    env = new_env
+stop_event = None
+housekeeping_thread = None
+
+def start(args):
+    global stop_event, housekeeping_thread
+
     stop_event = threading.Event()
     housekeeping_thread = threading.Thread(
         target=housekeeping,
-        kwargs={'stop_event': stop_event}
+        kwargs={'stop_event': stop_event, 'args': args}
     )
+
     housekeeping_thread.start()
     return (housekeeping_thread, stop_event)
 
+def stop():
+    global stop_event, housekeeping_thread
 
-if __name__ == "__main__":
+    if stop_event:
+        stop_event.set()
 
-    for key in ["PGCOPYDB_SOURCE_PGURI", "PGCOPYDB_TARGET_PGURI"]:
-        if key not in env or env[key] == "" or env[key] is None:
-            raise ValueError(f"${key} not found")
-
-    # Test connection.
-    run_sql_source("select 1")
-    run_sql_target("select 1")
-
-    housekeeping()
+    if housekeeping_thread and housekeeping_thread.is_alive():
+        housekeeping_thread.join()

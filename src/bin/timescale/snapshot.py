@@ -1,37 +1,36 @@
 import sys
 import subprocess
+import textwrap
 import logging
-import os
 
+from exception import ValidationError
 from utils import docker_command
-from validate import check_db_compatibility
-from environ import LIVE_MIGRATION_DOCKER
+from validate import check_db_compatibility, raise_if_volume_not_mounted
 
 logger = logging.getLogger(__name__)
 
-def snapshot(args):
+def _snapshot(args):
     if (args.dir / "snapshot").exists():
-        logger.error("Snapshot file already exists.")
-        logger.error("Snapshot process is either running or not cleaned up properly.")
-        print("Run the following command to clean up resources:")
-        print(docker_command('live-migration-clean', 'clean', '--prune'))
-        sys.exit(1)
+        message = f"""
+        Snapshot file already exists.
+        Snapshot process is either running or not cleaned up properly.
+        Run the following command to clean up resources:
+        {docker_command('live-migration-clean', 'clean', '--prune')}
+        """
+        raise ValidationError(message)
+
+    raise_if_volume_not_mounted(args.dir)
 
     logger.info("Running compatibility checks. This will take few seconds ...")
     report = check_db_compatibility(args=args)
     report.log()
+    args.telemetry.progress("completed-compatibility-checks")
     if report.has_errors():
         if args.ignore_compatibility_checks:
             logger.warn("Ignoring failed compatibility checks failed between source and target databases ...")
         else:
-            logger.error("Live migration compatibility checks failed between source and target databases. Please resolve them to proceed.")
-            sys.exit(1)
+            raise ValidationError("Compatibility checks failed. Use --ignore-compatibility-checks to ignore them.")
 
-    if LIVE_MIGRATION_DOCKER and not os.path.ismount(args.dir):
-        logger.error("Volume mount not found. To proceed, mount a volume: '-v <host_dir>:%s'", args.dir)
-        print("To create a snapshot, run the following command:")
-        print(docker_command('live-migration-snapshot', 'snapshot'))
-        sys.exit(1)
 
     logger.info("Creating snapshot ...")
     # Clean up pid files. This might cause issues in docker environment due
@@ -79,5 +78,13 @@ def snapshot(args):
         logger.error("You may need to cleanup and retry the snapshot creation.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean', '--prune'))
-        sys.exit(process.returncode)
 
+def snapshot(args):
+    try:
+        _snapshot(args)
+        args.telemetry.mark_success()
+    except Exception as e:
+        args.telemetry.add_exception()
+        message = textwrap.dedent(str(e))
+        logger.error(message)
+        sys.exit(1)

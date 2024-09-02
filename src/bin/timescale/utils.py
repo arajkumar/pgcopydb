@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import logging
+import uuid
 
 from pathlib import Path
 from time import perf_counter
@@ -62,14 +63,24 @@ def seconds_to_human(seconds):
     return " ".join(strings)
 
 
-def store_val(name: str, value):
-    with open(f"{env['PGCOPYDB_DIR']}/run/{name}", 'w') as file:
+def migration_id(dir):
+    id = get_stored_val(dir, "migration_id")
+    if id is None:
+        id = str(uuid.uuid4())
+        store_val(dir, "migration_id", id)
+
+    return id
+
+def store_val(dir: Path, name: str, value):
+    f = str(dir / "run" / name)
+    with open(f, 'w') as file:
         file.write(str(value))
 
 
-def get_stored_val(name: str):
+def get_stored_val(dir: Path, name: str):
+    f = str(dir / "run" / name)
     try:
-        with open(f"{env['PGCOPYDB_DIR']}/run/{name}", 'r') as file:
+        with open(f, 'r') as file:
             value = file.read()
         return value
     except FileNotFoundError:

@@ -63,6 +63,7 @@ def _target_activity(args):
 def target_activity(args):
     try:
         _target_activity(args)
+        args.telemetry.mark_success()
     except KeyboardInterrupt:
         print("Exiting...")
         exit(0)

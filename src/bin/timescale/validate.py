@@ -1,3 +1,4 @@
+import os
 import logging
 import typing
 
@@ -5,9 +6,24 @@ from enum import Enum
 from dataclasses import dataclass
 
 from psql import psql as psql
-from utils import get_dbtype, DBType
+from utils import get_dbtype, DBType, docker_command
+from environ import LIVE_MIGRATION_DOCKER
+from exception import ValidationError
 
 logger = logging.getLogger(__name__)
+
+def raise_if_volume_not_mounted(dir):
+    if LIVE_MIGRATION_DOCKER and not os.path.ismount(dir):
+        message = f"""
+        Volume mount not found!
+        Volume mount is required to store the state of the migration process
+        to resume the interrupted migration.
+
+        To proceed, mount a volume: '-v <host_dir>:{dir}'
+        To create a snapshot, run the following command:
+        {docker_command('live-migration-snapshot', 'snapshot')}
+        """
+        raise ValidationError(message)
 
 def _has_replication_origin_permission(conn) -> bool:
     def _has_perm(func_name: str) -> bool:
@@ -163,6 +179,7 @@ class Report:
 def validate(args):
     report = check_db_compatibility(args=args)
     report.pretty_print()
+    args.telemetry.mark_success()
 
 def check_db_compatibility(args) -> Report:
     """

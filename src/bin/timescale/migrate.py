@@ -1,27 +1,27 @@
-#!/usr/bin/env python3
 # This script orchestrates CDC based migration process using pgcopydb.
-
 import os
-import sys
 import threading
 import logging
-import traceback
-
+import textwrap
 from pathlib import Path
 
-from housekeeping import start_housekeeping
+import housekeeping
+
 from health_check import health_checker
 from utils import timeit, docker_command, dbname_from_uri, store_val, \
     get_stored_val, bytes_to_human, seconds_to_human, DBType, get_dbtype, \
     get_snapshot_id
 from environ import LIVE_MIGRATION_DOCKER, env
-from telemetry import telemetry_command, telemetry
 from usr_signal import wait_for_event, IS_TTY
 from filter import Filter
+from exception import (
+    ValidationError,
+)
+from validate import raise_if_volume_not_mounted
+
 from exec import (
         Process,
         run_cmd,
-        run_sql,
         psql,
         print_logs_with_error,
         LogFile,
@@ -30,6 +30,7 @@ from catalog import (
         target,
         pgcopydb
 )
+from psql import psql as psql_cmd
 from tsdb.postgres import create_hypertable_compatibility
 from tsdb.cross_version import CrossVersionMigration
 from tsdb.timescaledb import TimescaleDB
@@ -105,15 +106,15 @@ Once you are done"""
     event.wait()
 
 
-def monitor_db_sizes() -> threading.Event:
-    DB_SIZE_SQL = "select pg_size_pretty(pg_database_size(current_database()))"
-    src_size = get_stored_val("src_existing_data_size")
+def monitor_db_sizes(dir, source, target) -> threading.Event:
+    DB_SIZE_SQL = "select pg_size_pretty(pg_database_size(current_database())) as size"
+    src_size = get_stored_val(dir, "src_existing_data_size")
     if src_size is None:
-        src_size = run_sql(execute_on_target=False, sql=DB_SIZE_SQL)[:-1]
+        src_size = psql_cmd(source, sql=DB_SIZE_SQL)[0]["size"]
         # We save the size of the source database for reuse when running `migrate` with the
         # --resume option. Without this step, the source size would need to be recalculated
         # during the `--resume` phase, leading to inaccurate progress.
-        store_val("src_existing_data_size", src_size)
+        store_val(dir, "src_existing_data_size", src_size)
 
     stop_event = threading.Event()
     logger.info("Monitoring initial copy progress ...")
@@ -125,7 +126,7 @@ def monitor_db_sizes() -> threading.Event:
                 # during this period of unavailability, it will cause the monitor_db_size() thread
                 # to panic and stop execution. To prevent this, the database size query is placed
                 # inside a try block to handle any temporary unavailability.
-                tgt_size = run_sql(execute_on_target=True, sql=DB_SIZE_SQL)[:-1]
+                tgt_size = psql_cmd(target, sql=DB_SIZE_SQL)[0]["size"]
             except Exception:
                 pass
             else:
@@ -187,7 +188,6 @@ def prepare_filters(args):
     return pgcopydb_args
 
 
-@telemetry_command("migrate_existing_data_across_ts_versions")
 def migrate_existing_data_across_ts_versions(args):
     filter_args = prepare_filters(args)
 
@@ -217,7 +217,7 @@ def migrate_existing_data_across_ts_versions(args):
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
-    stop_progress = monitor_db_sizes()
+    stop_progress = monitor_db_sizes(args.dir, args.source, args.target)
 
     pgcopydb_dir = args.dir / "pgcopydb_clone"
 
@@ -249,7 +249,7 @@ def migrate_existing_data_across_ts_versions(args):
         cross_migration = CrossVersionMigration(args)
 
         if not cross_migration.validate():
-            sys.exit(1)
+            raise ValidationError("Cross version migration validation failed. Please resolve the issues before proceeding.")
 
         # Migrate hypertables from source to target. i.e. create hypertables
         # based on the dimension info available on source to target.
@@ -265,7 +265,6 @@ def migrate_existing_data_across_ts_versions(args):
     stop_progress.set()
 
 
-@telemetry_command("migrate_existing_data_from_pg_to_tsdb")
 def migrate_existing_data_from_pg_to_tsdb(args):
     filter_args = prepare_filters(args)
 
@@ -304,10 +303,9 @@ def migrate_existing_data_from_pg_to_tsdb(args):
     warn = args.skip_hypertable_incompatible_objects or args.skip_hypertable_compatibility_check
     error_shown = compatibility.warn_incompatibility(error=not warn)
     if error_shown:
-        logger.error("Please resolve the above errors before proceeding.")
-        sys.exit(1)
+        raise ValidationError("Please resolve the issues before proceeding.")
 
-    stop_progress = monitor_db_sizes()
+    stop_progress = monitor_db_sizes(args.dir, args.source, args.target)
 
     pgcopydb_dir = args.dir / "pgcopydb_clone"
     # Apply the filter directly into the catalog
@@ -344,7 +342,6 @@ def migrate_existing_data_from_pg_to_tsdb(args):
     stop_progress.set()
 
 
-@telemetry_command("migrate_roles")
 def migrate_roles():
     logger.info(f"Dumping roles to {env['PGCOPYDB_DIR']}/roles.sql ...")
     with timeit():
@@ -416,7 +413,6 @@ sed -i -E \
         print_logs_with_error(log_path=log_file.stderr, after=3, tail=0)
 
 
-@telemetry_command("migrate_existing_data")
 def migrate_existing_data(args, timescaledb: TimescaleDB = None):
     logger.info("Copying table data ...")
 
@@ -472,7 +468,7 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
         "--resume",
     ] + filter_args
 
-    stop_progress = monitor_db_sizes()
+    stop_progress = monitor_db_sizes(args.dir, args.source, args.target)
 
     with timeit():
        (Process(clone_args, "clone")
@@ -493,7 +489,6 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
 
     stop_progress.set()
 
-@telemetry_command("wait_for_DBs_to_sync")
 def wait_for_DBs_to_sync(follow: Process):
     def get_source_wal_lsn():
         return run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select pg_current_wal_lsn();")).strip()
@@ -544,110 +539,96 @@ def wait_for_DBs_to_sync(follow: Process):
             logger.info(f"Live-replay will complete in {seconds_to_human(arrival_seconds)} {stats}" )
         event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
 
-@telemetry_command("copy_sequences")
 def copy_sequences():
-    run_cmd("pgcopydb copy sequences --resume --not-consistent", LogFile("copy_sequences"))
+    run_cmd("pgcopydb copy sequences --resume --not-consistent",
+            LogFile("copy_sequences"))
 
-@telemetry_command("enable_user_background_jobs")
-def enable_user_background_jobs():
-    run_sql(execute_on_target=True,
-            sql="""
-            select public.alter_job(job_id, scheduled => true)
-            from timescaledb_information.jobs
-            where job_id >= 1000;
-            select timescaledb_post_restore();
-            """)
+def get_caggs_count(conn) -> int:
+    sql = """
+        SELECT count(*) as count FROM timescaledb_information.continuous_aggregates;
+    """
+    result = psql_cmd(conn=conn, sql=sql)
+    return int(result[0]["count"])
 
-def get_caggs_count():
-    return int(run_cmd(psql(uri="$PGCOPYDB_SOURCE_PGURI", sql="select count(*) from timescaledb_information.continuous_aggregates;")))
-
-@telemetry_command("set_replica_identity_for_caggs")
-def set_replica_identity_for_caggs(replica_identity: str = "DEFAULT"):
+def set_replica_identity_for_caggs(conn, replica_identity: str = "DEFAULT"):
     sql = f"""
-DO \$\$
+DO $$
 DECLARE
     r record;
 BEGIN
     FOR r IN SELECT materialization_hypertable_schema, materialization_hypertable_name
              FROM timescaledb_information.continuous_aggregates
     LOOP
-        EXECUTE 'ALTER TABLE ' ||
-                quote_ident(r.materialization_hypertable_schema) || '.' ||
-                quote_ident(r.materialization_hypertable_name) ||
-                ' REPLICA IDENTITY {replica_identity}';
+        EXECUTE FORMAT('ALTER TABLE %I.%I REPLICA IDENTITY {replica_identity}',
+                r.materialization_hypertable_schema,
+                r.materialization_hypertable_name)
     END LOOP;
 END;
-\$\$;
+$$;
     """
-    run_sql(execute_on_target=False,
+    psql_cmd(conn=conn,
             sql=sql)
 
 
-def replication_origin_exists():
-    r = run_cmd(psql(uri="$PGCOPYDB_TARGET_PGURI",
-                sql="select exists(select * from pg_replication_origin where roname='pgcopydb')"))
-    return r == "t\n"
+def replication_origin_exists(conn):
+    sql = """
+        SELECT
+            (count(*) > 0) AS exists
+        FROM pg_replication_origin WHERE roname='pgcopydb'
+    """
+    r = psql_cmd(conn=conn, sql=sql)
+    return r[0]["exists"] == "t"
 
 
-def timescaledb_pre_restore():
-    logger.info("Timescale pre-restore ...")
-    run_sql(execute_on_target=True, sql="select custom_schema.timescaledb_pre_restore();")
-
-
-def timescaledb_post_restore():
-    logger.info("Timescale post-restore ...")
-    run_sql(execute_on_target=True,
-            sql="""
-            begin;
-            select custom_schema.timescaledb_post_restore();
-            -- disable all background jobs
-            select custom_schema.alter_job(job_id, scheduled => false)
-            from timescaledb_information.jobs
-            where job_id >= 1000;
-            commit;
-            """)
-
-
-def migrate(args):
-    # Clean up pid files. This might cause issues in docker environment due
-    # deterministic pid values.
-    (args.dir / "pgcopydb.pid").unlink(missing_ok=True)
-    (args.dir / "pgcopydb_clone" / "pgcopydb.pid").unlink(missing_ok=True)
+def validate(args):
+    raise_if_volume_not_mounted(args.dir)
 
     if not (args.dir / "snapshot").exists():
-        logger.error("You must create a snapshot before starting the migration.")
-        print("Run the following command to create a snapshot:")
-        print(docker_command('live-migration-snapshot', 'snapshot'))
-        sys.exit(1)
+        message = f"""
+        You must create a snapshot before starting the migration.
+        Run the following command to create a snapshot:
+        {docker_command('live-migration-snapshot', 'snapshot')}
+        """
+        raise ValidationError(message)
 
     # check whether the snapshot is valid if initial data migration
     # is not yet complete.
     if not is_section_migration_complete("initial-data-migration") and not is_snapshot_valid():
-            logger.error("Invalid snapshot found. Snapshot process might have died or failed.")
-            logger.info("Please restart the migration process.")
-            print("Run the following command to clean the existing resources:")
-            print(docker_command('live-migration-clean', 'clean', '--prune'))
-            print()
-            print("Run the following command to create a new snapshot:")
-            print(docker_command('live-migration-snapshot', 'snapshot'))
-            sys.exit(1)
+            message = f"""
+            Invalid snapshot found. Snapshot process might have died or failed.
+            Please restart the migration process.
+            Run the following command to clean the existing resources:
+            {docker_command('live-migration-clean', 'clean', '--prune')}
+
+            Run the following command to create a new snapshot:
+            {docker_command('live-migration-snapshot', 'snapshot')}
+            """
+            raise ValidationError(message)
 
     # resume but no previous migration found
-    if not replication_origin_exists() and args.resume:
-        logger.error("No resumable migration found.")
-        print("To start the migration:")
-        print(docker_command('live-migration-migrate', 'migrate'))
-        sys.exit(1)
+    if not replication_origin_exists(args.target) and args.resume:
+        message = f"""
+        No resumable migration found. To start the migration:
+        {docker_command('live-migration-migrate', 'migrate')}
+        """
+        raise ValidationError(message)
 
     # if replication origin exists, then the previous migration was incomplete
-    if replication_origin_exists() and not args.resume:
-        logger.error("Found an incomplete migration.")
-        print("To resume the migration:")
-        print(docker_command('live-migration-migrate', 'migrate', '--resume'))
-        print()
-        print("To start a new migration, clean up the existing resources:")
-        print(docker_command('live-migration-clean', 'clean', '--prune'))
-        sys.exit(1)
+    if replication_origin_exists(args.target) and not args.resume:
+        message = f"""
+        Found an incomplete migration. To resume the migration:
+        {docker_command('live-migration-migrate', 'migrate', '--resume')}
+
+        To start a new migration, clean up the existing resources:
+        {docker_command('live-migration-clean', 'clean', '--prune')}
+        """
+        raise ValidationError(message)
+
+def _migrate(args, follow):
+    # Clean up pid files. This might cause issues in docker environment due
+    # deterministic pid values.
+    (args.dir / "pgcopydb.pid").unlink(missing_ok=True)
+    (args.dir / "pgcopydb_clone" / "pgcopydb.pid").unlink(missing_ok=True)
 
     source_type = get_dbtype(args.source)
     target_type = get_dbtype(args.target)
@@ -672,98 +653,114 @@ def migrate(args):
         case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
             logger.info("Migrating TimescaleDB to TimescaleDB(cross version) ....")
         case (DBType.TIMESCALEDB, DBType.POSTGRES):
-            logger.info("Migration from TimescaleDB to Postgres is not supported")
-            sys.exit(1)
+            raise ValidationError("Migration from TimescaleDB to Postgres is not supported")
 
     caggs_count = 0
     if source_type == DBType.TIMESCALEDB:
-        caggs_count = get_caggs_count()
+        caggs_count = get_caggs_count(args.source)
         if caggs_count > 0:
             logger.info(f"Setting replica identity to FULL for {caggs_count} caggs ...")
-            set_replica_identity_for_caggs('FULL')
+            set_replica_identity_for_caggs(args.source, 'FULL')
+            args.telemetry.progress(f"replica-idenitity-for-caggs:{caggs_count}")
 
     # reset endpos
     if args.resume:
         run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR 0/0")
+        args.telemetry.progress("reset sentinel on resume")
 
-    housekeeping_thread, housekeeping_stop_event = None, None
+    if not is_section_migration_complete("roles") and not args.skip_roles:
+        logger.info("Migrating roles from Source DB to Target DB ...")
+        migrate_roles()
+        mark_section_complete("roles")
+        args.telemetry.progress("roles-migrated")
 
+    if not is_section_migration_complete("initial-data-migration"):
+        logger.info("Migrating existing data from Source DB to Target DB ...")
+        match (source_type, target_type):
+            case (DBType.POSTGRES, DBType.POSTGRES):
+                migrate_existing_data(args=args, timescaledb=timescaledb)
+            case (DBType.POSTGRES, DBType.TIMESCALEDB):
+                migrate_existing_data_from_pg_to_tsdb(args)
+            case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
+                migrate_existing_data(args, timescaledb=timescaledb)
+            case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
+                migrate_existing_data_across_ts_versions(args)
+            case (DBType.TIMESCALEDB, DBType.POSTGRES):
+                raise ValidationError("Migration from TimescaleDB to Postgres is not supported")
+        mark_section_complete("initial-data-migration")
+        args.telemetry.progress("initial-data-migrated")
+
+    housekeeping.start(args)
+    target.convert_matview_to_view(args.target)
+    args.telemetry.progress("patched-matviews")
+
+    logger.info("Applying buffered transactions ...")
+    run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
+    args.telemetry.progress("apply-buffered-transactions")
+
+    wait_for_DBs_to_sync(follow)
+    args.telemetry.progress("db-synced")
+
+    run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR --current")
+    args.telemetry.progress("stop live-replay")
+
+    logger.info("Waiting for live-replay to complete ...")
+    follow.wait()
+    args.telemetry.progress("follow-completed")
+
+    logger.info("Copying sequences ...")
+    copy_sequences()
+    args.telemetry.progress("sequences-copied")
+
+    target.restore_matview(args.target)
+
+    if source_type == DBType.TIMESCALEDB:
+        logger.info("Enabling background jobs ...")
+        timescaledb.enable_jobs()
+        if caggs_count > 0:
+            logger.info("Setting replica identity back to DEFAULT for caggs ...")
+            set_replica_identity_for_caggs(args.source, 'DEFAULT')
+            args.telemetry.progress("reset caggs replica identity")
+
+def migrate(args):
     exit_code = 0
-
-    follow = create_follow(resume=args.resume)
+    follow = None
     try:
-        if not is_section_migration_complete("roles") and not args.skip_roles:
-            logger.info("Migrating roles from Source DB to Target DB ...")
-            migrate_roles()
-            mark_section_complete("roles")
+        args.telemetry.progress("begin")
+        validate(args)
+        args.telemetry.progress("validated")
 
-        if not is_section_migration_complete("initial-data-migration"):
-            logger.info("Migrating existing data from Source DB to Target DB ...")
-            match (source_type, target_type):
-                case (DBType.POSTGRES, DBType.POSTGRES):
-                    migrate_existing_data(args=args, timescaledb=timescaledb)
-                case (DBType.POSTGRES, DBType.TIMESCALEDB):
-                    migrate_existing_data_from_pg_to_tsdb(args)
-                case (DBType.TIMESCALEDB, DBType.TIMESCALEDB):
-                    migrate_existing_data(args, timescaledb=timescaledb)
-                case (DBType.TIMESCALEDB_SKIP_VERSION, DBType.TIMESCALEDB):
-                    migrate_existing_data_across_ts_versions(args)
-                case (DBType.TIMESCALEDB, DBType.POSTGRES):
-                    logger.error("Migration from TimescaleDB to Postgres is not supported")
-                    sys.exit(1)
-            mark_section_complete("initial-data-migration")
+        follow = create_follow(resume=args.resume)
+        args.telemetry.progress("follow created")
 
-        (housekeeping_thread, housekeeping_stop_event) = start_housekeeping(env)
-
-        target.convert_matview_to_view(args.target)
-
-        logger.info("Applying buffered transactions ...")
-        run_cmd("pgcopydb stream sentinel set apply --dir $PGCOPYDB_DIR")
-
-        wait_for_DBs_to_sync(follow)
-
-        run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR --current")
-
-        logger.info("Waiting for live-replay to complete ...")
-        follow.wait()
-
+        _migrate(args, follow)
     except KeyboardInterrupt:
         logger.info("Exiting ... (Ctrl+C)")
+        args.telemetry.mark_interrupted()
 
+    except ValidationError as e:
+        message = textwrap.dedent(str(e))
+        logger.error(message)
+        args.telemetry.add_exception()
+        exit_code = 1
     except Exception as e:
-        logger.error(f"Unexpected exception: {e}")
-        logger.error(traceback.format_exc())
-        telemetry.complete_fail()
-
+        logger.exception(e)
+        args.telemetry.add_exception()
         exit_code = 1
     else:
-        logger.info("Copying sequences ...")
-        copy_sequences()
-
-        target.restore_matview(args.target)
-
-        if source_type == DBType.TIMESCALEDB:
-            logger.info("Enabling background jobs ...")
-            timescaledb.enable_jobs()
-            if caggs_count > 0:
-                logger.info("Setting replica identity back to DEFAULT for caggs ...")
-                set_replica_identity_for_caggs('DEFAULT')
-
+        args.telemetry.mark_success()
         logger.info("Migration successfully completed.")
         print("Run the following command to clean up resources:")
         print(docker_command('live-migration-clean', 'clean'))
-        telemetry.complete_success()
         exit_code = 0
 
     finally:
         # TODO: Use daemon threads for housekeeping and health_checker.
         health_checker.stop_all()
-        if housekeeping_stop_event:
-            housekeeping_stop_event.set()
-        if housekeeping_thread and housekeeping_thread.is_alive():
-            housekeeping_thread.join()
+        housekeeping.stop()
         # cleanup all subprocesses created by pgcopydb follow
-        follow.terminate()
+        if follow:
+            follow.terminate()
 
         if exit_code == 0:
             logger.info("All processes have exited successfully.")
