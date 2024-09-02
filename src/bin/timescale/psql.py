@@ -26,14 +26,15 @@ def psql(conn, sql, **kwargs) -> list[dict]:
                conn,
                "--quiet",
                "--csv",
-               "--command",
-               sql,
+               "--file",
+               "-",
                ]
 
     try:
         result = subprocess.check_output(command,
                                          stderr=subprocess.PIPE,
                                          universal_newlines=True,
+                                         input=sql,
                                          env=env)
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Error executing SQL: {e.stderr}")

@@ -155,7 +155,9 @@ fn test_end_to_end_migration() -> Result<()> {
         Sql(r"
 		CREATE TABLE metrics(time timestamptz primary key, value float8);
 		SELECT create_hypertable('metrics', 'time');
-		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+		-- Generate more chunks to check large number of chunks are not
+		-- causing Argument list too long error.
+		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00'::timestamptz - INTERVAL'2000 WEEKS', '2024-01-31 23:00:00' , INTERVAL'1 WEEK') as time;
 	"),
     )?;
 
@@ -179,7 +181,7 @@ fn test_end_to_end_migration() -> Result<()> {
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
 
-    target_assert.has_table_count("public", "metrics", 744);
+    target_assert.has_table_count("public", "metrics", 2005);
 
     psql(&source_container, Sql(r"
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-02-01 00:00:00', '2024-02-29 23:00:00', INTERVAL'1 hour') as time;
@@ -191,7 +193,7 @@ fn test_end_to_end_migration() -> Result<()> {
         Duration::from_secs(60),
     )?;
 
-    target_assert.has_table_count("public", "metrics", 1440);
+    target_assert.has_table_count("public", "metrics", 2701);
 
     Ok(())
 }
