@@ -158,6 +158,30 @@ fn test_end_to_end_migration() -> Result<()> {
 		-- Generate more chunks to check large number of chunks are not
 		-- causing Argument list too long error.
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00'::timestamptz - INTERVAL'2000 WEEKS', '2024-01-31 23:00:00' , INTERVAL'1 WEEK') as time;
+
+		CREATE MATERIALIZED VIEW metrics_avg_daily
+		WITH (timescaledb.continuous) AS
+		SELECT
+		time_bucket('1 day', time) AS bucket,
+		avg(value) AS avg_value
+		FROM metrics GROUP BY bucket
+		WITH NO DATA;
+
+		ALTER MATERIALIZED VIEW metrics_avg_daily SET
+		(timescaledb.compress = true);
+
+	"),
+    )?;
+
+    psql(
+        &source_container,
+        Sql("CALL refresh_continuous_aggregate('metrics_avg_daily', NULL, NULL);"),
+    )?;
+
+    psql(
+        &source_container,
+        Sql(r"
+		SELECT compress_chunk(c, true) FROM show_chunks('metrics_avg_daily') c;
 	"),
     )?;
 

@@ -561,13 +561,12 @@ BEGIN
     LOOP
         EXECUTE FORMAT('ALTER TABLE %I.%I REPLICA IDENTITY {replica_identity}',
                 r.materialization_hypertable_schema,
-                r.materialization_hypertable_name)
+                r.materialization_hypertable_name);
     END LOOP;
 END;
 $$;
     """
-    psql_cmd(conn=conn,
-            sql=sql)
+    psql_cmd(conn=conn, sql=sql)
 
 
 def replication_origin_exists(conn):
@@ -660,8 +659,14 @@ def _migrate(args, follow):
         caggs_count = get_caggs_count(args.source)
         if caggs_count > 0:
             logger.info(f"Setting replica identity to FULL for {caggs_count} caggs ...")
-            set_replica_identity_for_caggs(args.source, 'FULL')
-            args.telemetry.progress(f"replica-idenitity-for-caggs:{caggs_count}")
+            try:
+                set_replica_identity_for_caggs(args.source, 'FULL')
+            except Exception:
+                logger.warn("Failed to set replica identity to FULL for caggs."
+                            "UPDATE/DELETE operations on caggs will not be "
+                            "replicated to the target DB.")
+            else:
+                args.telemetry.progress(f"replica-identity-for-caggs:{caggs_count}")
 
     # reset endpos
     if args.resume:
@@ -719,8 +724,14 @@ def _migrate(args, follow):
         timescaledb.enable_jobs()
         if caggs_count > 0:
             logger.info("Setting replica identity back to DEFAULT for caggs ...")
-            set_replica_identity_for_caggs(args.source, 'DEFAULT')
-            args.telemetry.progress("reset caggs replica identity")
+            try:
+                set_replica_identity_for_caggs(args.source, 'DEFAULT')
+            except Exception:
+                # We already warn the user about failure to
+                # set replica identity to FULL for caggs.
+                pass
+            else:
+                args.telemetry.progress("reset caggs replica identity")
 
 def migrate(args):
     exit_code = 0

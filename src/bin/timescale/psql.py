@@ -22,6 +22,8 @@ def psql(conn, sql, **kwargs) -> list[dict]:
     command = ["psql",
                "--no-psqlrc",
                "--no-align",
+               "-v",
+               "ON_ERROR_STOP=1",
                "--dbname",
                conn,
                "--quiet",
@@ -30,14 +32,11 @@ def psql(conn, sql, **kwargs) -> list[dict]:
                "-",
                ]
 
-    try:
-        result = subprocess.check_output(command,
-                                         stderr=subprocess.PIPE,
-                                         universal_newlines=True,
-                                         input=sql,
-                                         env=env)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Error executing SQL: {e.stderr}")
+    result = subprocess.check_output(command,
+                                     stderr=subprocess.PIPE,
+                                     universal_newlines=True,
+                                     input=sql,
+                                     env=env)
 
     reader = csv.DictReader(StringIO(result), delimiter=',')
     # Convert the reader to a list to avoid the generator being exhausted
