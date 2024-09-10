@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::{tempdir, TempDir};
-use test_common::PgVersion::{PG14, PG15};
+use test_common::PgVersion::{PG12, PG13, PG14, PG15};
 use test_common::PsqlInput::Sql;
 use test_common::TsVersion::{TS210, TS213, TS214};
 use test_common::{
@@ -147,7 +147,7 @@ fn test_end_to_end_migration() -> Result<()> {
 
     let network_name = generate_test_network_name();
 
-    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let source_container = start_source(&docker, PG13, TS214, &network_name);
     let target_container = start_target(&docker, PG15, TS214, &network_name);
 
     psql(
@@ -936,7 +936,7 @@ fn test_pg_to_ts_with_table_data_filtering() -> Result<()> {
 
     let network_name = generate_test_network_name();
 
-    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let source_container = start_source(&docker, PG12, TS210, &network_name);
     let target_container = start_target(&docker, PG15, TS214, &network_name);
 
     psql(
@@ -1022,7 +1022,7 @@ fn test_pg_to_pg_with_table_data_filtering() -> Result<()> {
 
     let network_name = generate_test_network_name();
 
-    let source_container = start_source(&docker, PG15, TS214, &network_name);
+    let source_container = start_source(&docker, PG12, TS210, &network_name);
     let target_container = start_target(&docker, PG15, TS214, &network_name);
 
     psql(

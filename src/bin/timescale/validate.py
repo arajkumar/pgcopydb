@@ -214,7 +214,7 @@ def check_db_compatibility(args) -> Report:
         ),
         Check(
             check_message="Postgres version in source db <= target db",
-            sql="select current_setting('server_version_num')::float4 version",
+            sql="select current_setting('server_version_num')::float4 as version",
             source_value=lambda x: float(psql(source_uri, x)[0]["version"]),
             target_value=lambda x: float(psql(target_uri, x)[0]["version"]),
             check=lambda source, target: source <= target,
@@ -223,21 +223,21 @@ def check_db_compatibility(args) -> Report:
         ),
         Check(
             check_message="Postgres version in source db >= 9",
-            sql="select current_setting('server_version_num')::float4 version",
+            sql="select current_setting('server_version_num')::float4 as version",
             source_value=lambda x: float(psql(source_uri, x)[0]["version"]),
             target_value=None,
             check=lambda source, _: source >= 90000,
             help="Postgres version {source} does not support logical decoding."),
         Check(
             check_message="'wal_level' is logical",
-            sql="select current_setting('wal_level') setting",
+            sql="select current_setting('wal_level') as setting",
             source_value=lambda x: str(psql(source_uri, x)[0]["setting"]),
             target_value=None,
             check=lambda source, _: source == "logical",
             help="Source db 'wal_level' GUC must be set to 'logical'"),
         Check(
             check_message="'old_snapshot_threshold' is -1",
-            sql="select current_setting('old_snapshot_threshold') setting",
+            sql="select current_setting('old_snapshot_threshold') as setting",
             source_value=lambda x: int(psql(source_uri, x)[0]["setting"]),
             target_value=None,
             check=lambda source, _: source == -1,
@@ -245,7 +245,7 @@ def check_db_compatibility(args) -> Report:
         ),
         Check(
             check_message="Source db size below 12TB",
-            sql="select pg_database_size(current_database()) size",
+            sql="select pg_database_size(current_database()) as size",
             source_value=lambda x: int(psql(source_uri, x)[0]["size"]),
             target_value=None,
             check=lambda source, _: source < 12_000_000_000_000, # 12 TB.
@@ -254,7 +254,7 @@ def check_db_compatibility(args) -> Report:
         ),
         Check(
             check_message="Source db should not have native partitioning",
-            sql="select count(*) count from pg_partitioned_table",
+            sql="select count(*) as count from pg_partitioned_table",
             source_value=lambda x: int(psql(source_uri, x)[0]["count"]),
             target_value=None,
             check=lambda source, _: source == 0,
@@ -265,7 +265,7 @@ def check_db_compatibility(args) -> Report:
         ),
         Check(
             check_message="Source db should ideally not have non-standard tablespaces",
-            sql="select coalesce(array_agg(spcname), '{}'::text[]) coalesce from pg_tablespace where spcname not in ('pg_default', 'pg_global')",
+            sql="select coalesce(array_agg(spcname), '{}'::text[]) as coalesce from pg_tablespace where spcname not in ('pg_default', 'pg_global')",
             source_value=lambda x: str(psql(source_uri, x)[0]["coalesce"]),
             target_value=None,
             check=lambda source, _: source == "{}",
@@ -276,7 +276,7 @@ def check_db_compatibility(args) -> Report:
         Check(
             check_message="Source db should have only supported extensions",
             sql="""
-        select coalesce(json_agg(json_build_object(extname, extversion)), '[]'::json) agg FROM pg_extension
+        select coalesce(json_agg(json_build_object(extname, extversion)), '[]'::json) as agg FROM pg_extension
         where extname not in (
             'bloom', 'btree_gin', 'btree_gist', 'citext',
             'cube', 'dict_int', 'dict_xsyn', 'fuzzystrmatch',
@@ -367,7 +367,7 @@ def check_db_compatibility(args) -> Report:
         if has_caggs_finalized:
             tsdb_checks.append(Check(
                 check_message="Source db does not have old partial-form continuous aggregates",
-                sql="select count(*) > 0 exists from timescaledb_information.continuous_aggregates where not finalized",
+                sql="select (count(*) > 0) as exists from timescaledb_information.continuous_aggregates where not finalized",
                 source_value=lambda x: str(psql(source_uri, x)[0]["exists"]),
                 target_value=None,
                 check=lambda source, _: source == "f",

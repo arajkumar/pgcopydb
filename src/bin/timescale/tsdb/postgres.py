@@ -181,7 +181,8 @@ def get_related_objs(pguri,
         WHERE
             idxf.faq_indexname IS NULL
         GROUP BY
-            ht.nspname, ht.relname, idx.indexrelid, idxcls.relname, ht.dimensions
+            ht.nspname, ht.relname, idx.indexrelid, idxcls.relname, ht.dimensions,
+            idx.indisprimary
         ORDER BY
             ht.nspname, ht.relname, idxcls.relname
     ), constraints AS (
