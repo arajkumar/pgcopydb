@@ -33,12 +33,16 @@ static CommandLine dump_schema_command =
 		"schema",
 		"Dump source database schema as custom files in work directory",
 		" --source <URI> ",
-		"  --source             Postgres URI to the source database\n"
-		"  --target             Directory where to save the dump files\n"
-		"  --dir                Work directory to use\n"
-		"  --skip-extensions    Skip restoring extensions\n" \
-		"  --filters <filename> Use the filters defined in <filename>\n"
-		"  --snapshot           Use snapshot obtained with pg_export_snapshot\n",
+		"  --source                      Postgres URI to the source database\n"
+		"  --target                      Directory where to save the dump files\n"
+		"  --dir                         Work directory to use\n"
+		"  --skip-extensions             Skip restoring extensions\n"
+		"  --filters <filename>          Use the filters defined in <filename>\n"
+		"  --snapshot                    Use snapshot obtained with pg_export_snapshot\n"
+		"  --split-tables-larger-than    Same-table concurrency size threshold\n"
+		"  --split-max-parts             Maximum number of jobs for Same-table concurrency\n"
+		"  --skip-split-by-ctid          Skip spliting tables by ctid\n"
+		"  --estimate-table-sizes        Allow using estimates for relation sizes\n",
 		cli_dump_schema_getopts,
 		cli_dump_schema);
 
@@ -95,6 +99,10 @@ cli_dump_schema_getopts(int argc, char **argv)
 		{ "trace", no_argument, NULL, 'z' },
 		{ "quiet", no_argument, NULL, 'q' },
 		{ "help", no_argument, NULL, 'h' },
+		{ "split-tables-larger-than", required_argument, NULL, 'L' },
+		{ "split-max-parts", required_argument, NULL, 'u' },
+		{ "skip-split-by-ctid", no_argument, NULL, 'k' },
+		{ "estimate-table-sizes", no_argument, NULL, 'm' },
 		{ NULL, 0, NULL, 0 }
 	};
 
@@ -198,6 +206,52 @@ cli_dump_schema_getopts(int argc, char **argv)
 			{
 				strlcpy(options.snapshot, optarg, sizeof(options.snapshot));
 				log_trace("--snapshot %s", options.snapshot);
+				break;
+			}
+
+			case 'L':
+			{
+				if (!cli_parse_bytes_pretty(
+						optarg,
+						&(options.splitTablesLargerThan.bytes),
+						(char *) &(options.splitTablesLargerThan.bytesPretty),
+						sizeof(options.splitTablesLargerThan.bytesPretty)))
+				{
+					log_fatal("Failed to parse --split-tables-larger-than: \"%s\"",
+							  optarg);
+					++errors;
+				}
+
+				log_trace("--split-tables-larger-than %s (%lld)",
+						  options.splitTablesLargerThan.bytesPretty,
+						  (long long) options.splitTablesLargerThan.bytes);
+				break;
+			}
+
+			case 'k':
+			{
+				options.skipCtidSplit = true;
+				log_trace("--skip-split-by-ctid");
+				break;
+			}
+
+			case 'u':
+			{
+				if (!stringToInt(optarg, &options.splitMaxParts) ||
+					options.splitMaxParts < 1)
+				{
+					log_fatal("Failed to parse --split-max-parts: \"%s\"",
+							  optarg);
+					++errors;
+				}
+				log_trace("--split-max-parts %d", options.splitMaxParts);
+				break;
+			}
+
+			case 'm':
+			{
+				options.estimateTableSizes = true;
+				log_trace("--estimate-table-sizes");
 				break;
 			}
 

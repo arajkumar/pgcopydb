@@ -36,19 +36,23 @@ static CommandLine restore_schema_command =
 		"schema",
 		"Restore a database schema from custom files to target database",
 		" --dir <dir> [ --source <URI> ] --target <URI> ",
-		"  --source             Postgres URI to the source database\n"
-		"  --target             Postgres URI to the target database\n"
-		"  --dir                Work directory to use\n"
-		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
-		"  --drop-if-exists     On the target database, clean-up from a previous run first\n"
-		"  --no-owner           Do not set ownership of objects to match the original database\n"
-		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
-		"  --no-comments        Do not output commands to restore comments\n"
-		"  --no-tablespaces     Do not output commands to select tablespaces\n"
-		"  --filters <filename> Use the filters defined in <filename>\n"
-		"  --restart            Allow restarting when temp files exist already\n"
-		"  --resume             Allow resuming operations after a failure\n"
-		"  --not-consistent     Allow taking a new snapshot on the source database\n",
+		"  --source                      Postgres URI to the source database\n"
+		"  --target                      Postgres URI to the target database\n"
+		"  --dir                         Work directory to use\n"
+		"  --restore-jobs                Number of concurrent jobs for pg_restore\n"
+		"  --drop-if-exists              On the target database, clean-up from a previous run first\n"
+		"  --no-owner                    Do not set ownership of objects to match the original database\n"
+		"  --no-acl                      Prevent restoration of access privileges (grant/revoke commands).\n"
+		"  --no-comments                 Do not output commands to restore comments\n"
+		"  --no-tablespaces              Do not output commands to select tablespaces\n"
+		"  --filters <filename>          Use the filters defined in <filename>\n"
+		"  --restart                     Allow restarting when temp files exist already\n"
+		"  --resume                      Allow resuming operations after a failure\n"
+		"  --not-consistent              Allow taking a new snapshot on the source database\n"
+		"  --split-tables-larger-than    Same-table concurrency size threshold\n"
+		"  --split-max-parts             Maximum number of jobs for Same-table concurrency\n"
+		"  --skip-split-by-ctid          Skip spliting tables by ctid\n"
+		"  --estimate-table-sizes        Allow using estimates for relation sizes\n",
 		cli_restore_schema_getopts,
 		cli_restore_schema);
 
@@ -57,21 +61,25 @@ static CommandLine restore_schema_pre_data_command =
 		"pre-data",
 		"Restore a database pre-data schema from custom file to target database",
 		" --dir <dir> [ --source <URI> ] --target <URI> ",
-		"  --source             Postgres URI to the source database\n"
-		"  --target             Postgres URI to the target database\n"
-		"  --dir                Work directory to use\n"
-		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
-		"  --drop-if-exists     On the target database, clean-up from a previous run first\n"
-		"  --no-owner           Do not set ownership of objects to match the original database\n"
-		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
-		"  --no-comments        Do not output commands to restore comments\n"
-		"  --no-tablespaces     Do not output commands to select tablespaces\n"
-		"  --skip-extensions    Skip restoring extensions\n" \
-		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
-		"  --filters <filename> Use the filters defined in <filename>\n"
-		"  --restart            Allow restarting when temp files exist already\n"
-		"  --resume             Allow resuming operations after a failure\n"
-		"  --not-consistent     Allow taking a new snapshot on the source database\n",
+		"  --source                      Postgres URI to the source database\n"
+		"  --target                      Postgres URI to the target database\n"
+		"  --dir                         Work directory to use\n"
+		"  --restore-jobs                Number of concurrent jobs for pg_restore\n"
+		"  --drop-if-exists              On the target database, clean-up from a previous run first\n"
+		"  --no-owner                    Do not set ownership of objects to match the original database\n"
+		"  --no-acl                      Prevent restoration of access privileges (grant/revoke commands).\n"
+		"  --no-comments                 Do not output commands to restore comments\n"
+		"  --no-tablespaces              Do not output commands to select tablespaces\n"
+		"  --skip-extensions             Skip restoring extensions\n" \
+		"  --skip-ext-comments           Skip restoring COMMENT ON EXTENSION\n" \
+		"  --filters <filename>          Use the filters defined in <filename>\n"
+		"  --restart                     Allow restarting when temp files exist already\n"
+		"  --resume                      Allow resuming operations after a failure\n"
+		"  --not-consistent              Allow taking a new snapshot on the source database\n"
+		"  --split-tables-larger-than    Same-table concurrency size threshold\n"
+		"  --split-max-parts             Maximum number of jobs for Same-table concurrency\n"
+		"  --skip-split-by-ctid          Skip spliting tables by ctid\n"
+		"  --estimate-table-sizes        Allow using estimates for relation sizes\n",
 		cli_restore_schema_getopts,
 		cli_restore_schema_pre_data);
 
@@ -80,20 +88,24 @@ static CommandLine restore_schema_post_data_command =
 		"post-data",
 		"Restore a database post-data schema from custom file to target database",
 		" --dir <dir> [ --source <URI> ] --target <URI> ",
-		"  --source             Postgres URI to the source database\n"
-		"  --target             Postgres URI to the target database\n"
-		"  --dir                Work directory to use\n"
-		"  --restore-jobs       Number of concurrent jobs for pg_restore\n"
-		"  --no-owner           Do not set ownership of objects to match the original database\n"
-		"  --no-acl             Prevent restoration of access privileges (grant/revoke commands).\n"
-		"  --no-comments        Do not output commands to restore comments\n"
-		"  --no-tablespaces     Do not output commands to select tablespaces\n"
-		"  --skip-extensions    Skip restoring extensions\n" \
-		"  --skip-ext-comments  Skip restoring COMMENT ON EXTENSION\n" \
-		"  --filters <filename> Use the filters defined in <filename>\n"
-		"  --restart            Allow restarting when temp files exist already\n"
-		"  --resume             Allow resuming operations after a failure\n"
-		"  --not-consistent     Allow taking a new snapshot on the source database\n",
+		"  --source                      Postgres URI to the source database\n"
+		"  --target                      Postgres URI to the target database\n"
+		"  --dir                         Work directory to use\n"
+		"  --restore-jobs                Number of concurrent jobs for pg_restore\n"
+		"  --no-owner                    Do not set ownership of objects to match the original database\n"
+		"  --no-acl                      Prevent restoration of access privileges (grant/revoke commands).\n"
+		"  --no-comments                 Do not output commands to restore comments\n"
+		"  --no-tablespaces              Do not output commands to select tablespaces\n"
+		"  --skip-extensions             Skip restoring extensions\n" \
+		"  --skip-ext-comments           Skip restoring COMMENT ON EXTENSION\n" \
+		"  --filters <filename>          Use the filters defined in <filename>\n"
+		"  --restart                     Allow restarting when temp files exist already\n"
+		"  --resume                      Allow resuming operations after a failure\n"
+		"  --not-consistent              Allow taking a new snapshot on the source database\n"
+		"  --split-tables-larger-than    Same-table concurrency size threshold\n"
+		"  --split-max-parts             Maximum number of jobs for Same-table concurrency\n"
+		"  --skip-split-by-ctid          Skip spliting tables by ctid\n"
+		"  --estimate-table-sizes        Allow using estimates for relation sizes\n",
 		cli_restore_schema_getopts,
 		cli_restore_schema_post_data);
 
@@ -170,6 +182,10 @@ cli_restore_schema_getopts(int argc, char **argv)
 		{ "resume", no_argument, NULL, 'R' },
 		{ "not-consistent", no_argument, NULL, 'C' },
 		{ "snapshot", required_argument, NULL, 'N' },
+		{ "split-tables-larger-than", required_argument, NULL, 'L' },
+		{ "split-max-parts", required_argument, NULL, 'u' },
+		{ "skip-split-by-ctid", no_argument, NULL, 'k' },
+		{ "estimate-table-sizes", no_argument, NULL, 'm' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "notice", no_argument, NULL, 'v' },
@@ -321,6 +337,52 @@ cli_restore_schema_getopts(int argc, char **argv)
 							  options.filterFileName);
 					++errors;
 				}
+				break;
+			}
+
+			case 'L':
+			{
+				if (!cli_parse_bytes_pretty(
+						optarg,
+						&(options.splitTablesLargerThan.bytes),
+						(char *) &(options.splitTablesLargerThan.bytesPretty),
+						sizeof(options.splitTablesLargerThan.bytesPretty)))
+				{
+					log_fatal("Failed to parse --split-tables-larger-than: \"%s\"",
+							  optarg);
+					++errors;
+				}
+
+				log_trace("--split-tables-larger-than %s (%lld)",
+						  options.splitTablesLargerThan.bytesPretty,
+						  (long long) options.splitTablesLargerThan.bytes);
+				break;
+			}
+
+			case 'k':
+			{
+				options.skipCtidSplit = true;
+				log_trace("--skip-split-by-ctid");
+				break;
+			}
+
+			case 'u':
+			{
+				if (!stringToInt(optarg, &options.splitMaxParts) ||
+					options.splitMaxParts < 1)
+				{
+					log_fatal("Failed to parse --split-max-parts: \"%s\"",
+							  optarg);
+					++errors;
+				}
+				log_trace("--split-max-parts %d", options.splitMaxParts);
+				break;
+			}
+
+			case 'm':
+			{
+				options.estimateTableSizes = true;
+				log_trace("--estimate-table-sizes");
 				break;
 			}
 

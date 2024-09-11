@@ -199,6 +199,7 @@ def migrate_existing_data_across_ts_versions(args):
                                 "$PGCOPYDB_DIR/pgcopydb_clone",
                                 "--snapshot",
                                 "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--split-tables-larger-than=1GB",
                                 "--resume",
                                 ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
@@ -214,6 +215,7 @@ def migrate_existing_data_across_ts_versions(args):
                                      "--snapshot",
                                      "$(cat $PGCOPYDB_DIR/snapshot)",
                                      "--resume",
+                                     "--split-tables-larger-than=1GB",
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
@@ -276,6 +278,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                 "$PGCOPYDB_DIR/pgcopydb_clone",
                                 "--snapshot",
                                 "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--split-tables-larger-than=1GB",
                                 "--resume",
                                 ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
@@ -291,6 +294,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                      "--snapshot",
                                      "$(cat $PGCOPYDB_DIR/snapshot)",
                                      "--resume",
+                                     "--split-tables-larger-than=1GB",
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
@@ -428,6 +432,7 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
                                 clone_dir,
                                 "--snapshot",
                                 "$(cat $PGCOPYDB_DIR/snapshot)",
+                                "--split-tables-larger-than=1GB",
                                 "--resume",
                                 ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
@@ -443,6 +448,7 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
                                      "--snapshot",
                                      "$(cat $PGCOPYDB_DIR/snapshot)",
                                      "--resume",
+                                     "--split-tables-larger-than=1GB",
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
 
