@@ -950,6 +950,9 @@ fn test_pg_to_ts_with_table_data_filtering() -> Result<()> {
 
 		CREATE TABLE metrics(id serial, time timestamptz, value float8, primary key(id, time));
 		INSERT INTO metrics(time, value) SELECT time, random() FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+
+		CREATE TABLE metrics_tmp (LIKE metrics);
+		INSERT INTO metrics_tmp SELECT * FROM metrics;
 	"#),
     )?;
 
@@ -994,6 +997,48 @@ fn test_pg_to_ts_with_table_data_filtering() -> Result<()> {
         .spawn()
         .expect("failed to send signal");
 
+    // Wait for the initial data copy to complete.
+    wait_for_source_target_sync(
+        &source_container,
+        &target_container,
+        Duration::from_secs(60),
+    )?;
+
+    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+    // Ensure that chunks and normal tables are vacuumed.
+    let ensure_vacuum_sql = r"
+		SELECT
+			bool_and(vacuum_count = 1) AND bool_and(analyze_count = 1)
+		FROM
+			pg_stat_user_tables ut
+		LEFT JOIN
+			_timescaledb_catalog.hypertable ht
+		ON (ut.schemaname = ht.schema_name AND ut.relname = ht.table_name)
+		WHERE
+			ht.schema_name IS NULL
+		AND
+			ut.schemaname NOT IN ('_timescaledb_catalog',
+							   '_timescaledb_cache',
+							   '_timescaledb_config',
+							   '_timescaledb_debug',
+							   '__live_migration'
+							   );
+	";
+
+    target_assert.is_true(ensure_vacuum_sql);
+
+    // Ensure hypertable root is not vacuumed.
+    let ensure_root_not_vacuumed_sql = r"
+		SELECT
+			bool_and(vacuum_count = 0) AND bool_and(analyze_count = 0)
+		FROM
+			pg_stat_user_tables ut
+		JOIN
+			timescaledb_information.hypertables ht
+		ON (ut.schemaname, ut.relname) = (ht.hypertable_schema, ht.hypertable_name)
+	";
+    target_assert.is_true(ensure_root_not_vacuumed_sql);
+
     psql(
         &source_container,
         Sql(r#"
@@ -1007,7 +1052,6 @@ fn test_pg_to_ts_with_table_data_filtering() -> Result<()> {
         Duration::from_secs(60),
     )?;
 
-    let mut target_assert = DbAssert::new(&target_container.connection_string())?;
     target_assert.has_table_count("public", "Metrics_data_excluded", 0);
     target_assert.has_table_count("public", "metrics", 1440);
 

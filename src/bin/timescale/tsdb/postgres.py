@@ -10,6 +10,7 @@ from multiprocessing import Pool
 
 from catalog.pgcopydb import Catalog, Filter
 from psql import psql as psql_cmd
+from utils import timeit
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +325,41 @@ def try_creating_incompatible_objects(args, hypertables):
         hypertables = [(args, ht) for ht in hypertables]
         pool.starmap(_create_constraint, hypertables)
 
-    # TODO: Should we run ANALYZE on the hypertables?
+
+def _vacuum_analyze(conn, table):
+    table = table["fq_table_name"]
+    sql = f"VACUUM ANALYZE {table}"
+    with timeit(sql):
+        psql_cmd(conn, sql)
+
+def vacuum_analyze_chunks_and_tables(conn, jobs):
+    """
+    Analyze chunks and tables on the target database excluding
+    hypertable root tables.
+    """
+    sql = """
+    SELECT
+        format('%I.%I', ut.schemaname, ut.relname) AS fq_table_name
+    FROM
+        pg_stat_user_tables ut
+    LEFT JOIN
+        _timescaledb_catalog.hypertable ht
+    ON (ut.schemaname = ht.schema_name AND ut.relname = ht.table_name)
+    WHERE
+        ht.schema_name IS NULL
+        AND
+        ut.schemaname NOT IN (
+                           '_timescaledb_catalog',
+                           '_timescaledb_cache',
+                           '_timescaledb_config',
+                           '_timescaledb_debug',
+                           '__live_migration'
+                           );
+    """
+    tables = psql_cmd(conn, sql)
+    with Pool(processes=int(jobs)) as pool:
+        pool.starmap(_vacuum_analyze, [(conn, table) for table in tables])
+
 
 
 # HypertableCompatibility class is responsible for checking the compatibility of

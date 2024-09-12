@@ -16,7 +16,7 @@ from exec import run_cmd, psql
 logger = logging.getLogger(__name__)
 
 class timeit:
-    def __init__(self, topic: str = None):
+    def __init__(self, topic):
         self.topic = topic
 
     def __enter__(self):

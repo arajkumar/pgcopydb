@@ -31,7 +31,10 @@ from catalog import (
         pgcopydb
 )
 from psql import psql as psql_cmd
-from tsdb.postgres import create_hypertable_compatibility
+from tsdb.postgres import (
+        create_hypertable_compatibility,
+        vacuum_analyze_chunks_and_tables,
+)
 from tsdb.cross_version import CrossVersionMigration
 from tsdb.timescaledb import TimescaleDB
 
@@ -332,6 +335,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                         "--no-acl",
                         "--no-owner",
                         "--fail-fast",
+                        "--skip-vacuum",
                         "--snapshot",
                         get_snapshot_id(env['PGCOPYDB_DIR']),
                     ] + filter_args
@@ -343,12 +347,20 @@ def migrate_existing_data_from_pg_to_tsdb(args):
             .wait())
 
     compatibility.create_incompatible_objects()
+
+    if not is_section_migration_complete("analyze-db"):
+        with timeit("Analyze tables"):
+            # Lets use both table and index jobs for vacuum analyze
+            jobs = int(args.table_jobs) + int(args.index_jobs)
+            vacuum_analyze_chunks_and_tables(args.target, jobs)
+        mark_section_complete("analyze-db")
+
     stop_progress.set()
 
 
 def migrate_roles():
     logger.info(f"Dumping roles to {env['PGCOPYDB_DIR']}/roles.sql ...")
-    with timeit():
+    with timeit("Dump roles"):
         source_pg_uri = env["PGCOPYDB_SOURCE_PGURI"]
         source_dbname = dbname_from_uri(source_pg_uri)
         if source_dbname == "":
@@ -476,7 +488,7 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
 
     stop_progress = monitor_db_sizes(args.dir, args.source, args.target)
 
-    with timeit():
+    with timeit("Copy table data"):
        (Process(clone_args, "clone")
             .with_logging()
             # The primary aim for using a retry here is to handle disk resize events.
