@@ -1,11 +1,11 @@
--- KEEPALIVE {"lsn":"0/24E8B88","timestamp":"2024-08-06 06:26:15.797861+0000"}
-BEGIN; -- {"xid":500,"lsn":"0/24E8B88","timestamp":"2024-08-06 06:26:15.798656+0000","commit_lsn":"0/24E8FF0"}
+-- KEEPALIVE {"lsn":"0/24ED400","timestamp":"2024-09-18 18:01:33.658662+0000"}
+BEGIN; -- {"xid":501,"lsn":"0/24ED400","timestamp":"2024-09-18 18:01:33.661063+0000","commit_lsn":"0/24ED868"}
 PREPARE ec9f2790 AS INSERT INTO "public"."rental" ("rental_id", "rental_date", "inventory_id", "customer_id", "return_date", "staff_id", "last_update") overriding system value VALUES ($1, $2, $3, $4, $5, $6, $7);
 EXECUTE ec9f2790["16050","2022-06-01 00:00:00+00","371","291",null,"1","2022-06-01 00:00:00+00"];
 PREPARE 4afa901a AS INSERT INTO "public"."payment_p2022_06" ("payment_id", "customer_id", "staff_id", "rental_id", "amount", "payment_date") overriding system value VALUES ($1, $2, $3, $4, $5, $6);
 EXECUTE 4afa901a["32099","291","1","16050","5.99","2022-06-01 00:00:00+00"];
-COMMIT; -- {"xid":500,"lsn":"0/24E8FF0","timestamp":"2024-08-06 06:26:15.798656+0000"}
-BEGIN; -- {"xid":501,"lsn":"0/24E8FF0","timestamp":"2024-08-06 06:26:15.799793+0000","commit_lsn":"0/24EA0D8"}
+COMMIT; -- {"xid":501,"lsn":"0/24ED868","timestamp":"2024-09-18 18:01:33.661063+0000"}
+BEGIN; -- {"xid":502,"lsn":"0/24ED868","timestamp":"2024-09-18 18:01:33.664223+0000","commit_lsn":"0/24EE950"}
 PREPARE 6ee4a968 AS UPDATE "public"."payment_p2022_02" SET "amount" = $1 WHERE "payment_id" = $2 and "customer_id" = $3 and "staff_id" = $4 and "rental_id" = $5 and "amount" = $6 and "payment_date" = $7;
 EXECUTE 6ee4a968["11.95","23757","116","2","14763","11.99","2022-02-11 03:52:25.634006+00"];
 PREPARE 6ee4a968 AS UPDATE "public"."payment_p2022_02" SET "amount" = $1 WHERE "payment_id" = $2 and "customer_id" = $3 and "staff_id" = $4 and "rental_id" = $5 and "amount" = $6 and "payment_date" = $7;
@@ -26,14 +26,14 @@ PREPARE dc973d3c AS UPDATE "public"."payment_p2022_07" SET "amount" = $1 WHERE "
 EXECUTE dc973d3c["11.95","28814","592","1","3973","11.99","2022-07-06 12:15:38.928947+00"];
 PREPARE dc973d3c AS UPDATE "public"."payment_p2022_07" SET "amount" = $1 WHERE "payment_id" = $2 and "customer_id" = $3 and "staff_id" = $4 and "rental_id" = $5 and "amount" = $6 and "payment_date" = $7;
 EXECUTE dc973d3c["11.95","29136","13","2","8831","11.99","2022-07-22 16:15:40.797771+00"];
-COMMIT; -- {"xid":501,"lsn":"0/24EA0D8","timestamp":"2024-08-06 06:26:15.799793+0000"}
-BEGIN; -- {"xid":502,"lsn":"0/24EA298","timestamp":"2024-08-06 06:26:15.799955+0000","commit_lsn":"0/24EA3A8"}
+COMMIT; -- {"xid":502,"lsn":"0/24EE950","timestamp":"2024-09-18 18:01:33.664223+0000"}
+BEGIN; -- {"xid":503,"lsn":"0/24EEB10","timestamp":"2024-09-18 18:01:33.664604+0000","commit_lsn":"0/24EEC20"}
 PREPARE 9b3560f5 AS DELETE FROM "public"."payment_p2022_06" WHERE "payment_id" = $1 and "customer_id" = $2 and "staff_id" = $3 and "rental_id" = $4 and "amount" = $5 and "payment_date" = $6;
 EXECUTE 9b3560f5["32099","291","1","16050","5.99","2022-06-01 00:00:00+00"];
 PREPARE 2ca9993d AS DELETE FROM "public"."rental" WHERE "rental_id" = $1;
 EXECUTE 2ca9993d["16050"];
-COMMIT; -- {"xid":502,"lsn":"0/24EA3A8","timestamp":"2024-08-06 06:26:15.799955+0000"}
-BEGIN; -- {"xid":503,"lsn":"0/24EA3A8","timestamp":"2024-08-06 06:26:15.800532+0000","commit_lsn":"0/24EA928"}
+COMMIT; -- {"xid":503,"lsn":"0/24EEC20","timestamp":"2024-09-18 18:01:33.664604+0000"}
+BEGIN; -- {"xid":504,"lsn":"0/24EEC20","timestamp":"2024-09-18 18:01:33.665211+0000","commit_lsn":"0/24EF1A0"}
 PREPARE 6ee4a968 AS UPDATE "public"."payment_p2022_02" SET "amount" = $1 WHERE "payment_id" = $2 and "customer_id" = $3 and "staff_id" = $4 and "rental_id" = $5 and "amount" = $6 and "payment_date" = $7;
 EXECUTE 6ee4a968["11.99","23757","116","2","14763","11.95","2022-02-11 03:52:25.634006+00"];
 PREPARE 6ee4a968 AS UPDATE "public"."payment_p2022_02" SET "amount" = $1 WHERE "payment_id" = $2 and "customer_id" = $3 and "staff_id" = $4 and "rental_id" = $5 and "amount" = $6 and "payment_date" = $7;
@@ -54,41 +54,49 @@ PREPARE dc973d3c AS UPDATE "public"."payment_p2022_07" SET "amount" = $1 WHERE "
 EXECUTE dc973d3c["11.99","28814","592","1","3973","11.95","2022-07-06 12:15:38.928947+00"];
 PREPARE dc973d3c AS UPDATE "public"."payment_p2022_07" SET "amount" = $1 WHERE "payment_id" = $2 and "customer_id" = $3 and "staff_id" = $4 and "rental_id" = $5 and "amount" = $6 and "payment_date" = $7;
 EXECUTE dc973d3c["11.99","29136","13","2","8831","11.95","2022-07-22 16:15:40.797771+00"];
-COMMIT; -- {"xid":503,"lsn":"0/24EA928","timestamp":"2024-08-06 06:26:15.800532+0000"}
-BEGIN; -- {"xid":504,"lsn":"0/24EA928","timestamp":"2024-08-06 06:26:15.801018+0000","commit_lsn":"0/24EAC00"}
+COMMIT; -- {"xid":504,"lsn":"0/24EF1A0","timestamp":"2024-09-18 18:01:33.665211+0000"}
+BEGIN; -- {"xid":505,"lsn":"0/24EF1A0","timestamp":"2024-09-18 18:01:33.665929+0000","commit_lsn":"0/24EF478"}
 PREPARE 21a8a4dc AS DELETE FROM "public"."address" WHERE "address_id" = $1 and "address" = $2 and "address2" IS NULL and "district" = $3 and "city_id" = $4 and "postal_code" = $5 and "phone" = $6 and "last_update" = $7;
 EXECUTE 21a8a4dc["1","47 MySakila Drive","Alberta","300","","","2022-02-15 09:45:30+00"];
 PREPARE 21a8a4dc AS DELETE FROM "public"."address" WHERE "address_id" = $1 and "address" = $2 and "address2" IS NULL and "district" = $3 and "city_id" = $4 and "postal_code" = $5 and "phone" = $6 and "last_update" = $7;
 EXECUTE 21a8a4dc["3","23 Workhaven Lane","Alberta","300","","14033335568","2022-02-15 09:45:30+00"];
 PREPARE 3f3ad11 AS UPDATE "public"."address" SET "postal_code" = $1 WHERE "address_id" = $2 and "address" = $3 and "address2" IS NULL and "district" = $4 and "city_id" = $5 and "postal_code" = $6 and "phone" = $7 and "last_update" = $8;
 EXECUTE 3f3ad11["751007","4","1411 Lillydale Drive","QLD","576","","6172235589","2022-02-15 09:45:30+00"];
-COMMIT; -- {"xid":504,"lsn":"0/24EAC00","timestamp":"2024-08-06 06:26:15.801018+0000"}
-BEGIN; -- {"xid":505,"lsn":"0/24EAC00","timestamp":"2024-08-06 06:26:15.801328+0000","commit_lsn":"0/24EAF78"}
+COMMIT; -- {"xid":505,"lsn":"0/24EF478","timestamp":"2024-09-18 18:01:33.665929+0000"}
+BEGIN; -- {"xid":506,"lsn":"0/24EF478","timestamp":"2024-09-18 18:01:33.666222+0000","commit_lsn":"0/24EF7F0"}
 PREPARE a5a12d9d AS INSERT INTO "public"."generated_column_test" ("id", "name", "email") overriding system value VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9);
 EXECUTE a5a12d9d["1","Tiger","tiger@wild.com","2","Elephant","elephant@wild.com","3","Cat","cat@home.net"];
-COMMIT; -- {"xid":505,"lsn":"0/24EAF78","timestamp":"2024-08-06 06:26:15.801328+0000"}
-BEGIN; -- {"xid":506,"lsn":"0/24EAF78","timestamp":"2024-08-06 06:26:15.801557+0000","commit_lsn":"0/24EB118"}
+COMMIT; -- {"xid":506,"lsn":"0/24EF7F0","timestamp":"2024-09-18 18:01:33.666222+0000"}
+BEGIN; -- {"xid":507,"lsn":"0/24EF7F0","timestamp":"2024-09-18 18:01:33.666419+0000","commit_lsn":"0/24EF990"}
 PREPARE acf3f3fd AS UPDATE "public"."generated_column_test" SET "name" = $1, "greet_hello" = DEFAULT, "greet_hi" = DEFAULT, "time" = DEFAULT, "email" = $2, "table" = DEFAULT, """table""" = DEFAULT, """hel""lo""" = DEFAULT WHERE "id" = $3;
 EXECUTE acf3f3fd["Lion","tiger@wild.com","1"];
 PREPARE acf3f3fd AS UPDATE "public"."generated_column_test" SET "name" = $1, "greet_hello" = DEFAULT, "greet_hi" = DEFAULT, "time" = DEFAULT, "email" = $2, "table" = DEFAULT, """table""" = DEFAULT, """hel""lo""" = DEFAULT WHERE "id" = $3;
 EXECUTE acf3f3fd["Lion","lion@wild.com","1"];
-COMMIT; -- {"xid":506,"lsn":"0/24EB118","timestamp":"2024-08-06 06:26:15.801557+0000"}
-BEGIN; -- {"xid":507,"lsn":"0/24EB118","timestamp":"2024-08-06 06:26:15.801682+0000","commit_lsn":"0/24EB210"}
+COMMIT; -- {"xid":507,"lsn":"0/24EF990","timestamp":"2024-09-18 18:01:33.666419+0000"}
+BEGIN; -- {"xid":508,"lsn":"0/24EF990","timestamp":"2024-09-18 18:01:33.666507+0000","commit_lsn":"0/24EFA88"}
 PREPARE acf3f3fd AS UPDATE "public"."generated_column_test" SET "name" = $1, "greet_hello" = DEFAULT, "greet_hi" = DEFAULT, "time" = DEFAULT, "email" = $2, "table" = DEFAULT, """table""" = DEFAULT, """hel""lo""" = DEFAULT WHERE "id" = $3;
 EXECUTE acf3f3fd["Kitten","kitten@home.com","3"];
-COMMIT; -- {"xid":507,"lsn":"0/24EB210","timestamp":"2024-08-06 06:26:15.801682+0000"}
-BEGIN; -- {"xid":508,"lsn":"0/24EB210","timestamp":"2024-08-06 06:26:15.801795+0000","commit_lsn":"0/24EB290"}
+COMMIT; -- {"xid":508,"lsn":"0/24EFA88","timestamp":"2024-09-18 18:01:33.666507+0000"}
+BEGIN; -- {"xid":509,"lsn":"0/24EFA88","timestamp":"2024-09-18 18:01:33.666584+0000","commit_lsn":"0/24EFB08"}
 PREPARE 586d3754 AS DELETE FROM "public"."generated_column_test" WHERE "id" = $1;
 EXECUTE 586d3754["2"];
-COMMIT; -- {"xid":508,"lsn":"0/24EB290","timestamp":"2024-08-06 06:26:15.801795+0000"}
-BEGIN; -- {"xid":509,"lsn":"0/24EB290","timestamp":"2024-08-06 06:26:15.802041+0000","commit_lsn":"0/24EB938"}
+COMMIT; -- {"xid":509,"lsn":"0/24EFB08","timestamp":"2024-09-18 18:01:33.666584+0000"}
+BEGIN; -- {"xid":510,"lsn":"0/24EFB08","timestamp":"2024-09-18 18:01:33.666764+0000","commit_lsn":"0/24EFC68"}
+PREPARE 14a82b14 AS INSERT INTO "public"."single_column_table" ("id") overriding system value VALUES ($1), ($2);
+EXECUTE 14a82b14["1","2"];
+PREPARE 45a47ea2 AS INSERT INTO "public"."multi_column_table" ("id", "name", "email") overriding system value VALUES ($1, $2, $3), ($4, $5, $6);
+EXECUTE 45a47ea2["1","Alice","alice@hello.com","2","Bob","bob@hello.com"];
+COMMIT; -- {"xid":510,"lsn":"0/24EFC68","timestamp":"2024-09-18 18:01:33.666764+0000"}
+BEGIN; -- {"xid":511,"lsn":"0/24EFC68","timestamp":"2024-09-18 18:01:33.666834+0000","commit_lsn":"0/24EFE50"}
+COMMIT; -- {"xid":511,"lsn":"0/24EFE50","timestamp":"2024-09-18 18:01:33.666834+0000"}
+BEGIN; -- {"xid":512,"lsn":"0/24EFE50","timestamp":"2024-09-18 18:01:33.667030+0000","commit_lsn":"0/24F0510"}
 TRUNCATE ONLY "Sp1eCial .Char"."source1testing"
-COMMIT; -- {"xid":509,"lsn":"0/24EB938","timestamp":"2024-08-06 06:26:15.802041+0000"}
-BEGIN; -- {"xid":510,"lsn":"0/24EB938","timestamp":"2024-08-06 06:26:15.802382+0000","commit_lsn":"0/24EBC50"}
+COMMIT; -- {"xid":512,"lsn":"0/24F0510","timestamp":"2024-09-18 18:01:33.667030+0000"}
+BEGIN; -- {"xid":513,"lsn":"0/24F0510","timestamp":"2024-09-18 18:01:33.667210+0000","commit_lsn":"0/24F0828"}
 PREPARE 5fb4b087 AS INSERT INTO "Sp1eCial .Char"."source1testing" ("s0", "s""1") overriding system value VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10);
 EXECUTE 5fb4b087["6","1","7","2","8","3","9","4","10","5"];
-COMMIT; -- {"xid":510,"lsn":"0/24EBC50","timestamp":"2024-08-06 06:26:15.802382+0000"}
-BEGIN; -- {"xid":511,"lsn":"0/24EBC50","timestamp":"2024-08-06 06:26:15.802701+0000","commit_lsn":"0/24EBE10"}
+COMMIT; -- {"xid":513,"lsn":"0/24F0828","timestamp":"2024-09-18 18:01:33.667210+0000"}
+BEGIN; -- {"xid":514,"lsn":"0/24F0828","timestamp":"2024-09-18 18:01:33.667345+0000","commit_lsn":"0/24F09E8"}
 PREPARE 67577134 AS UPDATE "Sp1eCial .Char"."source1testing" SET "s""1" = $1 WHERE "s0" = $2;
 EXECUTE 67577134["2","6"];
 PREPARE 67577134 AS UPDATE "Sp1eCial .Char"."source1testing" SET "s""1" = $1 WHERE "s0" = $2;
@@ -99,16 +107,16 @@ PREPARE 67577134 AS UPDATE "Sp1eCial .Char"."source1testing" SET "s""1" = $1 WHE
 EXECUTE 67577134["8","9"];
 PREPARE 67577134 AS UPDATE "Sp1eCial .Char"."source1testing" SET "s""1" = $1 WHERE "s0" = $2;
 EXECUTE 67577134["10","10"];
-COMMIT; -- {"xid":511,"lsn":"0/24EBE10","timestamp":"2024-08-06 06:26:15.802701+0000"}
-BEGIN; -- {"xid":512,"lsn":"0/24EBE10","timestamp":"2024-08-06 06:26:15.802820+0000","commit_lsn":"0/24EBE80"}
+COMMIT; -- {"xid":514,"lsn":"0/24F09E8","timestamp":"2024-09-18 18:01:33.667345+0000"}
+BEGIN; -- {"xid":515,"lsn":"0/24F09E8","timestamp":"2024-09-18 18:01:33.667384+0000","commit_lsn":"0/24F0A58"}
 PREPARE fddd6a1b AS DELETE FROM "Sp1eCial .Char"."source1testing" WHERE "s0" = $1;
 EXECUTE fddd6a1b["8"];
-COMMIT; -- {"xid":512,"lsn":"0/24EBE80","timestamp":"2024-08-06 06:26:15.802820+0000"}
-BEGIN; -- {"xid":513,"lsn":"0/24EBE80","timestamp":"2024-08-06 06:26:15.803119+0000","commit_lsn":"0/24EC148"}
+COMMIT; -- {"xid":515,"lsn":"0/24F0A58","timestamp":"2024-09-18 18:01:33.667384+0000"}
+BEGIN; -- {"xid":516,"lsn":"0/24F0A58","timestamp":"2024-09-18 18:01:33.667534+0000","commit_lsn":"0/24F0D08"}
 PREPARE 477f61f7 AS INSERT INTO "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456"."abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" ("abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456") overriding system value VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10);
 EXECUTE 477f61f7["6","1","7","2","8","3","9","4","10","5"];
-COMMIT; -- {"xid":513,"lsn":"0/24EC148","timestamp":"2024-08-06 06:26:15.803119+0000"}
-BEGIN; -- {"xid":514,"lsn":"0/24EC148","timestamp":"2024-08-06 06:26:15.803499+0000","commit_lsn":"0/24EC498"}
+COMMIT; -- {"xid":516,"lsn":"0/24F0D08","timestamp":"2024-09-18 18:01:33.667534+0000"}
+BEGIN; -- {"xid":517,"lsn":"0/24F0D08","timestamp":"2024-09-18 18:01:33.667809+0000","commit_lsn":"0/24F1058"}
 PREPARE c2fc8166 AS UPDATE "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456"."abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" SET "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456" = $1 WHERE "abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" = $2;
 EXECUTE c2fc8166["4","1"];
 PREPARE c2fc8166 AS UPDATE "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456"."abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" SET "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456" = $1 WHERE "abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" = $2;
@@ -129,6 +137,6 @@ PREPARE c2fc8166 AS UPDATE "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567890123456789012345
 EXECUTE c2fc8166["8","9"];
 PREPARE c2fc8166 AS UPDATE "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456"."abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" SET "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789012345678901234567890123456" = $1 WHERE "abcdefghijklmnopqrstuvwxyz0123456789012345678901234567890123456" = $2;
 EXECUTE c2fc8166["10","10"];
-COMMIT; -- {"xid":514,"lsn":"0/24EC498","timestamp":"2024-08-06 06:26:15.803499+0000"}
--- KEEPALIVE {"lsn":"0/24EC498","timestamp":"2024-08-06 06:26:15.803531+0000"}
--- ENDPOS {"lsn":"0/24EC498"}
+COMMIT; -- {"xid":517,"lsn":"0/24F1058","timestamp":"2024-09-18 18:01:33.667809+0000"}
+-- KEEPALIVE {"lsn":"0/24F1058","timestamp":"2024-09-18 18:01:33.667850+0000"}
+-- ENDPOS {"lsn":"0/24F1058"}
