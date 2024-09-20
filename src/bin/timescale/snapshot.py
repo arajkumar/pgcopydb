@@ -21,15 +21,28 @@ def _snapshot(args):
 
     raise_if_volume_not_mounted(args.dir)
 
-    logger.info("Running compatibility checks. This will take few seconds ...")
-    report = check_db_compatibility(args=args)
-    report.log()
-    args.telemetry.progress("completed-compatibility-checks")
-    if report.has_errors():
-        if args.ignore_compatibility_checks:
-            logger.warn("Ignoring failed compatibility checks failed between source and target databases ...")
+    if args.skip_compatibility_checks:
+        logger.warning("Skipping compatibility checks. This may lead to unexpected failures.")
+    else:
+        try:
+            logger.info("Running compatibility checks. This will take few seconds ...")
+            report = check_db_compatibility(args=args)
+            report.raise_on_error()
+        except ValidationError as e:
+            args.telemetry.add_exception()
+            message = textwrap.dedent(str(e))
+            logger.error(message)
+            if args.ignore_compatibility_errors:
+                message = """
+                          Ignoring compatibility errors. This may lead other
+                          issues or unexpected behavior.
+                          """
+                logger.warning(textwrap.dedent(message))
+            else:
+                logger.error("Please fix the compatibility issues and retry.")
+                sys.exit(1)
         else:
-            raise ValidationError("Compatibility checks failed. Use --ignore-compatibility-checks to ignore them.")
+            args.telemetry.progress("completed-compatibility-checks")
 
 
     logger.info("Creating snapshot ...")

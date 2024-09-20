@@ -10,7 +10,7 @@ from multiprocessing import Pool
 
 from catalog.pgcopydb import Catalog, Filter
 from psql import psql as psql_cmd
-from utils import timeit
+from utils import timeit, get_terminal_width
 
 logger = logging.getLogger(__name__)
 
@@ -395,14 +395,15 @@ class HypertableCompatibility:
         try_creating_incompatible_objects(self.args, self.hypertables)
 
     def _error_summary(self):
+        SEPARATOR = "*" * get_terminal_width()
         message = f"""
-{"*" * 72}
+{SEPARATOR}
 You can do one of the following to resolve the issue:
     1) Skip the compatibility check using the `--skip-hypertable-compatibility-check` flag and manually create the indexes/constraints on the target when the tool fails to create them. This is a most optimal way to resolve the issue.
     2) Fix the incompatible indexes/constraints on the source to include hypertable dimensions and restart the migration from the beginning.
     3) Skip the incompatible indexes/constraints using the `--skip-hypertable-incompatible-objects` flag. Beware, skipping them might slow down the replication of the UPDATE/DELETE operations on the target.
     4) Skip the incompatible indexes/constraints using the `--skip-index` flag and resume the migration.
-{"*" * 72}
+{SEPARATOR}
     """
         return message
 

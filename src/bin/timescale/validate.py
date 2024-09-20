@@ -6,7 +6,7 @@ from enum import Enum
 from dataclasses import dataclass
 
 from psql import psql as psql
-from utils import get_dbtype, DBType, docker_command
+from utils import get_dbtype, DBType, docker_command, get_terminal_width
 from environ import LIVE_MIGRATION_DOCKER
 from exception import ValidationError
 
@@ -149,16 +149,23 @@ class Report:
     def has_errors(self) -> bool:
         return len(self.errors) > 0
 
-    def log(self):
+    def raise_on_error(self):
+        SEPARATOR = "=" * get_terminal_width()
         if len(self.warnings) > 0:
-            logger.warn("Following compatibility checks have warnings:")
+            warning_message = f"Following compatibility checks have warnings:\n{SEPARATOR}\n"
             for w in self.warnings:
-                logger.warn(w.message)
+                message = f"{w.message}\n{SEPARATOR}\n"
+                warning_message += message
+
+            logger.warning(warning_message)
 
         if len(self.errors) > 0:
-            logger.error("Following compatibility checks failed:")
+            error_message = f"Following compatibility checks have failed:\n{SEPARATOR}\n"
             for e in self.errors:
-                logger.error(e.message)
+                message = f"{e.message}\n{SEPARATOR}\n"
+                error_message += message
+
+            raise ValidationError(error_message)
 
     def pretty_print(self):
         for s in self.successes:
@@ -219,7 +226,8 @@ def check_db_compatibility(args) -> Report:
             target_value=lambda x: float(psql(target_uri, x)[0]["version"]),
             check=lambda source, target: source <= target,
             help="Postgres version in source {source} is greater than "
-                 "target {target}. This is not tested and take your own risk."
+                 "target {target}. This is not tested and take your own risk.",
+            warn_only=True
         ),
         Check(
             check_message="Postgres version in source db >= 9",
@@ -229,14 +237,14 @@ def check_db_compatibility(args) -> Report:
             check=lambda source, _: source >= 90000,
             help="Postgres version {source} does not support logical decoding."),
         Check(
-            check_message="'wal_level' is logical",
+            check_message="GUC 'wal_level' must be logical",
             sql="select current_setting('wal_level') as setting",
             source_value=lambda x: str(psql(source_uri, x)[0]["setting"]),
             target_value=None,
             check=lambda source, _: source == "logical",
             help="Source db 'wal_level' GUC must be set to 'logical'"),
         Check(
-            check_message="'old_snapshot_threshold' is -1",
+            check_message="GUC 'old_snapshot_threshold' must be -1",
             sql="select current_setting('old_snapshot_threshold') as setting",
             source_value=lambda x: int(psql(source_uri, x)[0]["setting"]),
             target_value=None,
@@ -244,13 +252,14 @@ def check_db_compatibility(args) -> Report:
             help="Source db 'old_snapshot_threshold' GUC must be set to -1"
         ),
         Check(
-            check_message="Source db size below 12TB",
+            check_message="Source db size should be below 12TB",
             sql="select pg_database_size(current_database()) as size",
             source_value=lambda x: int(psql(source_uri, x)[0]["size"]),
             target_value=None,
             check=lambda source, _: source < 12_000_000_000_000, # 12 TB.
             help="Live migration should not be used with source above 12TB to "
-                 "avoid running out of space on Timescale cloud during migration."
+                 "avoid running out of space on Timescale cloud during migration.",
+            warn_only=True,
         ),
         Check(
             check_message="Source db should not have native partitioning",
@@ -261,7 +270,8 @@ def check_db_compatibility(args) -> Report:
             help="Source db has native partitioning. You may not be able to "
                  "convert them to hypertables. But, you can still migrate the "
                  "data as Postgres partitioned tables and use your own solution "
-                 "to convert them to hypertables."
+                 "to convert them to hypertables.",
+            warn_only=True,
         ),
         Check(
             check_message="Source db should ideally not have non-standard tablespaces",
@@ -269,9 +279,9 @@ def check_db_compatibility(args) -> Report:
             source_value=lambda x: str(psql(source_uri, x)[0]["coalesce"]),
             target_value=None,
             check=lambda source, _: source == "{}",
-            help="While live migration works when source db has "
-                 "non-standard/default tablespaces, it doesn't migrate the "
-                 "non-default ones.",
+            help="Non default table spaces found. While live migration works "
+                 "when source db has non-standard/default tablespaces, "
+                 "it doesn't migrate the non-default ones.",
             warn_only=True),
         Check(
             check_message="Source db should have only supported extensions",
@@ -296,13 +306,14 @@ def check_db_compatibility(args) -> Report:
             source_value=lambda x: str(psql(source_uri, x)[0]["agg"]),
             target_value=None,
             check=lambda source, _: source == "[]",
-            help="Following extensions are not supported on Timescale Cloud: "
-                 "{source}. You can skip unsupported extension using "
-                 "--skip-extension flag during migration.",
+            help="Unsupported extensions found on the source. Following "
+                 "extensions are not supported on Timescale Cloud: {source}. "
+                 "You can skip unsupported extension using --skip-extension "
+                 "flag during migration.",
             warn_only = True,
         ),
         Check(
-            check_message="Source db should not have table attributes with NaN, +- Infinity as values",
+            check_message="Source db should not have tables with NaN, +- Infinity as values",
             sql="""
             select exists (
                 select 1 from pg_stats where
@@ -329,8 +340,9 @@ def check_db_compatibility(args) -> Report:
             source_value=lambda x: str(psql(source_uri, x)[0]["exists"]),
             target_value=None,
             check=lambda source, _: source == "f",
-            help="Current version of live migration do not replicate NaN, "
-                 "Infinity values. Don't use this tool if you have such values."
+            help="NaN/Inf values found on the source. Currently the tool do not "
+                 "replicate NaN/Infinity values. Don't use this tool if you "
+                 "have such values."
     ),
     ]
 
@@ -351,7 +363,9 @@ def check_db_compatibility(args) -> Report:
                     source_value=lambda x: str(psql(source_uri, x)[0]["nspname"]),
                     target_value=None,
                     check=lambda source, _: source == "public",
-                    help="TimescaleDB extension on source should be installed on "
+                    help="TimescaleDB extension on source is installed on "
+                         "non public schema."
+                         "TimescaleDB extension on source should be installed on "
                          "'public' schema. If not, you can still migrate to "
                          "Timescale Cloud by using "
                          "--force-timescaledb-public-schema flag when creating "

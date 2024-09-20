@@ -99,13 +99,24 @@ def main():
                                  help='Output plugin (Default: wal2json)',
                                  default='wal2json',
                                  choices=['wal2json', 'test_decoding'])
-    parser_snapshot.add_argument('--ignore-compatibility-checks',
+    parser_snapshot.add_argument('--skip-compatibility-checks',
                                  default=False,
                                  action='store_true',
-                                 help='Ignore the results of the compatibility '
+                                 help='Skip compatibility checks when creating '
+                                      'a snapshot. Use this flag at your own '
+                                      'risk as it may lead unexpected failures'
+                                      ' during migration.'
+                                )
+    parser_snapshot.add_argument('--ignore-compatibility-errors',
+                                 default=False,
+                                 action='store_true',
+                                 help='Ignore the errors from the compatibility '
                                       'checks when creating a snapshot. This '
                                       'will allow the snapshot to be created '
-                                      'even if the compatibility checks fail.'
+                                      'even when the compatibility checks fail. '
+                                      'Use this flag at your own risk as it may '
+                                      'lead to unexpected failures during '
+                                      'migration.'
                                  )
 
     parser_clean = subparsers.add_parser('clean', help='Clean up resources',

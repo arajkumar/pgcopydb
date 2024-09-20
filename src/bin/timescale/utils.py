@@ -144,3 +144,10 @@ def dbname_from_uri(uri: str) -> str:
         # result.path[1]: '/rbac_test'
         result = urlparse(uri)
         return result.path[1:]
+
+def get_terminal_width():
+    try:
+        import shutil
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
