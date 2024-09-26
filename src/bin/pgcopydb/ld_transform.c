@@ -2223,11 +2223,14 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 						  update->table.relname);
 		int pos = 0;
 
+		int skippedColumns = 0;
+
 		for (int r = 0; r < new->values.count; r++)
 		{
 			LogicalMessageValues *values = &(new->values.array[r]);
 
 			bool first = true;
+
 
 			/* now loop over column values for this VALUES row */
 			for (int v = 0; v < values->cols; v++)
@@ -2269,7 +2272,11 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 					}
 				}
 
-				if (!skip)
+				if (skip)
+				{
+					++skippedColumns;
+				}
+				else
 				{
 					if (attr->isgenerated)
 					{
@@ -2356,20 +2363,44 @@ stream_write_update(FILE *out, LogicalMessageUpdate *update)
 			return false;
 		}
 
-		uint32_t hash = hashlittle(buf->data, buf->len, 5381);
-
-		FFORMAT(out, "PREPARE %x AS %s;\n", hash, buf->data);
-
-		destroyPQExpBuffer(buf);
-
 		/*
-		 * Second, the EXECUTE part.
+		 * When all column values in the SET clause are equal to those in the
+		 * WHERE clause, we remove all columns from the SET clause. This results
+		 * in an invalid UPDATE statement like the one shown below:
+		 *
+		 * UPDATE table SET WHERE "id" = 1;
+		 *
+		 * Usually, the above could happen when REPLICA IDENTITY is set to FULL,
+		 * and the UPDATE statement executed with the same values as the old ones.
+		 * For e.g.
+		 * UPDATE table SET "id" = 1 WHERE "id" = 1;
+		 *
+		 * Skip the UPDATE statement in such cases.
 		 */
-		char *serialized_string = json_serialize_to_string(js);
+		bool skipUpdate = (skippedColumns == new->attributes.count);
 
-		FFORMAT(out, "EXECUTE %x%s;\n", hash, serialized_string);
+		if (skipUpdate)
+		{
+			log_warn("Skipping UPDATE statement as all columns are "
+					 "the same as the old");
+		}
+		else
+		{
+			uint32_t hash = hashlittle(buf->data, buf->len, 5381);
 
-		json_free_serialized_string(serialized_string);
+			FFORMAT(out, "PREPARE %x AS %s;\n", hash, buf->data);
+
+			destroyPQExpBuffer(buf);
+
+			/*
+			 * Second, the EXECUTE part.
+			 */
+			char *serialized_string = json_serialize_to_string(js);
+
+			FFORMAT(out, "EXECUTE %x%s;\n", hash, serialized_string);
+
+			json_free_serialized_string(serialized_string);
+		}
 	}
 
 	return true;
