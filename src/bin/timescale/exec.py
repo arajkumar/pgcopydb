@@ -108,6 +108,7 @@ def run_cmd(cmd: str, log_file: LogFile = None) -> str:
             if retcode != 0:
                 if log_file is not None:
                     print_logs_with_error(log_path=log_file.stderr)
+
                 message = f"""
                 Command '{cmd}' failed with exit code {retcode}.
                 stderr: {err}
@@ -127,6 +128,9 @@ class Retry:
         self.max_retries = max_retries
         self.count = 0
         self.backoff = backoff
+
+    def reset(self):
+        self.count = 0
 
     def increment_and_wait_for_backoff(self):
         self.count += 1
@@ -184,6 +188,8 @@ class Process:
     def current(self) -> subprocess.Popen:
         retcode = self.process.poll()
         if retcode is None:
+            if self.retry:
+                self.retry.reset()
             return self.process
 
         # The process has stopped running since retcode is not None,
@@ -210,8 +216,12 @@ class Process:
             if self.store_logs:
                 print_logs_with_error(self.log_file.stderr)
             out, err = self.process.communicate()
-            cmd_name = self.args[0]
-            logger.error(f"command '{cmd_name}' exited with {retcode} code.\n\nstderr={err}\n\nstdout={out}")
+            cmd = self.args[0]
+            message = f"""Command '{cmd}' failed with exit code {retcode}.
+            stderr: {err}
+            stdout: {out}"""
+            logger.error(message)
+            raise ProcessFailedException(message)
         return self.process
 
     def run(self):
