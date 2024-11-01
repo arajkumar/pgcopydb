@@ -1163,6 +1163,8 @@ fn test_compatible_migration_from_pg_to_ts() -> Result<()> {
 		CREATE UNIQUE INDEX metrics_unique_idx ON metrics (time, id);
 
 		INSERT INTO metrics(time, value, type_id) SELECT time, random(), (floor(random() * 100) + 1) FROM generate_series('2024-01-01 00:00:00', '2024-01-31 23:00:00', INTERVAL'1 hour') as time;
+		CREATE PUBLICATION test_pub FOR TABLE metrics;
+		CREATE SUBSCRIPTION test_sub CONNECTION 'host=source-db user=postgres dbname=postgres' PUBLICATION test_pub WITH(enabled = false, create_slot = false, connect = false);
 	"),
     )?;
 
@@ -1214,6 +1216,12 @@ fn test_compatible_migration_from_pg_to_ts() -> Result<()> {
     )?;
 
     let mut target_assert = DbAssert::new(&target_container.connection_string())?;
+    let mut source_assert = DbAssert::new(&source_container.connection_string())?;
+    source_assert.has_table_count("pg_catalog", "pg_publication_rel", 1);
+    source_assert.has_table_count("pg_catalog", "pg_subscription", 1);
+
+    target_assert.has_table_count("pg_catalog", "pg_publication_rel", 0);
+    target_assert.has_table_count("pg_catalog", "pg_subscription", 0);
     target_assert.has_table_count("public", "metrics", 1440);
 
     target_assert.has_pk("public", "metrics", vec!["id"]);

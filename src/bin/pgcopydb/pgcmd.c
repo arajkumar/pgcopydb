@@ -411,6 +411,12 @@ pg_dump_db(PostgresPaths *pgPaths,
 	args[argsIndex++] = "--section=pre-data";
 	args[argsIndex++] = "--section=post-data";
 
+	/*
+	 * We don't want to migrate publications and subscriptions.
+	 */
+	args[argsIndex++] = "--no-publications";
+	args[argsIndex++] = "--no-subscriptions";
+
 	/* apply [include-only-schema] filtering */
 	for (int i = 0; i < filters->includeOnlySchemaList.count; i++)
 	{
