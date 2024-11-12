@@ -11,7 +11,7 @@ from enum import Enum
 
 from version import SCRIPT_VERSION, DOCKER_IMAGE_NAME
 from environ import LIVE_MIGRATION_DOCKER, env
-from exec import run_cmd, psql
+from psql import psql
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,8 @@ class DBType(Enum):
 
 
 def get_dbtype(uri):
-    result = run_cmd(psql(uri=uri, sql="select exists(select 1 from pg_extension where extname = 'timescaledb');"))
-    if result == "t\n":
+    result = psql(conn=uri, sql="select exists(select 1 from pg_extension where extname = 'timescaledb') as timescaledb;")
+    if result[0]["timescaledb"] == "t":
         return DBType.TIMESCALEDB
     return DBType.POSTGRES
 
@@ -150,3 +150,21 @@ def get_terminal_width():
         return shutil.get_terminal_size().columns
     except Exception:
         return 80
+
+def _guess_db_cpu_count(conn) -> int:
+    try:
+        result = psql(conn, "select current_setting('max_parallel_workers')::int as workers")
+        result = int(result[0]["workers"])
+    except Exception:
+        return 1
+    else:
+        return result
+
+def guess_table_jobs(conn) -> int:
+    db_jobs = _guess_db_cpu_count(conn)
+    if db_jobs < (os.cpu_count() or 1):
+        return db_jobs
+    return os.cpu_count() or 1
+
+def guess_index_jobs(conn) -> int:
+    return _guess_db_cpu_count(conn)

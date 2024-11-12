@@ -18,7 +18,7 @@ from inspect_db import target_activity
 from catalog import target
 from validate import validate
 from telemetry import Telemetry
-from utils import migration_id
+from utils import migration_id, guess_table_jobs, guess_index_jobs
 
 def setup_logging(work_dir: Path):
     logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created).isoformat(sep="T", timespec="milliseconds"))
@@ -131,10 +131,10 @@ def main():
                                            add_help=False)
     parser_migrate.add_argument('--resume', action='store_true', help='Resume the migration')
     parser_migrate.add_argument('--skip-roles', action='store_true', help='Skip roles migration')
-    parser_migrate.add_argument('--table-jobs', default="8", type=str,
-                                help='Number of parallel jobs to copy "existing data" from source db to target db (Default: 8)')
-    parser_migrate.add_argument('--index-jobs', default="8", type=str,
-                                help='Number of parallel jobs to create indexes in target db (Default: 8)')
+    parser_migrate.add_argument('--table-jobs', type=str,
+                                help='Number of parallel jobs to copy "existing data" from source db to target db')
+    parser_migrate.add_argument('--index-jobs', type=str,
+                                help='Number of parallel jobs to create indexes in target db')
 
     parser_migrate.add_argument('--skip-extensions', nargs='*',
                                 help='Skips the given extensions during migration. Empty list skips all extensions.')
@@ -207,6 +207,12 @@ def main():
     pgcopydb_init_env(args)
     create_dirs(args.dir)
 
+    def _add_jobs_args(args):
+        if args.table_jobs is None:
+            args.table_jobs = str(guess_table_jobs(args.target))
+        if args.index_jobs is None:
+            args.index_jobs = str(guess_index_jobs(args.target))
+
     logger = setup_logging(args.dir)
 
     id = migration_id(args.dir)
@@ -234,6 +240,7 @@ def main():
             # Telemetry by default sends event only on failure.
             # Let's enable telemetry on success as well for migrate command.
             telemetry.send_on_success()
+            _add_jobs_args(args)
             exit_code = migrate(args)
             sys.exit(exit_code)
         case 'inspect':
