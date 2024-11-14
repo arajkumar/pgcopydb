@@ -33,16 +33,22 @@ prepareTableSpecsForExtension(CopyTableDataSpec *tableSpecs,
 							  CopyDataSpec *copySpecs,
 							  SourceExtensionConfig *config)
 {
-	SourceTable table = { 0 };
+	SourceTable *table = calloc(1, sizeof(SourceTable));
 
-	strlcpy(table.nspname, config->nspname, sizeof(table.nspname));
-	strlcpy(table.relname, config->relname, sizeof(table.relname));
-	sformat(table.qname, sizeof(table.qname),
+	if (table == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	strlcpy(table->nspname, config->nspname, sizeof(table->nspname));
+	strlcpy(table->relname, config->relname, sizeof(table->relname));
+	sformat(table->qname, sizeof(table->qname),
 			"%s.%s",
 			config->nspname, config->relname);
-	table.oid = config->reloid;
+	table->oid = config->reloid;
 
-	if (!copydb_init_table_specs(tableSpecs, copySpecs, &table, 0))
+	if (!copydb_init_table_specs(tableSpecs, copySpecs, table, 0))
 	{
 		/* errors have already been logged */
 		return false;
@@ -128,6 +134,10 @@ bool
 copydb_copy_extensions(CopyDataSpec *copySpecs, bool createExtensions)
 {
 	PGSQL dst = { 0 };
+
+	pid_t pid = getpid();
+
+	log_notice("Started COPY extensions %d [%d]", pid, getppid());
 
 	if (!catalog_init_from_specs(copySpecs))
 	{

@@ -71,6 +71,7 @@ static char *sourceDBcreateDDLs[] = {
 
 	"create unique index s_t_qname on s_table(qname)",
 	"create unique index s_t_rlname on s_table(restore_list_name)",
+	"create unique index s_t_nspname_relname on s_table(nspname, relname)",
 
 	"create table s_matview("
 	"  oid integer primary key, "
@@ -115,17 +116,20 @@ static char *sourceDBcreateDDLs[] = {
 	"create table s_index("
 	"  oid integer primary key, "
 	"  qname text, nspname text, relname text, restore_list_name text, "
-	"  tableoid references s_table(oid), "
+	"  tableoid integer references s_table(oid), "
 	"  isprimary bool, isunique bool, columns text, sql text "
 	")",
 
 	"create unique index s_i_rlname on s_index(restore_list_name)",
+	"create index s_i_table_oid on s_index(tableoid)",
 
 	"create table s_constraint("
 	"  oid integer primary key, conname text, "
-	"  indexoid references s_index(oid), "
+	"  indexoid integer references s_index(oid), "
 	"  condeferrable bool, condeferred bool, sql text "
 	")",
+
+	"create index s_con_indexoid on s_constraint(indexoid)",
 
 	"create table s_seq("
 	"  oid integer, "
@@ -166,6 +170,9 @@ static char *sourceDBcreateDDLs[] = {
 	"  command text, "
 	"  unique(tableoid, partnum)"
 	")",
+
+	"create index s_su_ind_oid on summary(indexoid)",
+	"create index s_su_con_oid on summary(conoid)",
 
 	"create table vacuum_summary("
 	"  pid integer, "
@@ -297,7 +304,7 @@ static char *filterDBcreateDDLs[] = {
 	"create table s_index("
 	"  oid integer primary key, "
 	"  qname text, nspname text, relname text, restore_list_name text, "
-	"  tableoid references s_table(oid), "
+	"  tableoid integer references s_table(oid), "
 	"  isprimary bool, isunique bool, columns text, sql text "
 	")",
 
@@ -305,7 +312,7 @@ static char *filterDBcreateDDLs[] = {
 
 	"create table s_constraint("
 	"  oid integer primary key, conname text, "
-	"  indexoid references s_index(oid), "
+	"  indexoid integer references s_index(oid), "
 	"  condeferrable bool, condeferred bool, sql text "
 	")",
 
@@ -404,10 +411,11 @@ static char *targetDBcreateDDLs[] = {
 	")",
 
 	"create unique index s_i_rlname on s_index(restore_list_name)",
+	"create unique index s_i_ns_rel on s_index(nspname, relname)",
 
 	"create table s_constraint("
 	"  oid integer primary key, conname text, "
-	"  indexoid references s_index(oid), "
+	"  indexoid integer references s_index(oid), "
 	"  condeferrable bool, condeferred bool, sql text "
 	")"
 };

@@ -686,7 +686,7 @@ def _migrate(args, follow):
             else:
                 args.telemetry.progress(f"replica-identity-for-caggs:{caggs_count}")
 
-    logger.info("Parallel workers => table-jobs: %s index-jobs: %s", args.table_jobs, args.index_jobs)
+    logger.info("Parallel workers => table-jobs: %s index-jobs: %s os.cpu_count: %d", args.table_jobs, args.index_jobs, os.cpu_count())
     # reset endpos
     if args.resume:
         run_cmd("pgcopydb stream sentinel set endpos --dir $PGCOPYDB_DIR 0/0")

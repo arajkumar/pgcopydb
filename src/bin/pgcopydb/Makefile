@@ -85,9 +85,9 @@ ifneq ($(shell uname -s),Darwin)
 SECURITY_CFLAGS += -z noexecstack -Wl,-z,relro -Wl,-z,now
 endif
 
-DEFAULT_CFLAGS += $(SECURITY_CFLAGS)
+DEFAULT_CFLAGS := $(SECURITY_CFLAGS) $(DEFAULT_CFLAGS)
 
-override CFLAGS := $(DEFAULT_CFLAGS) $(CFLAGS)
+override CFLAGS := $(CFLAGS) $(DEFAULT_CFLAGS)
 
 JENKINS_CFLAGS = $(CFLAGS) -Wno-implicit-fallthrough
 

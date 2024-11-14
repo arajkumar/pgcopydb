@@ -1,3 +1,4 @@
+import os
 import time
 import json
 import traceback
@@ -63,6 +64,7 @@ class Telemetry:
                 "version": SCRIPT_VERSION,
                 "method": "LIVE_MIGRATION",
                 "migration_id": id,
+                "cpu_count": os.cpu_count(),
             },
             "command_by_duration_seconds": [],
             "commmand": command,

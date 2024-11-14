@@ -52,16 +52,16 @@ def _has_replication_origin_permission(conn) -> bool:
 def _has_tables_without_replica_ident(source) -> list[dict]:
     # Exclude chunks from the check. Hypertables are already checked.
     if get_dbtype(source) == DBType.TIMESCALEDB:
-        chunks = psql(conn=source,
-                      sql="SELECT chunk_schema, chunk_name FROM timescaledb_information.chunks")
-        chunks = [f"(n.nspname != '{c['chunk_schema']}' AND c.relname != '{c['chunk_name']}')" for c in chunks]
-        chunks = chunks or ["1 = 1"]
-        chunks = " AND ".join(chunks)
+       exclude_chunks = """
+        LEFT JOIN _timescaledb_catalog.chunk c ON (t.nspname = c.schema_name AND t.relname = c.table_name)
+        WHERE c.schema_name IS NULL AND c.table_name IS NULL
+        """
     else:
-        chunks = "1 = 1"
+        exclude_chunks = ""
 
-    sql = f"""SELECT table_name AS tables FROM (
-            SELECT FORMAT('%I.%I', n.nspname, c.relname) AS table_name
+    sql = f"""WITH tables AS (
+            SELECT
+            n.nspname, c.relname
             FROM pg_class c
             JOIN pg_namespace n ON c.relnamespace = n.oid
             LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary = true
@@ -81,13 +81,15 @@ def _has_tables_without_replica_ident(source) -> list[dict]:
             AND i.indrelid IS NULL -- no primary key
             AND con.conrelid IS NULL -- no unique constraints
             AND c.relreplident = 'd' -- default replica identity (not explicitly set)
-            AND ({chunks})
             GROUP BY n.nspname, c.relname
             ORDER BY n.nspname, c.relname
-        ) subquery"""
-
+        )
+        SELECT FORMAT('%I.%I', nspname, relname) AS table_name
+        FROM tables t
+        {exclude_chunks}
+        """
     result = psql(conn=source, sql=sql)
-    result = [r["tables"] for r in result]
+    result = [r["table_name"] for r in result]
     return result
 
 def _target_is_timescale_cloud(target) -> bool:
