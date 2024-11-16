@@ -806,7 +806,7 @@ copydb_update_progress_table_hook(void *ctx, SourceTable *table)
 			return false;
 		}
 
-		done = tableSpecs.partsDonePid > 0;
+		done = tableSpecs.donePartNumber > 0;
 	}
 
 	if (done)

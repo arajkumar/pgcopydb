@@ -182,7 +182,7 @@ static char *sourceDBcreateDDLs[] = {
 	")",
 
 	"create table s_table_parts_done("
-	" tableoid integer primary key references s_table(oid), pid integer"
+	" tableoid integer primary key references s_table(oid), partnum integer"
 	")",
 
 	"create table s_table_indexes_done("

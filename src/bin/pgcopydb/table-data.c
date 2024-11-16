@@ -1385,7 +1385,7 @@ copydb_table_parts_are_all_done(CopyDataSpec *specs,
 		}
 
 		/* set isBeingProcessed to false to allow processing indexes */
-		*isBeingProcessed = (tableSpecs->partsDonePid != getpid());
+		*isBeingProcessed = (tableSpecs->donePartNumber != tableSpecs->part.partNumber);
 	}
 
 	return true;

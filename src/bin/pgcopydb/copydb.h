@@ -146,7 +146,7 @@ typedef struct CopyTableDataSpec
 
 	/* summary/activity tracking */
 	uint32_t countPartsDone;
-	pid_t partsDonePid;
+	int donePartNumber;
 	bool allPartsAreDone;
 
 	uint32_t countIndexesLeft;
