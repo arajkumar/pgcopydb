@@ -618,35 +618,63 @@ copydb_copy_supervisor_add_table_hook(void *ctx, SourceTable *table)
 	}
 	else
 	{
-		/*
-		 * Add as many times the table OID as we have partitions, each with
-		 * their own partition number that starts at 1 (not zero).
-		 *
-		 * Before adding the table to be processed by workers, truncate it on
-		 * the target database now, avoiding concurrency issues.
-		 */
-		bool granted = false;
+		CopyTableDataSpec *tableSpecs =
+			(CopyTableDataSpec *) calloc(1, sizeof(CopyTableDataSpec));
 
-		if (!pgsql_has_table_privilege(dst, table->qname, "TRUNCATE", &granted))
+		DatabaseCatalog *sourceDB = &(specs->catalogs.source);
+
+		if (!copydb_init_table_specs(tableSpecs, specs, table, 0))
 		{
 			/* errors have already been logged */
 			return false;
 		}
 
-		if (granted)
+		if (!summary_table_count_parts_done(sourceDB, tableSpecs))
 		{
-			bool decendants = false;
+			/* errors have already been logged */
+			return false;
+		}
 
-			if (!copydb_table_has_childs(dst, table, &decendants))
+		log_info("Table \"%s\" has %d partitions done",
+				 table->qname,
+				 tableSpecs->countPartsDone);
+
+		/*
+		 * If we have no partitions done, then we need to truncate the table
+		 * on the target database before adding it to the process queue.
+		 */
+		if (tableSpecs->countPartsDone == 0)
+		{
+			/*
+			 * Add as many times the table OID as we have partitions, each with
+			 * their own partition number that starts at 1 (not zero).
+			 *
+			 * Before adding the table to be processed by workers, truncate it on
+			 * the target database now, avoiding concurrency issues.
+			 */
+			bool granted = false;
+
+			if (!pgsql_has_table_privilege(dst, table->qname, "TRUNCATE", &granted))
 			{
 				/* errors have already been logged */
 				return false;
 			}
 
-			if (!pgsql_truncate(dst, table->qname, decendants))
+			if (granted)
 			{
-				/* errors have already been logged */
-				return false;
+				bool decendants = false;
+
+				if (!copydb_table_has_childs(dst, table, &decendants))
+				{
+					/* errors have already been logged */
+					return false;
+				}
+
+				if (!pgsql_truncate(dst, table->qname, decendants))
+				{
+					/* errors have already been logged */
+					return false;
+				}
 			}
 		}
 
@@ -1001,9 +1029,10 @@ copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 	 */
 	if (isDone)
 	{
-		log_info("Skipping table-data %s (%u), already done on a previous run",
+		log_info("Skipping table-data %s (%u) part %d, already done on a previous run",
 				 tableSpecs->sourceTable->qname,
-				 tableSpecs->sourceTable->oid);
+				 tableSpecs->sourceTable->oid,
+				 tableSpecs->sourceTable->partition.partNumber);
 	}
 	else
 	{
@@ -1356,7 +1385,7 @@ copydb_table_parts_are_all_done(CopyDataSpec *specs,
 		}
 
 		/* set isBeingProcessed to false to allow processing indexes */
-		*isBeingProcessed = (tableSpecs->partsDonePid != getpid());
+		*isBeingProcessed = (tableSpecs->donePartNumber != tableSpecs->part.partNumber);
 	}
 
 	return true;

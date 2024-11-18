@@ -688,7 +688,7 @@ summary_add_table_parts_done(DatabaseCatalog *catalog,
 	SourceTable *table = tableSpecs->sourceTable;
 
 	char *sql =
-		"insert or ignore into s_table_parts_done(tableoid, pid) "
+		"insert or ignore into s_table_parts_done(tableoid, partnum) "
 		"values($1, $2)";
 
 	if (!semaphore_lock(&(catalog->sema)))
@@ -709,7 +709,7 @@ summary_add_table_parts_done(DatabaseCatalog *catalog,
 	/* bind our parameters now */
 	BindParam params[] = {
 		{ BIND_PARAMETER_TYPE_INT64, "tableoid", table->oid, NULL },
-		{ BIND_PARAMETER_TYPE_INT64, "pid", getpid(), NULL }
+		{ BIND_PARAMETER_TYPE_INT64, "partnum", table->partition.partNumber, NULL }
 	};
 
 	int count = sizeof(params) / sizeof(params[0]);
@@ -756,7 +756,7 @@ summary_lookup_table_parts_done(DatabaseCatalog *catalog,
 
 	SourceTable *table = tableSpecs->sourceTable;
 
-	char *sql = "select pid from s_table_parts_done where tableoid = $1 ";
+	char *sql = "select partnum from s_table_parts_done where tableoid = $1 ";
 
 	if (!semaphore_lock(&(catalog->sema)))
 	{
@@ -812,7 +812,7 @@ summary_table_parts_done_fetch(SQLiteQuery *query)
 {
 	CopyTableDataSpec *tableSpecs = (CopyTableDataSpec *) query->context;
 
-	tableSpecs->partsDonePid = sqlite3_column_int(query->ppStmt, 0);
+	tableSpecs->donePartNumber = sqlite3_column_int(query->ppStmt, 0);
 
 	return true;
 }
