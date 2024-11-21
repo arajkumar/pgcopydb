@@ -65,7 +65,6 @@ def _has_tables_without_replica_ident(source) -> list[dict]:
             FROM pg_class c
             JOIN pg_namespace n ON c.relnamespace = n.oid
             LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary = true
-            LEFT JOIN pg_constraint con ON con.conrelid = c.oid AND con.contype IN ('p', 'u')
             WHERE c.relkind = 'r' -- only consider ordinary tables
             AND n.nspname NOT IN (
                 '_timescaledb_internal',
@@ -79,7 +78,6 @@ def _has_tables_without_replica_ident(source) -> list[dict]:
                 'pg_catalog'
                 ) -- exclude system tables
             AND i.indrelid IS NULL -- no primary key
-            AND con.conrelid IS NULL -- no unique constraints
             AND c.relreplident = 'd' -- default replica identity (not explicitly set)
             GROUP BY n.nspname, c.relname
             ORDER BY n.nspname, c.relname
