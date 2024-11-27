@@ -981,7 +981,7 @@ copydb_copy_data_by_oid(CopyDataSpec *specs, PGSQL *src, PGSQL *dst,
 	 */
 	bool tableStillExists = true;
 
-	if (!copydb_check_table_exists(src, table, &tableStillExists))
+	if (!copydb_check_table_exists(specs, src, table, &tableStillExists))
 	{
 		/* errors have already been logged */
 		return false;
@@ -1674,7 +1674,8 @@ copydb_prepare_summary_command(CopyTableDataSpec *tableSpecs)
  * SHARE LOCK on the table.
  */
 bool
-copydb_check_table_exists(PGSQL *pgsql, SourceTable *table, bool *exists)
+copydb_check_table_exists(CopyDataSpec *specs, PGSQL *pgsql, SourceTable *table,
+						  bool *exists)
 {
 	if (!pgsql_table_exists(pgsql,
 							table->oid,
@@ -1698,6 +1699,12 @@ copydb_check_table_exists(PGSQL *pgsql, SourceTable *table, bool *exists)
 	if (!locked)
 	{
 		log_error("Failed to LOCK table %s in ACCESS SHARE mode", table->qname);
+
+		/*
+		 * Failure in acquiring lock would abort the current transaction. We
+		 * need to close the current snapshot and use a non snapshot connection.
+		 */
+		(void) copydb_close_snapshot(specs);
 	}
 
 	/*
