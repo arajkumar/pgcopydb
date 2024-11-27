@@ -2,7 +2,7 @@ import logging
 import json
 import urllib.request
 
-SCRIPT_VERSION = "v1.0.4"
+SCRIPT_VERSION = "v1.0.5"
 
 DOCKER_IMAGE_NAME = "timescale/live-migration"
 
