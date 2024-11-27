@@ -1,11 +1,15 @@
 import sys
-import subprocess
 import textwrap
 import logging
 
+from exec import Process
 from exception import ValidationError
 from utils import docker_command
-from validate import check_db_compatibility, raise_if_volume_not_mounted
+from validate import (
+    check_db_compatibility,
+    raise_if_volume_not_mounted,
+    wal2json_with_numeric_as_string_support,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +65,20 @@ def _snapshot(args):
         dir,
     ]
 
-    process = subprocess.Popen(snapshot_command,
-                               stdout=subprocess.PIPE,
-                               text=True)
+    if args.plugin == "wal2json":
+        if wal2json_with_numeric_as_string_support(args.source):
+            logger.info("Using wal2json with numeric as string support.")
+            snapshot_command.append("--wal2json-numeric-as-string")
+        else:
+            logger.warning("wal2json does not support numeric as string. This may lead to data loss.")
+    else:
+        logger.warning("Using test_decoding plugin. This is not fully tested.")
+
+    process = Process(snapshot_command, "snapshot").with_logging().run()
     snapshot_id = ''
-    while process.poll() is None and snapshot_id == '':
-        snapshot_id = process.stdout.readline().strip()
+    while process.alive() and snapshot_id == '':
+        with open(process.log_file.stdout) as f:
+            snapshot_id = f.readline().strip()
 
     if snapshot_id != '':
         logger.info(f"Snapshot {snapshot_id} created successfully.")

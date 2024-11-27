@@ -188,6 +188,30 @@ def validate(args):
     report.pretty_print()
     args.telemetry.mark_success()
 
+def _wal2json_installed(source) -> bool:
+    sql = "SELECT slot_name FROM pg_create_logical_replication_slot('livemigration', 'wal2json', temporary => true);"
+    try:
+        result = psql(conn=source, sql=sql)
+    except Exception:
+        return False
+    else:
+        return result[0]["slot_name"] == "livemigration"
+
+def wal2json_with_numeric_as_string_support(source) -> bool:
+    sql = """
+        BEGIN;
+        SELECT slot_name FROM pg_create_logical_replication_slot('livemigration', 'wal2json', temporary => true);
+        SELECT pg_logical_slot_peek_changes('livemigration', NULL, NULL, 'numeric-data-types-as-string', '1') LIMIT 1;
+        SELECT pg_drop_replication_slot('livemigration');
+        COMMIT;
+        """
+    try:
+        psql(conn=source, sql=sql)
+    except Exception:
+        return False
+    else:
+        return True
+
 def check_db_compatibility(args) -> Report:
     """
     Performs a series of compatibility checks between the source and target databases to
@@ -199,6 +223,14 @@ def check_db_compatibility(args) -> Report:
     target_uri = args.target
 
     checks = [
+        Check(
+            check_message="Check wal2json logical decoding plugin",
+            source_value=lambda _: _wal2json_installed(source_uri),
+            check=lambda s, _: s,
+            help="wal2json logical decoding plugin is not installed on the "
+                 "source db. Install the plugin to proceed with live migration."
+                 "For more information, visit https://github.com/eulerto/wal2json?tab=readme-ov-file#build-and-install",
+        ),
         Check(
             check_message="The user has execute permission on "
                           "pg_replication_origin functions in the target db",
@@ -312,7 +344,10 @@ def check_db_compatibility(args) -> Report:
                  "flag during migration.",
             warn_only = True,
         ),
-        Check(
+    ]
+
+    if not wal2json_with_numeric_as_string_support(source_uri):
+        checks.append(Check(
             check_message="Source db should not have tables with NaN, +- Infinity as values",
             sql="""
             select exists (
@@ -343,8 +378,8 @@ def check_db_compatibility(args) -> Report:
             help="NaN/Inf values found on the source. Currently the tool do not "
                  "replicate NaN/Infinity values. Don't use this tool if you "
                  "have such values."
-    ),
-    ]
+    ))
+
 
     if get_dbtype(source_uri) == DBType.TIMESCALEDB:
         has_caggs_finalized = psql(source_uri,

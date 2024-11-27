@@ -208,7 +208,7 @@ class Process:
             backoff_message = ""
             if retry_backoff > 0:
                 backoff_message = f"after {retry_backoff}s"
-            logger.warning(f"{self.name} failed. Retrying: {self.retry.count+1}/{self.retry.max_retries} {backoff_message}")
+            logger.warning(f"{self.name} failed with exit code {retcode}. Retrying: {self.retry.count+1}/{self.retry.max_retries} {backoff_message}")
             self.retry.increment_and_wait_for_backoff()
             self.args = self.retry.args
             self.run()
