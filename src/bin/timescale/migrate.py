@@ -6,6 +6,7 @@ import textwrap
 from pathlib import Path
 
 import housekeeping
+import clean
 
 from health_check import health_checker
 from utils import timeit, docker_command, dbname_from_uri, store_val, \
@@ -206,6 +207,7 @@ def migrate_existing_data_across_ts_versions(args):
                                 "--resume",
                                 ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
+        drop_if_exists(args)
 
     with timeit("Restore pre-data"):
         restore_pre_data = " ".join(["pgcopydb",
@@ -221,6 +223,7 @@ def migrate_existing_data_across_ts_versions(args):
                                      "--split-tables-larger-than=1GB",
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
+        mark_section_complete("drop-objects")
 
     stop_progress = monitor_db_sizes(args.dir, args.source, args.target)
 
@@ -270,6 +273,62 @@ def migrate_existing_data_across_ts_versions(args):
     stop_progress.set()
 
 
+def rewrite_drop(line):
+    if line.startswith("DROP EXTENSION"):
+        return False, line
+
+    if "DROP" in line:
+        line = line.strip()
+        if line.startswith("DROP TABLE"):
+            # skip semicolon at the end
+            return True, line[:-1] + " CASCADE;"
+        return True, line
+    return False, line
+
+def drop_object(conn, line):
+    rewrite, line = rewrite_drop(line)
+    if not rewrite:
+        if "DROP" in line:
+            logger.info(f"Skipping: {line}")
+        return
+    try:
+        logger.info(line)
+        psql_cmd(conn=conn, sql=line)
+    except Exception:
+        logger.warn(f"Failed to drop, skipping: {line}")
+
+def drop_if_exists(args, timescaledb: TimescaleDB = None):
+    if not args.drop_if_exists:
+        return
+
+    if is_section_migration_complete("drop-objects"):
+        return
+
+    dump_file = str(args.dir / "pgcopydb_clone"/ "schema"/ "schema.dump")
+    drop_sql_file = str(args.dir / "pgcopydb_clone" / "drop_objects.sql")
+    drop_cmd  = " ".join(["pg_restore",
+                       dump_file,
+                       "--clean",
+                       "--if-exists",
+                       "--no-owner",
+                       "--no-acl",
+                       "-f",
+                       drop_sql_file,
+                    ])
+
+    with timeit("Fetch objects to drop"):
+        run_cmd(drop_cmd, LogFile("drop_objects"))
+
+    # Migration which ended with an error might have left extension
+    # in pre_restore state. Lets always run post_restore to ensure
+    # that the extension is loaded.
+    if timescaledb:
+        timescaledb.post_restore()
+    with timeit("Apply drop objects"):
+        with open(drop_sql_file) as f:
+            for line in f:
+                drop_object(args.target, line)
+
 def migrate_existing_data_from_pg_to_tsdb(args):
     filter_args = prepare_filters(args)
 
@@ -285,6 +344,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                 "--resume",
                                 ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
+        drop_if_exists(args)
 
     with timeit("Restore pre-data"):
         restore_pre_data = " ".join(["pgcopydb",
@@ -300,6 +360,7 @@ def migrate_existing_data_from_pg_to_tsdb(args):
                                      "--split-tables-larger-than=1GB",
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
+        mark_section_complete("drop-objects")
 
     if not is_section_migration_complete("hypertable-creation"):
         show_hypertable_creation_prompt()
@@ -448,6 +509,7 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
                                 "--resume",
                                 ] + filter_args)
         run_cmd(dump_schema, LogFile("dump_schema"))
+        drop_if_exists(args, timescaledb)
 
     with timeit("Restore pre-data"):
         restore_pre_data = " ".join(["pgcopydb",
@@ -463,6 +525,7 @@ def migrate_existing_data(args, timescaledb: TimescaleDB = None):
                                      "--split-tables-larger-than=1GB",
                                      ] + filter_args)
         run_cmd(restore_pre_data, LogFile("restore_pre_data"))
+        mark_section_complete("drop-objects")
 
     if timescaledb:
        timescaledb.pre_restore()

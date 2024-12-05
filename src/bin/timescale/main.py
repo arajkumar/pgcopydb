@@ -130,6 +130,12 @@ def main():
                                            parents=[common],
                                            add_help=False)
     parser_migrate.add_argument('--resume', action='store_true', help='Resume the migration')
+    parser_migrate.add_argument('--drop-if-exists',
+                                action='store_true',
+                                help='Drop the created objects on the target '
+                                'database if it exists. Useful when you want '
+                                'to restart the migration from scratch and reuse '
+                                'the same target instance.')
     parser_migrate.add_argument('--skip-roles', action='store_true', help='Skip roles migration')
     parser_migrate.add_argument('--table-jobs', type=str,
                                 help='Number of parallel jobs to copy "existing data" from source db to target db')
