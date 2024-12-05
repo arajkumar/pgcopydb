@@ -927,6 +927,17 @@ pg_restore_db(PostgresPaths *pgPaths,
 	{
 		args[argsIndex++] = "--jobs";
 		args[argsIndex++] = intToString(options.jobs).strValue;
+
+		/*
+		 * Interrupting a pg_restore process with multiple jobs leaves
+		 * the target database in an inconsistent and non resumable state.
+		 * Let's clean up the target database if we are interrupted.
+		 */
+		if (!options.dropIfExists)
+		{
+			args[argsIndex++] = "--clean";
+			args[argsIndex++] = "--if-exists";
+		}
 	}
 
 	if (options.dropIfExists)
