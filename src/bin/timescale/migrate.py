@@ -274,13 +274,15 @@ def migrate_existing_data_across_ts_versions(args):
 
 
 def rewrite_drop(line):
+    if line.startswith("DROP INDEX"):
+        return False, line
+
     if line.startswith("DROP EXTENSION"):
         return False, line
 
-    if "DROP" in line:
+    if line.startswith("DROP "):
         line = line.strip()
         if line.startswith("DROP TABLE"):
-            # skip semicolon at the end
             return True, line[:-1] + " CASCADE;"
         return True, line
     return False, line
@@ -288,7 +290,7 @@ def rewrite_drop(line):
 def drop_object(conn, line):
     rewrite, line = rewrite_drop(line)
     if not rewrite:
-        if "DROP" in line:
+        if line.startswith("DROP "):
             logger.info(f"Skipping: {line}")
         return
     try:
@@ -621,7 +623,7 @@ def wait_for_DBs_to_sync(follow: Process):
         event.wait(timeout=LSN_UPDATE_INTERVAL_SECONDS)
 
 def copy_sequences():
-    run_cmd("pgcopydb copy sequences --resume --not-consistent",
+    run_cmd("pgcopydb copy sequences --resume --not-consistent --dir $PGCOPYDB_DIR",
             LogFile("copy_sequences"))
 
 def get_caggs_count(conn) -> int:
